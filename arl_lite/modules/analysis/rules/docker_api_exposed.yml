@@ -1,0 +1,13 @@
+name: docker_api_exposed
+description: Docker API 暴露(完全控制容器)
+risk: 9
+tags: [docker, rce, exposure]
+collect:
+  - table: findings
+    where: "title = 'Harbor' OR title = 'Portainer' OR title = 'Rancher'"
+headline: "⚠️ 容器管理平台暴露: {target}"
+advice: |
+  1. 立即关闭公网访问
+  2. 启用 RBAC
+  3. 启用 TLS 客户端证书认证
+  4. 监控异常操作

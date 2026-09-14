@@ -1,0 +1,13 @@
+name: port_high_risk
+description: 高危端口列表(常被攻击)
+risk: 6
+tags: [network, port, exposure]
+collect:
+  - table: ports
+    where: "port IN (23, 135, 139, 445, 1433, 3389, 5900, 6379, 9200, 11211, 27017) AND state = 'open'"
+headline: "⚠️ 高危端口开放: {ip}:{port} ({service})"
+advice: |
+  1. 如不需要,关闭服务
+  2. 网络层限制访问 IP
+  3. 启用认证和加密
+  4. 监控异常连接

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "arl-lite"
+version = "0.7.7"
+description = "灯塔 ARL 降级增强版:2G 内存友好的资产侦察工具,CLI/TUI 形态,集成 AI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "arl-lite contributors"}]
+keywords = ["security", "reconnaissance", "asset-discovery", "osint", "cli"]
+
+# 核心依赖:全部标准库,零外部 pip 依赖
+# 增强依赖(可选):检测到则启用,否则降级
+dependencies = []
+
+[project.optional-dependencies]
+full = [
+    "typer>=0.9",      # CLI 增强
+    "rich>=13",        # 终端美化
+    "httpx>=0.25",     # 异步 HTTP
+    "pyyaml>=6",       # 配置文件
+    "apscheduler>=3.10", # 周期任务
+    "textual>=0.50",   # TUI
+    "openpyxl>=3.1",   # Excel 导出
+]
+dev = [
+    "pytest>=7",
+    "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+arl-lite = "arl_lite.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["arl_lite*"]
+
+[tool.setuptools.package-data]
+arl_lite = ["db/*.sql", "fingerprints/*.json", "prompts/*.txt"]

@@ -1,0 +1,14 @@
+name: subdomain_count_high
+description: workspace 内总子域数 ≥ 20(攻击面大)
+risk: 4
+count_min: 20
+tags: [subdomain, attack_surface, info]
+collect:
+  - table: domains
+    where: "1=1"
+headline: "💡 workspace 内子域数 ≥ 20(攻击面大,当前 {count} 个,关注废弃子域)"
+advice: |
+  1. 定期审计子域,识别废弃/未维护的
+  2. 关注子域接管风险
+  3. 启用 CSP 限制跨域
+  4. 监控新增子域

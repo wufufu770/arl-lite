@@ -1,0 +1,321 @@
+"""arl_lite.cli_report_html
+
+HTML 报告生成 — 从 workspace 数据生成独立的 HTML 文件(无外部依赖)。
+
+特性:
+- 单文件 HTML(内嵌 CSS,无外部资源)
+- 响应式设计
+- 风险高亮
+- 统计 + Top 风险 + 关联 + 资产分布
+"""
+from __future__ import annotations
+
+from . import __version__
+
+import html
+from datetime import datetime
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .db.storage import Storage
+
+
+def _level_color(level: str) -> str:
+    return {
+        "critical": "#dc2626",
+        "high": "#f59e0b",
+        "medium": "#3b82f6",
+        "low": "#10b981",
+    }.get(level, "#6b7280")
+
+
+def generate_html_report(storage: "Storage", workspace: str, title: str = "ARL-Lite Security Report") -> str:
+    """生成 HTML 报告
+
+    Args:
+        storage: Storage 实例
+        workspace: workspace 名
+        title: 报告标题
+
+    Returns:
+        完整 HTML 字符串
+    """
+    from .core.risk_score import top_risks, risk_summary
+
+    # 1. 统计(COUNT(*);旧版在这里全表载入 8 张表只为 len,且 ports/findings 各查了两次)
+    hosts = storage.query("hosts", limit=10000)
+    stats = storage.get_stats()
+    risk = risk_summary(storage)
+    top = top_risks(storage, limit=20)
+    correlations = storage.query("correlations", limit=10000)
+    host_samples = [h.get("host", "?") for h in hosts[:20] if h.get("host")]
+    stats.setdefault("monitors", len(storage.query("monitors", limit=10000)))
+
+    # 2. 按 target_type 分组
+    by_type: dict[str, list[dict]] = {}
+    for t in top:
+        by_type.setdefault(t.target_type, []).append(t)
+
+    # 3. 时间戳
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    # 4. 渲染
+    parts = []
+    parts.append(f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>{html.escape(title)}</title>
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    margin: 0; padding: 0; background: #f5f7fa; color: #1f2937;
+  }}
+  .container {{ max-width: 1200px; margin: 0 auto; padding: 24px; }}
+  h1 {{ margin: 0 0 8px; font-size: 28px; color: #111827; }}
+  .meta {{ color: #6b7280; font-size: 14px; margin-bottom: 24px; }}
+  .card {{
+    background: #fff; border-radius: 8px; padding: 20px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    margin-bottom: 16px;
+  }}
+  .stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }}
+  .stat {{
+    text-align: center; padding: 16px; background: #f9fafb;
+    border-radius: 6px; border: 1px solid #e5e7eb;
+  }}
+  .stat-value {{ font-size: 28px; font-weight: 600; color: #111827; }}
+  .stat-label {{ font-size: 12px; color: #6b7280; margin-top: 4px; }}
+  table {{ width: 100%; border-collapse: collapse; margin-top: 8px; }}
+  th, td {{ text-align: left; padding: 10px 12px; border-bottom: 1px solid #e5e7eb; font-size: 14px; }}
+  th {{ background: #f9fafb; font-weight: 600; color: #4b5563; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; }}
+  tr:hover {{ background: #f9fafb; }}
+  .level {{
+    display: inline-block; padding: 2px 10px; border-radius: 4px;
+    font-size: 12px; font-weight: 600; color: #fff;
+  }}
+  .level-critical {{ background: #dc2626; }}
+  .level-high {{ background: #f59e0b; }}
+  .level-medium {{ background: #3b82f6; }}
+  .level-low {{ background: #10b981; }}
+  .level-info {{ background: #6b7280; }}
+  .score {{ font-weight: 600; font-family: monospace; }}
+  .muted {{ color: #6b7280; font-size: 12px; }}
+  h2 {{ font-size: 18px; margin: 0 0 12px; color: #111827; border-bottom: 2px solid #e5e7eb; padding-bottom: 8px; }}
+  h3 {{ font-size: 15px; margin: 16px 0 8px; color: #374151; }}
+  .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
+  @media (max-width: 768px) {{
+    .grid-2 {{ grid-template-columns: 1fr; }}
+  }}
+  .footer {{ text-align: center; color: #9ca3af; font-size: 12px; margin-top: 32px; padding: 16px; }}
+  .badge {{
+    display: inline-block; padding: 2px 8px; border-radius: 3px;
+    background: #e0e7ff; color: #3730a3; font-size: 11px;
+    margin-left: 4px; font-weight: 500;
+  }}
+  code {{
+    background: #f3f4f6; padding: 1px 6px; border-radius: 3px;
+    font-family: "SF Mono", Consolas, monospace; font-size: 12px;
+  }}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>🛡️ {html.escape(title)}</h1>
+  <div class="meta">
+    workspace: <code>{html.escape(workspace)}</code>
+    &nbsp;·&nbsp; 生成时间: {now}
+    &nbsp;·&nbsp; arl-lite v{__version__}
+  </div>
+""")
+
+    # 资产统计
+    parts.append("""
+  <div class="card">
+    <h2>📊 资产概览</h2>
+    <div class="stats">
+""")
+    for label, val in [
+        ("域名", stats["domains"]),
+        ("Hosts", stats["hosts"]),
+        ("Ports", stats["ports"]),
+        ("Sites", stats["sites"]),
+        ("Findings", stats["findings"]),
+        ("关联", stats["correlations"]),
+        ("任务", stats["tasks"]),
+        ("监控", stats["monitors"]),
+    ]:
+        parts.append(f'      <div class="stat"><div class="stat-value">{val}</div><div class="stat-label">{label}</div></div>\n')
+    parts.append("""    </div>
+  </div>
+""")
+
+    # 风险概览
+    parts.append("""
+  <div class="card">
+    <h2>⚠️ 风险概览</h2>
+    <div class="grid-2">
+      <div>
+        <h3>等级分布</h3>
+        <table>
+          <tr><th>等级</th><th>数量</th></tr>
+""")
+    for level in ["critical", "high", "medium", "low"]:
+        n = risk["by_level"].get(level, 0)
+        color = _level_color(level)
+        parts.append(f'          <tr><td><span class="level level-{level}">{level.upper()}</span></td><td>{n}</td></tr>\n')
+    parts.append(f"""        </table>
+      </div>
+      <div>
+        <h3>指标</h3>
+        <table>
+          <tr><td>总关联数</td><td>{risk['total_correlations']}</td></tr>
+          <tr><td>唯一目标数</td><td>{risk['unique_targets']}</td></tr>
+          <tr><td>最高风险分</td><td>{risk['max_risk']}</td></tr>
+        </table>
+      </div>
+    </div>
+  </div>
+""")
+
+    # Top 风险
+    parts.append("""
+  <div class="card">
+    <h2>🌐 Hosts 样例</h2>
+""")
+    if host_samples:
+        parts.append('    <p style="font-family:monospace;font-size:13px;">\n')
+        for h in host_samples:
+            parts.append(f'      {html.escape(h)}<br>\n')
+        if len(hosts) > 20:
+            parts.append(f'      <span class="muted">... 还有 {len(hosts) - 20} 个</span>\n')
+        parts.append("    </p>\n")
+    else:
+        parts.append('    <p class="muted">无 hosts</p>\n')
+    parts.append("  </div>\n")
+
+    # Top 风险
+    parts.append("""
+  <div class="card">
+    <h2>🎯 Top 高风险资产</h2>
+""")
+    if top:
+        parts.append("""    <table>
+      <tr><th>目标</th><th>类型</th><th>分数</th><th>等级</th><th>命中规则数</th><th>规则</th></tr>
+""")
+        for t in top[:20]:
+            color = _level_color(t.risk_level)
+            rules_str = ", ".join(t.rule_names[:3]) if t.rule_names else "-"
+            # class 属性位置也必须白名单:文本转义挡不住属性逃逸
+            safe_level = t.risk_level if t.risk_level in ("critical", "high", "medium", "low") else "low"
+            parts.append(
+                f'      <tr><td><code>{html.escape(t.target)}</code></td>'
+                f'<td><span class="badge">{html.escape(str(t.target_type))}</span></td>'
+                f'<td class="score">{int(t.risk_score)}</td>'
+                f'<td><span class="level level-{safe_level}">{html.escape(str(t.risk_level).upper())}</span></td>'
+                f'<td>{int(t.rule_count)}</td>'
+                f'<td class="muted">{html.escape(rules_str)}</td></tr>\n'
+            )
+        parts.append("    </table>\n")
+    else:
+        parts.append("    <p class=\"muted\">无风险资产(没跑关联分析或没命中规则)</p>\n")
+    parts.append("  </div>\n")
+
+    # 关联分析
+    if correlations:
+        parts.append("""
+  <div class="card">
+    <h2>🔍 关联分析(去重后)</h2>
+    <table>
+      <tr><th>规则</th><th>目标</th><th>风险</th><th>概要</th></tr>
+""")
+        for c in correlations[:50]:
+            headline = c.get("headline", "")
+            if len(headline) > 80:
+                headline = headline[:80] + "..."
+            try:
+                risk = int(c.get("risk") or 0)
+            except (TypeError, ValueError):
+                risk = 0
+            level = "critical" if risk >= 9 else "high" if risk >= 7 else "medium" if risk >= 4 else "low"
+            parts.append(
+                f'      <tr><td>{html.escape(c.get("rule_name", "?"))}</td>'
+                f'<td><code>{html.escape(c.get("target", "?"))}</code></td>'
+                f'<td><span class="level level-{level}">{risk}</span></td>'
+                f'<td>{html.escape(headline)}</td></tr>\n'
+            )
+        parts.append("    </table>\n")
+        if len(correlations) > 50:
+            total = stats.get("correlations", len(correlations))
+            parts.append(f'    <p class="muted">仅显示前 50 条,共 {total} 条</p>\n')
+        parts.append("  </div>\n")
+    else:
+        parts.append('  <div class="card"><h2>🔍 关联分析(去重后)</h2><p class="muted">暂无关联结果(未跑过 correlate 或 0 命中)</p></div>\n')
+
+    # Findings
+    findings = storage.query("findings", limit=10000)
+    if findings:
+        parts.append("""
+  <div class="card">
+    <h2>📝 Findings</h2>
+    <table>
+      <tr><th>类型</th><th>标题</th><th>目标</th><th>严重度</th><th>来源</th></tr>
+""")
+        for f in findings[:100]:
+            sev = f.get("severity", "info")
+            # class 属性白名单(bulk_insert 可写入任意 severity 值)
+            sev = sev if sev in ("info", "low", "medium", "high", "critical") else "info"
+            target = f.get("target", "?")
+            if len(target) > 60:
+                target = target[:60] + "..."
+            parts.append(
+                f'      <tr><td><span class="badge">{html.escape(f.get("finding_type", "?"))}</span></td>'
+                f'<td>{html.escape(f.get("title", "?"))}</td>'
+                f'<td><code>{html.escape(target)}</code></td>'
+                f'<td><span class="level level-{sev}">{html.escape(sev.upper())}</span></td>'
+                f'<td class="muted">{html.escape(f.get("source", "?"))}</td></tr>\n'
+            )
+        parts.append("    </table>\n")
+        if len(findings) > 100:
+            total = stats.get("findings", len(findings))
+            parts.append(f'    <p class="muted">仅显示前 100 条,共 {total} 条</p>\n')
+        parts.append("  </div>\n")
+    else:
+        parts.append('  <div class="card"><h2>📝 Findings</h2><p class="muted">暂无发现</p></div>\n')
+
+    # Footer
+    parts.append(f"""
+  <div class="footer">
+    Generated by <code>arl-lite v{__version__}</code> · {now}
+  </div>
+</div>
+</body>
+</html>
+""")
+    return "".join(parts)
+
+
+def write_html_report(storage: "Storage", workspace: str, output_path: str | Path) -> Path:
+    """生成 HTML 报告并写到文件
+
+    Args:
+        storage: Storage 实例
+        workspace: workspace 名
+        output_path: 输出文件路径(.html)
+
+    Returns:
+        写入的 Path
+    """
+    html_content = generate_html_report(storage, workspace)
+    out = Path(output_path)
+    # 防御:parent 是已存在但不是目录(/dev/null 等)
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+    except (FileExistsError, NotADirectoryError) as e:
+        raise IOError(f"cannot create parent dir {out.parent}: {e}") from e
+    if not out.parent.is_dir():
+        raise IOError(f"parent path is not a directory: {out.parent}")
+    out.write_text(html_content, encoding="utf-8")
+    return out

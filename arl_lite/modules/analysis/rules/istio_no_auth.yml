@@ -1,0 +1,12 @@
+name: istio_no_auth
+description: Istio 服务网格暴露(可能内部服务可访问)
+risk: 6
+tags: [istio, mesh, exposure]
+collect:
+  - table: sites
+    where: "server LIKE '%istio%'"
+headline: "💡 Istio 服务网格: {url}"
+advice: |
+  1. 检查 istio-ingressgateway 的 RBAC 配置
+  2. 启用 mTLS
+  3. 限制 AuthorizationPolicy

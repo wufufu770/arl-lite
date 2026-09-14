@@ -1,0 +1,12 @@
+name: dev_port_public
+description: 开发/调试端口暴露(常见于误配)
+risk: 7
+tags: [exposure, dev, misconfig, network]
+collect:
+  - table: ports
+    where: "port IN (3000, 4000, 5000, 8000, 8001, 8080, 8081, 8443, 9000, 9090, 4200, 5000, 5858, 9229) AND service IN ('http-alt', 'http-proxy', 'unknown')"
+headline: "⚠️ 开发端口暴露公网: {ip}:{port} ({service})"
+advice: |
+  1. 检查是否为开发环境(应只在内网)
+  2. 加上 Basic Auth 或 IP 白名单
+  3. 生产环境用 80/443,不要直接暴露 Node.js / Flask 端口

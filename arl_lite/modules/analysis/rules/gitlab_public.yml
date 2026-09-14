@@ -1,0 +1,13 @@
+name: gitlab_public
+description: GitLab 暴露公网(代码仓库风险)
+risk: 7
+tags: [gitlab, code_leak, exposure]
+collect:
+  - table: findings
+    where: "title = 'GitLab'"
+headline: "⚠️ GitLab 暴露公网: {target} (源码泄露风险)"
+advice: |
+  1. 启用 SSO/MFA
+  2. 限制外部分享
+  3. 监控异常 push/clone
+  4. 定期审计权限

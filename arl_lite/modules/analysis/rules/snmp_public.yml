@@ -1,0 +1,13 @@
+name: snmp_public
+description: SNMP 暴露公网(默认 community string 风险)
+risk: 7
+tags: [exposure, snmp, network]
+collect:
+  - table: ports
+    where: "port IN (161, 162) AND state = 'open'"
+headline: "⚠️ SNMP 暴露公网: {ip}:{port}"
+advice: |
+  1. 修改默认 community string (public/private)
+  2. 使用 SNMPv3(支持认证 + 加密)
+  3. 网络层限制访问
+  4. SNMP 经常泄露设备型号/版本,方便攻击者找漏洞

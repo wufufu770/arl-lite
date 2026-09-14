@@ -1,0 +1,13 @@
+name: elasticsearch_public
+description: Elasticsearch 暴露公网(无认证)
+risk: 9
+tags: [elasticsearch, exposure, data_leak]
+collect:
+  - table: findings
+    where: "title = 'ElasticSearch' OR title = 'OpenSearch'"
+headline: "⚠️ Elasticsearch 暴露公网: {target} (可能数据泄露)"
+advice: |
+  1. 立即启用认证(X-Pack Security 或 Search Guard)
+  2. 关闭公网访问
+  3. 启用 TLS 加密
+  4. 检查是否有 index 数据泄漏(常见 Elasticsearch 被脱裤)

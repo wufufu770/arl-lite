@@ -1,0 +1,12 @@
+name: swagger_public
+description: Swagger UI 暴露公网(API 文档泄露)
+risk: 5
+tags: [swagger, api_doc, exposure]
+collect:
+  - table: findings
+    where: "title = 'Swagger UI'"
+headline: "💡 Swagger UI 暴露公网: {target} (可能暴露内部 API 文档)"
+advice: |
+  1. 加上认证或 IP 白名单
+  2. 生产环境不应有完整 API 文档
+  3. 至少去掉危险接口的文档

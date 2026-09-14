@@ -1,0 +1,14 @@
+name: rdp_exposed
+description: RDP 暴露公网(爆破 + 勒索软件目标)
+risk: 8
+tags: [exposure, rdp, ransomware, network]
+collect:
+  - table: ports
+    where: "port = 3389 AND state = 'open'"
+headline: "⚠️ RDP 暴露公网: {ip}:3389 (勒索软件常见入口)"
+advice: |
+  1. 不要把 RDP 暴露公网,使用 VPN/堡垒机
+  2. 启用网络级认证(NLA)
+  3. 强密码 + 账户锁定策略
+  4. 修改默认端口(防扫描)
+  5. 部署 fail2ban 等防爆破

@@ -1,0 +1,14 @@
+name: exposed_database
+description: 数据库服务暴露在公网
+risk: 9
+tags: [exposure, database, network]
+collect:
+  - table: ports
+    where: "port IN (3306, 5432, 6379, 27017, 9200, 1433, 5984, 2379, 7000, 7001, 1521, 11211, 33060, 5433)"
+headline: "⚠️ 数据库服务暴露在公网: {ip}:{port} ({service})"
+advice: |
+  1. 确认该数据库是否真的需要公网访问
+  2. 如不需要,在防火墙/安全组限制访问
+  3. 如需要,启用 TLS 加密 + 强密码策略
+  4. 部署 WAF/IDS 监控异常查询
+  5. 检查认证配置,避免空密码/默认账号

@@ -1,0 +1,13 @@
+name: weblogic_public
+description: WebLogic 暴露公网(历史 RCE 严重)
+risk: 9
+tags: [weblogic, rce, exposure, deserialization]
+collect:
+  - table: findings
+    where: "title = 'WebLogic' OR title = 'JBoss' OR title = 'WildFly'"
+headline: "⚠️ WebLogic/JBoss 暴露公网: {target} (反序列化 RCE 历史高危)"
+advice: |
+  1. 立即升级到最新补丁版本
+  2. 不要暴露公网
+  3. 启用反序列化过滤
+  4. 监控异常请求

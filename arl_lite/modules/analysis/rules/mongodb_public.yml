@@ -1,0 +1,13 @@
+name: mongodb_public
+description: MongoDB 暴露公网(可能未授权 + 历史大规模脱裤)
+risk: 9
+tags: [mongodb, exposure, unauth, data_leak]
+collect:
+  - table: findings
+    where: "title = 'MongoDB'"
+headline: "⚠️ MongoDB 暴露公网: {target} (历史多次大规模数据泄露)"
+advice: |
+  1. 立即启用认证(--auth)
+  2. 关闭公网访问
+  3. 启用 TLS
+  4. 检查是否在赎金勒索名单(曾经的 MongoDB 勒索事件)

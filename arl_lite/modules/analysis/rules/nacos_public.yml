@@ -1,0 +1,13 @@
+name: nacos_public
+description: Nacos 暴露公网(常见未授权 + 默认 nacos/nacos)
+risk: 9
+tags: [nacos, exposure, unauth, rce]
+collect:
+  - table: findings
+    where: "title = 'Nacos'"
+headline: "⚠️ Nacos 暴露公网: {target} (默认 nacos/nacos, 多次 RCE)"
+advice: |
+  1. 立即修改默认密码
+  2. 关闭公网访问(只允许内网)
+  3. 升级到 2.x+(修复 CVE-2021-29441 等)
+  4. 启用鉴权

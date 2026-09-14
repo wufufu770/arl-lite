@@ -1,0 +1,13 @@
+name: grafana_public
+description: Grafana 暴露公网(常见未授权访问)
+risk: 7
+tags: [grafana, exposure, monitoring]
+collect:
+  - table: findings
+    where: "title = 'Grafana'"
+headline: "⚠️ Grafana 暴露公网: {target}"
+advice: |
+  1. 不要直接暴露公网
+  2. 启用 SSO(Google/GitHub/Okta)
+  3. 升级到 8.x+(修复 CVE-2021-43798 任意文件读取)
+  4. 配置 IP 白名单

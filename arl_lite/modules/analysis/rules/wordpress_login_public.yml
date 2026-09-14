@@ -1,0 +1,13 @@
+name: wordpress_login_public
+description: WordPress 登录页暴露公网(爆破目标)
+risk: 6
+tags: [wordpress, login, brute_force]
+collect:
+  - table: findings
+    where: "title = 'WordPress' AND target LIKE '%wp-login%'"
+headline: "🔓 WordPress 登录页暴露公网: {target}"
+advice: |
+  1. 限制 wp-login.php 访问(IP 白名单)
+  2. 启用 2FA 插件(Google Authenticator)
+  3. 安装 fail2ban
+  4. 改名 wp-login.php(WPS Hide Login 插件)

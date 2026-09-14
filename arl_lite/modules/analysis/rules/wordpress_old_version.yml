@@ -1,0 +1,13 @@
+name: wordpress_old_version
+description: WordPress 未识别版本(可能未维护)
+risk: 3
+tags: [wordpress, version, maintenance]
+collect:
+  - table: sites
+    where: "tech LIKE '%wordpress%' AND status_code = 200"
+headline: "💡 WordPress 站点: {url} (检查是否最新)"
+advice: |
+  1. 升级到最新 WordPress 版本
+  2. 更新所有插件/主题
+  3. 删掉未使用的插件/主题
+  4. 启用自动更新

@@ -1,0 +1,13 @@
+name: kibana_public
+description: Kibana 暴露公网(常见未授权 + 旧版本 RCE)
+risk: 8
+tags: [kibana, exposure, rce, elastic]
+collect:
+  - table: findings
+    where: "title = 'Kibana'"
+headline: "⚠️ Kibana 暴露公网: {target} (Elasticsearch 数据风险)"
+advice: |
+  1. 不要把 Kibana 暴露公网
+  2. 启用 Basic Auth / SSO
+  3. 升级到 7.x+(修复 CVE-2018-17233 等)
+  4. 检查 ES 数据是否包含敏感信息

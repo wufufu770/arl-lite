@@ -1,0 +1,13 @@
+name: high_risk_tech_stack
+description: 高风险技术栈识别(Spring Boot 默认错误页、Struts2 等)
+risk: 6
+tags: [tech_stack, exposure, fingerprint]
+collect:
+  - table: findings
+    where: "title IN ('Spring Boot', 'Apache Tomcat', 'Struts2')"
+headline: "💡 高风险技术栈: {target} ({title})"
+advice: |
+  1. 启用自定义错误页(不暴露框架信息)
+  2. 升级到最新版本
+  3. 关注 CVE 公告
+  4. 加 WAF 防护

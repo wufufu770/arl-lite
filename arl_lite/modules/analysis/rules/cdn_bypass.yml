@@ -1,0 +1,12 @@
+name: cdn_bypass
+description: 同一域名既有 CDN 又有直接 IP(可能 CDN 旁路)
+risk: 4
+tags: [cdn, network, misconfig]
+collect:
+  - table: findings
+    where: "title = 'Cloudflare' OR title = 'Akamai' OR title = 'AWS CloudFront'"
+headline: "💡 检测到 CDN: {target} (检查是否所有子域都走 CDN)"
+advice: |
+  1. 确认所有子域都走 CDN
+  2. 防火墙只允许 CDN IP 段访问源站
+  3. 加上 Host header 白名单

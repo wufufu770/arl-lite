@@ -1,0 +1,13 @@
+name: smtp_open_relay
+description: SMTP 服务暴露(可能存在开放中继)
+risk: 6
+tags: [exposure, smtp, network]
+collect:
+  - table: ports
+    where: "port = 25 AND state = 'open'"
+headline: "⚠️ SMTP 暴露公网: {ip}:25 (检查是否开放中继)"
+advice: |
+  1. 检查是否配置为开放中继(容易被利用发垃圾邮件)
+  2. 启用 SMTP 认证
+  3. 强制 TLS (端口 587 替代 25)
+  4. 监控发件行为

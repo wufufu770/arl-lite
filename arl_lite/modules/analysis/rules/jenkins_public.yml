@@ -1,0 +1,14 @@
+name: jenkins_public
+description: Jenkins 暴露公网(常见 RCE 目标)
+risk: 9
+tags: [jenkins, exposure, rce]
+collect:
+  - table: findings
+    where: "title = 'Jenkins' AND target LIKE 'http%'"
+headline: "⚠️ Jenkins 暴露公网: {target} (历史多次 RCE)"
+advice: |
+  1. 不要把 Jenkins 暴露公网
+  2. 启用反向代理 + Basic Auth
+  3. 升级到最新版本
+  4. 启用 Matrix 权限 + 审计日志
+  5. 限制 Script Console 访问

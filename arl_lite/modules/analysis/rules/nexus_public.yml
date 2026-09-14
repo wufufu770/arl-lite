@@ -1,0 +1,13 @@
+name: nexus_public
+description: Nexus Repository 暴露(代码包/依赖风险)
+risk: 7
+tags: [nexus, package, code_leak]
+collect:
+  - table: findings
+    where: "title = 'Nexus Repository' OR title = 'Artifactory'"
+headline: "⚠️ Nexus/Artifactory 暴露公网: {target} (依赖包被篡改风险)"
+advice: |
+  1. 启用认证
+  2. 限制外网访问
+  3. 监控异常 push
+  4. 定期审计仓库

@@ -1,0 +1,13 @@
+name: ftp_anonymous
+description: FTP 服务暴露(可能允许匿名登录)
+risk: 6
+tags: [exposure, ftp, network]
+collect:
+  - table: ports
+    where: "port = 21 AND state = 'open'"
+headline: "⚠️ FTP 服务暴露公网: {ip}:21 (ftp)"
+advice: |
+  1. 替换为 SFTP/SCP(走 SSH)
+  2. 如必须用 FTP,禁用匿名登录
+  3. 启用 TLS 加密(FTPS)
+  4. 限制访问 IP

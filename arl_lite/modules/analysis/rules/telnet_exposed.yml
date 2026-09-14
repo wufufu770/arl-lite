@@ -1,0 +1,13 @@
+name: telnet_exposed
+description: Telnet 暴露公网(明文传输)
+risk: 8
+tags: [exposure, plaintext, network]
+collect:
+  - table: ports
+    where: "port = 23 AND state = 'open'"
+headline: "⚠️ Telnet 暴露公网: {ip}:23 (明文协议)"
+advice: |
+  1. 立即替换为 SSH(端口 22)
+  2. 关闭 Telnet 服务
+  3. 检查是否有遗留的 IoT/工控设备
+  4. 网络层阻断 23 端口

@@ -1,0 +1,12 @@
+name: subdomain_no_https
+description: 子域只有 HTTP 没有 HTTPS
+risk: 4
+tags: [https, subdomain]
+collect:
+  - table: sites
+    where: "scheme = 'http' AND status_code = 200"
+headline: "💡 HTTP 站点(无 HTTPS): {url}"
+advice: |
+  1. 启用 HTTPS(Let's Encrypt 免费)
+  2. 强制 HTTPS 重定向
+  3. 设置 HSTS header

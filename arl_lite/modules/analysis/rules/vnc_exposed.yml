@@ -1,0 +1,13 @@
+name: vnc_exposed
+description: VNC 暴露公网(远程桌面爆破)
+risk: 7
+tags: [vnc, exposure, brute_force]
+collect:
+  - table: ports
+    where: "port = 5900 AND state = 'open'"
+headline: "⚠️ VNC 暴露公网: {ip}:5900"
+advice: |
+  1. 不要暴露公网
+  2. 启用 VNC 认证(强密码)
+  3. 走 SSH 隧道
+  4. 防火墙限制访问 IP

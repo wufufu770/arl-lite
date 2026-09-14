@@ -1,0 +1,13 @@
+name: bt_panel_public
+description: 宝塔面板暴露公网(常见默认/弱密码)
+risk: 7
+tags: [baota, panel, exposure, brute_force]
+collect:
+  - table: findings
+    where: "title = '宝塔面板'"
+headline: "⚠️ 宝塔面板暴露公网: {target}"
+advice: |
+  1. 修改默认端口(默认 8888)
+  2. 启用 Basic Auth + 入口限制
+  3. 强制 SSL
+  4. 修改默认账号/强密码

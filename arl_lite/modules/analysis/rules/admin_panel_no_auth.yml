@@ -1,0 +1,21 @@
+name: admin_panel_no_auth
+description: 管理面板无认证(检查是否需要认证)
+risk: 7
+tags: [admin, exposure, auth]
+collect:
+  - table: findings
+    where: "title IN ('phpMyAdmin', '宝塔面板', 'Adminer', '1Panel', 'Swagger UI', 'Grafana Login', 'Jenkins Login', 'WordPress Login')"
+cross_ref:
+  - table: sites
+    where: "url = findings.target AND status_code = 200"
+    description: "管理面板可访问"
+exclusion:
+  - table: findings
+    where: "target = findings.target AND title IN ('Cloudflare', 'Keycloak', 'Auth0')"
+    description: "已有认证或 CDN 保护"
+headline: "⚠️ 管理面板可访问(无前置认证): {target}"
+advice: |
+  1. 在管理面板前加 SSO(LDAP/OAuth)
+  2. 启用 MFA
+  3. IP 白名单
+  4. 监控异常登录

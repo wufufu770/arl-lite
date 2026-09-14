@@ -1,0 +1,12 @@
+name: no_https_for_login
+description: 登录页未启用 HTTPS(凭据明文传输)
+risk: 7
+tags: [https, login, plaintext]
+collect:
+  - table: findings
+    where: "title IN ('WordPress Login', 'Jenkins Login', 'Grafana Login') AND target LIKE 'http://%'"
+headline: "🔓 登录页未加密: {target}"
+advice: |
+  1. 立即启用 HTTPS(Let's Encrypt 免费)
+  2. 强制 HTTPS 重定向
+  3. 设置 HSTS header

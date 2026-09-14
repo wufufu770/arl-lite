@@ -1,0 +1,13 @@
+name: redis_public
+description: Redis 暴露公网(可能未授权访问)
+risk: 9
+tags: [redis, exposure, unauth, network]
+collect:
+  - table: findings
+    where: "title = 'Redis'"
+headline: "⚠️ Redis 暴露公网: {target} (可能未授权访问,可写 SSH key)"
+advice: |
+  1. 立即关闭公网访问
+  2. 启用 requirepass
+  3. 重命名 CONFIG 命令
+  4. 启用 protected-mode

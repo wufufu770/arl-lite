@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.mimosa/
+.arl-lite/
+*.egg-info/
+build/
+dist/
+cli_test_report*.html
+*.tar.gz
+*_export.json

@@ -1,0 +1,21 @@
+name: database_with_public_web
+description: 数据库暴露且同 IP 有公网 Web 服务(高危)
+risk: 10
+tags: [database, web, exposure, high_risk]
+collect:
+  - table: ports
+    where: "port IN (3306, 5432, 6379, 27017, 9200, 1433, 5984, 2379, 7000, 7001)"
+cross_ref:
+  - table: sites
+    where: "host = ports.ip AND status_code = 200"
+    description: "同一 IP 有活跃的 Web 服务"
+exclusion:
+  - table: findings
+    where: "target = ports.ip AND title = 'Cloudflare'"
+    description: "有 Cloudflare 防护(降级)"
+headline: "🔥 高危组合:数据库与 Web 同 IP 公网暴露: {ip}:{port} ({service})"
+advice: |
+  1. 立即将数据库迁移到内网或独立子网
+  2. 启用严格防火墙规则(数据库端口只接受内网)
+  3. 加 WAF 保护 Web 服务
+  4. 数据库启用 TLS + 强认证
