@@ -65,18 +65,20 @@ class GithubModule(BaseModule):
                 all_results.append(r)
 
         # data 只放真实结果(旧版伪造 count:0 假字典,会把 source_status
-        # 的 found_count 吹成 query 数);错误随 sr 带出,不再静默
+        # 的 found_count 吹成 query 数);部分失败也要带出(死源可见纪律:
+        # 8 条 query 挂 7 条却有结果时,不能伪装成全量健康)
+        partial = "; ".join(errors[:3]) if errors else None
         sr = self.make_source_result(
             data=all_results,
             source=self.name, start_time=start,
-            error="; ".join(errors[:3]) if errors and not all_results else None,
+            error=partial,
             error_type=("rate_limit" if any("403" in e or "rate" in e.lower() for e in errors)
-                        else "network") if errors and not all_results else None,
+                        else "network") if errors else None,
         )
         return ModuleResult(
             success=sr.ok, target=target, found=len(all_results),
             duration_seconds=time.time() - start,
-            sources=[sr], errors=[],
+            sources=[sr], errors=errors[:5],
             metadata={
                 "queries_run": len(queries),
                 "results": len(all_results),

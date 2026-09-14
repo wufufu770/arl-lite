@@ -9,6 +9,8 @@
 
 ## 这是什么
 
+> 目标平台:**Linux**(2G 内存 VPS 场景)。TUI 需要 Unix 终端;CLI 各子命令在标准 Python 3.10+ 环境均可运行。外部工具(nmap/subfinder/nuclei)为可选依赖,按需安装。
+
 ARL(灯塔 Asset Reconnaissance Lighthouse)是国内流行的红队资产侦察平台,功能强但资源消耗大(Web UI + MongoDB + 多 worker)。`arl-lite` 把它**重写**为:
 
 - **2 GB 内存机器** 跑得动
@@ -33,7 +35,7 @@ ARL(灯塔 Asset Reconnaissance Lighthouse)是国内流行的红队资产侦察�
 | **零假数据** | 失败 = `ok=False, error_type=network/rate_limit/auth` | ✓ |
 | **零外部 pip 依赖** | 纯 stdlib,内存 35 MB,2G 机器直接跑 | ✓ |
 
-## 架构 (v0.7.7)
+## 架构 (v0.7.8)
 
 ```
 arl-lite
@@ -45,7 +47,6 @@ arl-lite
 │   │   ├── fingerprint_engine.py     # AST 安全求值指纹匹配
 │   │   ├── correlation_engine.py     # YAML 规则执行器(37 规则)
 │   │   ├── monitor.py                # 监控 CRUD + 变更事件
-│   │   ├── scheduler.py              # 进程内调度器
 │   │   ├── risk_score.py             # 风险画像(score + level)
 │   │   └── watcher.py                # Watch 模式(持续监控 + 告警)        ★ v0.7
 │   ├── db/

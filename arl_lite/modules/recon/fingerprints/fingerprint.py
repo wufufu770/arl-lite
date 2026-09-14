@@ -77,17 +77,18 @@ class FingerprintModule(BaseModule):
         # target 是 URL 或 host[:port]
         url = target if target.startswith("http") else f"http://{target}"
 
-        # 1. 拉响应
-        try:
+        # 1. 拉响应(裸 host 默认 http;网络级失败再试 https,
+        # 否则纯 https 站点会漏检)
+        def _is_cert_error(e: Exception) -> bool:
+            if isinstance(e, ssl.SSLCertVerificationError):
+                return True
+            return isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError)
+
+        def _fetch_once(target_url: str):
             req = urllib.request.Request(
-                url,
+                target_url,
                 headers={"User-Agent": "Mozilla/5.0 (compatible; arl-lite)"},
             )
-
-            def _is_cert_error(e: Exception) -> bool:
-                if isinstance(e, ssl.SSLCertVerificationError):
-                    return True
-                return isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError)
 
             def _fetch():
                 # 默认校验证书,自签/过期再降级重试(与 httpx_probe 同策略)
@@ -95,12 +96,30 @@ class FingerprintModule(BaseModule):
                     return urllib.request.urlopen(
                         req, timeout=timeout, context=_ssl_context(verify=True))
                 except Exception as e:
-                    if url.startswith("https://") and _is_cert_error(e):
+                    if target_url.startswith("https://") and _is_cert_error(e):
                         return urllib.request.urlopen(
                             req, timeout=timeout, context=_ssl_context(verify=False))
                     raise
 
-            resp = await asyncio.get_running_loop().run_in_executor(None, _fetch)
+            return asyncio.get_running_loop().run_in_executor(None, _fetch)
+
+        try:
+            try:
+                resp = await _fetch_once(url)
+                if url.startswith("http://") and not hasattr(resp, "status"):
+                    raise RuntimeError("no http response")
+            except (urllib.error.URLError, OSError, RuntimeError) as e:
+                # http 打不通(连接拒绝/非 HTTP 服务)→ 试 https;
+                # HTTPError(4xx/5xx)说明 http 本身通,不重试
+                if not url.startswith("http://") or isinstance(e, urllib.error.HTTPError):
+                    raise
+                alt = "https://" + url[len("http://"):]
+                try:
+                    resp = await _fetch_once(alt)
+                    url = alt
+                except (urllib.error.URLError, OSError):
+                    raise e  # 两个 scheme 都失败,抛原始错误
+
             body = resp.read(200 * 1024).decode("utf-8", errors="ignore")
             status = resp.status
             headers = {k: v for k, v in resp.headers.items()}

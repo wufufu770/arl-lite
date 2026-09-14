@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import time
 import ipaddress
+import itertools
 import socket
 
 from ....core.base_module import BaseModule, ModuleResult
@@ -32,7 +33,9 @@ def resolve_host(target: str) -> list[str]:
         if net.num_addresses > 256:
             log.warning(f"portscan: {target} has {net.num_addresses} hosts, "
                         f"truncating to first 256 (safety)")
-            return [str(ip) for ip in list(net.hosts())[:256]]
+            # islice 惰性取前 256;list(net.hosts()) 会先物化全量
+            # (/8 = 1600 万对象,"安全截断"本身成了内存炸弹)
+            return [str(ip) for ip in itertools.islice(net.hosts(), 256)]
         return [str(ip) for ip in net.hosts()]
     except ValueError:
         pass

@@ -116,13 +116,22 @@ async def run_subfinder(
             if not isinstance(obj, dict):
                 continue
             host = obj.get("host") or obj.get("domain") or obj.get("subdomain")
-            if isinstance(host, str) and host.endswith(domain) and valid_hostname(host) and host not in seen:
+            if not isinstance(host, str):
+                continue
+            # 后缀必须按 label 边界:endswith(domain) 会把 notexample.com
+            # 误判成 example.com 的子域(与 crtsh/otx 等源同款语义)
+            lowered = host.lower()
+            if lowered != domain.lower() and not lowered.endswith("." + domain):
+                continue
+            if valid_hostname(host) and host not in seen:
                 seen.add(host)
-                yield host.lower()
+                yield lowered
         except json.JSONDecodeError:
             # 兼容纯文本输出
-            if line.endswith(domain) and valid_hostname(line) and line not in seen:
+            lowered = line.lower()
+            if lowered.endswith("." + domain) and valid_hostname(line) and line not in seen:
                 seen.add(line)
+                yield lowered
                 yield line.lower()
 
 

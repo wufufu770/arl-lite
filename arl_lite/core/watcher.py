@@ -264,7 +264,8 @@ class Watcher:
             self._current_runner = None
 
         after = self._count_assets()
-        new_by_type = {t: after.get(t, 0) - before.get(t, 0)
+        # max(0):资产被删/并发清库时差值可为负,通知语义只关心"新增"
+        new_by_type = {t: max(0, after.get(t, 0) - before.get(t, 0))
                        for t in ("hosts", "domains", "findings")}
         new_total = sum(new_by_type.values())
 

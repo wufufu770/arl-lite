@@ -9,3 +9,4 @@ dist/
 cli_test_report*.html
 *.tar.gz
 *_export.json
+recon_results/recon_results_*/

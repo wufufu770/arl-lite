@@ -1,7 +1,7 @@
 .PHONY: help install test test1 test2 test3 test-edge test-concurrency clean run query stats version tools correlate monitor risk tui all-in-one
 
 help:
-	@echo "arl-lite Makefile v0.7.7"
+	@echo "arl-lite Makefile v0.7.8"
 	@echo ""
 	@echo "  make install        安装 arl-lite 本体"
 	@echo "  make test           跑全部 9 套测试(phase1-7 + edge + concurrency)"
@@ -17,7 +17,7 @@ help:
 install:
 	bash install.sh
 
-test: test1 test2 test3 test4 test5 test6 test-edge test-concurrency
+test: test1 test2 test3 test4 test5 test6 test7 test-edge test-concurrency
 
 test1:
 	PYTHONPATH=. python3 tests/test_phase1.py

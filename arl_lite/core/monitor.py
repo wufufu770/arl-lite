@@ -109,10 +109,16 @@ class Monitor:
                  monitor_id, self.s.workspace_id)
             )
 
+    _ASSET_TABLES = {"domain": "domains", "host": "hosts", "port": "ports",
+                     "site": "sites", "finding": "findings"}
+
     def detect_changes(self, asset_type: str, since_iso: str) -> list[dict]:
         """检测 since 之后的新增资产(基于 first_seen)"""
-        # asset_type: domain / host / port / site / finding
-        table = asset_type + "s" if asset_type != "finding" else "findings"
+        # asset_type 白名单(与 storage.query 同纪律),不拼接
+        table = self._ASSET_TABLES.get(asset_type)
+        if table is None:
+            raise ValueError(f"unknown asset_type: {asset_type!r} "
+                             f"(choose from {sorted(self._ASSET_TABLES)})")
         with self.s._conn() as conn:
             rows = conn.execute(
                 f"SELECT * FROM {table} WHERE workspace_id = ? AND first_seen >= ?",

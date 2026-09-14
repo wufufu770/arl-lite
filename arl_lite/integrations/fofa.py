@@ -54,19 +54,25 @@ async def query_fofa(
     q = f'domain="{domain}"'
     qb64 = base64.b64encode(q.encode()).decode()
     fields = "host,ip,port"  # 至少需要 host
-    params = {
+    # 走 POST body:key 不再出现在 URL/代理/服务端 access log
+    # (FOFA /search/all 官方同时支持 GET query 与 POST form)
+    body = urllib.parse.urlencode({
         "qbase64": qb64,
         "email": email,
         "key": api_key,
         "size": size,
         "fields": fields,
-    }
-    url = FOFA_URL + "?" + urllib.parse.urlencode(params)
+    }).encode()
 
     def _do_request():
         req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "arl-lite/0.2"},
+            FOFA_URL,
+            data=body,
+            headers={
+                "User-Agent": "arl-lite/0.2",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            method="POST",
         )
         return urllib.request.urlopen(req, timeout=timeout)
 

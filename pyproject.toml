@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "arl-lite"
-version = "0.7.7"
+version = "0.7.8"
 description = "灯塔 ARL 降级增强版:2G 内存友好的资产侦察工具,CLI/TUI 形态,集成 AI"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,4 +38,4 @@ arl-lite = "arl_lite.cli:main"
 include = ["arl_lite*"]
 
 [tool.setuptools.package-data]
-arl_lite = ["db/*.sql", "fingerprints/*.json", "prompts/*.txt"]
+arl_lite = ["db/*.sql", "fingerprints/*.json"]

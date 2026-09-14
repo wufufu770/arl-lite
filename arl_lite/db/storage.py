@@ -190,18 +190,19 @@ class Storage:
 
         # 1. 补缺列(从 v0.2 → v0.3)
         cur_cols = {row["name"] for row in conn.execute("PRAGMA table_info(correlations)").fetchall()}
+        # 迁移列 → 字面量 SQL 映射(列名/类型是代码写死的常量,不走 f-string 拼接)
         needed = {
-            "target": "TEXT",
-            "target_type": "TEXT",
-            "headline": "TEXT",
-            "advice": "TEXT",
-            "tags": "TEXT",
-            "rule_description": "TEXT",
+            "target": "ALTER TABLE correlations ADD COLUMN target TEXT",
+            "target_type": "ALTER TABLE correlations ADD COLUMN target_type TEXT",
+            "headline": "ALTER TABLE correlations ADD COLUMN headline TEXT",
+            "advice": "ALTER TABLE correlations ADD COLUMN advice TEXT",
+            "tags": "ALTER TABLE correlations ADD COLUMN tags TEXT",
+            "rule_description": "ALTER TABLE correlations ADD COLUMN rule_description TEXT",
         }
-        for col, typ in needed.items():
+        for col, sql in needed.items():
             if col not in cur_cols:
                 try:
-                    conn.execute(f"ALTER TABLE correlations ADD COLUMN {col} {typ}")
+                    conn.execute(sql)
                     log.info(f"migrated: correlations ADD COLUMN {col}")
                 except Exception as e:
                     log.warning(f"failed to add column {col}: {e}")
@@ -609,8 +610,18 @@ class Storage:
         TABLES_WITH_MODULE = {"domains", "hosts", "ports", "sites", "findings"}
 
         with self._conn() as conn:
-            # 列名白名单:只接受表里真实存在的列(防列名注入/拼写错静默丢列)
-            valid_cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+            # 列名白名单:只接受表里真实存在的列(防列名注入/拼写错静默丢列)。
+            # table 已过上方 ALLOWED_TABLES 白名单;PRAGMA 用字面量映射,
+            # 不拼接表名
+            _PRAGMA_BY_TABLE = {
+                "domains": "PRAGMA table_info(domains)",
+                "hosts": "PRAGMA table_info(hosts)",
+                "ports": "PRAGMA table_info(ports)",
+                "sites": "PRAGMA table_info(sites)",
+                "findings": "PRAGMA table_info(findings)",
+                "correlations": "PRAGMA table_info(correlations)",
+            }
+            valid_cols = {r["name"] for r in conn.execute(_PRAGMA_BY_TABLE[table]).fetchall()}
             # 分批提交:单事务持写锁过长会让其他进程撞 "database is locked"
             BATCH = 500
             # 一次事务内全部 execute,大幅提升吞吐

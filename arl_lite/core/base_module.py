@@ -128,7 +128,13 @@ class BaseModule(ABC):
         self.task_id = task_id
         self.workspace_id = workspace_id
         self.config = config or {}
-        self.storage = storage  # 共享 storage 实例(TaskRunner 注入)
+        if storage is not None:
+            self.storage = storage  # 共享 storage 实例(TaskRunner 注入)
+        else:
+            # 兜底:单独实例化模块跑(脚本/测试)时不再 AttributeError;
+            # 生产路径 TaskRunner 始终注入,不触发这里
+            from ..db.storage import Storage
+            self.storage = Storage(workspace="default")
         self._stop_requested = False
 
     # === 生命周期钩子 ===

@@ -21,10 +21,15 @@ import logging
 import os
 import shutil
 import sys
-import termios
-import tty
 import unicodedata
 from typing import Callable
+
+try:  # termios/tty 仅 Unix;Windows 上 import arl_lite.tui 不再直接炸
+    import termios
+    import tty
+except ImportError:  # pragma: no cover
+    termios = None
+    tty = None
 
 from .. import __version__
 
@@ -453,6 +458,10 @@ def run_tui(workspace: str = "default") -> None:
     """启动 TUI(需要交互终端)"""
     from ..db.storage import Storage
 
+    if termios is None or tty is None:
+        print("[!] TUI 仅支持 Unix/Linux(需要 termios)。"
+              "Windows 请用 query / stats / export 子命令。", file=sys.stderr)
+        sys.exit(2)
     if not (hasattr(sys.stdin, "isatty") and sys.stdin.isatty()):
         print("[!] TUI 需要交互终端(cron/管道下不可用)。"
               "请用 query / stats / export 子命令。", file=sys.stderr)

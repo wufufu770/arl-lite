@@ -15,6 +15,8 @@ crt.sh 是 Comodo 的证书透明度日志搜索引擎,免费、无需 token、�
 """
 from __future__ import annotations
 
+import asyncio
+
 import json
 import urllib.request
 import urllib.error
@@ -112,6 +114,3 @@ async def collect_subdomains(
     except Exception as e:
         return [], f"{type(e).__name__}: {e}", "unknown"
 
-
-# 引入 asyncio
-import asyncio

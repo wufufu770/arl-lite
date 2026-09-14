@@ -118,8 +118,12 @@ def _decode_name(data: bytes, offset: int) -> tuple[str, int]:
     return name, (original_offset if jumped else offset)
 
 
-def _query(server: str, name: str, rtype: int, timeout: int = 5) -> bytes:
-    """发 DNS query,返回 raw response bytes"""
+def _query(server: str, name: str, rtype: int, timeout: int = 5) -> tuple[bytes, int]:
+    """发 DNS query,返回 (raw response bytes, 发出的 txid)
+
+    返回 txid 让调用方校验响应——不校验的话,同网段攻击者抢答伪造
+    响应即可投毒解析结果。
+    """
     # 构造 query
     txid = random.randint(0, 0xFFFF)
     header = struct.pack(">HHHHHH", txid, 0x0100, 1, 0, 0, 0)  # 标准 query
@@ -131,7 +135,7 @@ def _query(server: str, name: str, rtype: int, timeout: int = 5) -> bytes:
     try:
         sock.sendto(pkt, (server, 53))
         resp, _ = sock.recvfrom(4096)
-        return resp
+        return resp, txid
     finally:
         sock.close()
 
@@ -201,14 +205,14 @@ def _parse_response(data: bytes) -> tuple[int, int, list[DNSRecord]]:
                         i += l
                     value = " ".join(txt_parts)
                 elif rtype == RTYPE_SOA:
-                    mname, _ = _decode_name(data, offset - rdlength)
-                    rname_pos = offset - rdlength + len(mname) + 2
-                    # 重算:用新起点
-                    mname, new_offset = _decode_name(data, offset - rdlength)
-                    rname, _ = _decode_name(data, new_offset)
-                    if new_offset + 20 <= offset:
+                    # SOA RDATA = mname + rname + 5×uint32
+                    mname, rname_start = _decode_name(data, offset - rdlength)
+                    rname, rname_end = _decode_name(data, rname_start)
+                    if rname_end + 20 <= offset:
+                        # 定时器必须从 rname 结束处取;从 mname 结束处取会把
+                        # rname 的字节当成 serial(实测 serial 全错)
                         serial, refresh, retry, expire, minimum = struct.unpack(
-                            ">IIIII", data[new_offset:new_offset + 20]
+                            ">IIIII", data[rname_end:rname_end + 20]
                         )
                     else:
                         serial = refresh = retry = expire = minimum = 0
@@ -274,7 +278,11 @@ def lookup(name: str, server: str | None = None, timeout: int = 5) -> dict:
     errors = []
     for rtype, name_str in rtypes:
         try:
-            data = _query(server, name, rtype, timeout=timeout)
+            data, sent_txid = _query(server, name, rtype, timeout=timeout)
+            # TXID 不匹配 = 抢答/伪造包,丢弃(同网段投毒防线)
+            if len(data) >= 2 and struct.unpack(">H", data[:2])[0] != sent_txid:
+                errors.append(f"{name_str}: txid mismatch (spoofed response dropped)")
+                continue
             rcode, ancount, records = _parse_response(data)
             if rcode != 0:
                 errors.append(f"{name_str}: rcode={rcode}")
