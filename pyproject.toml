@@ -39,3 +39,9 @@ include = ["arl_lite*"]
 
 [tool.setuptools.package-data]
 arl_lite = ["db/*.sql", "fingerprints/*.json"]
+
+[tool.pytest.ini_options]
+# async def test_xxx() 需要 auto 模式才会被 pytest-asyncio 接管。
+# 之前没配这一项,9 个 async 测试全部被 skip 成 "async def functions are not natively supported",
+# 覆盖率比看起来低很多。
+asyncio_mode = "auto"

@@ -6,6 +6,7 @@ Phase 1 实现,够用就好,不引入 Celery/Redis。
 """
 from __future__ import annotations
 
+import os
 import time
 import json
 import logging
@@ -18,6 +19,21 @@ from ..db.storage import Storage
 from ..modules.registry import discover_modules
 
 log = logging.getLogger("arl_lite.task_runner")
+
+# 并发上限:同时跑几个 module
+#
+# 之前是 asyncio.gather 把所有 module 一起放出去,而 module 内部还有自己的
+# 并发(如 httpx_probe.DEFAULT_CONCURRENCY=50)。9 个 module 一起跑 = 峰值 450
+# 个请求同时打向 crt.sh / hackertarget 这类公共源,容易被限流甚至封 IP。
+# 这里给 module 层加一道闸,module 内部并发不变,只限制同时活跃的 module 数。
+MAX_CONCURRENT_MODULES = int(os.environ.get("ARL_MAX_CONCURRENT_MODULES", "4"))
+
+# 单 module 超时(秒)
+#
+# 之前 module 卡死(比如对某个不响应的端口做 connect 超时循环)会拖死整个 task,
+# gather 永远不返回,任务永远挂着,watcher 也会被这个卡住。
+# 兜底超时让"卡死"降级成"这个源失败",符合三态纪律:失败必须可区分。
+MODULE_TIMEOUT_SECONDS = int(os.environ.get("ARL_MODULE_TIMEOUT", "180"))
 
 
 class TaskRunner:
@@ -123,33 +139,51 @@ class TaskRunner:
         # 记录每个源的状态(并发前后都会写)
         # 这里预占位,结果在并发后写
 
-        # 4. 并发执行(Phase 2:9 源并行,总时间 = max 而非 sum)
+        # 4. 并发执行(Phase 2:多源并行,总时间 = max 而非 sum)
         results: list[ModuleResult] = []
         if not selected:
             log.warning(f"task {task_id} no modules selected")
         else:
+            # module 层并发闸:同一时刻最多 MAX_CONCURRENT_MODULES 个源在跑
+            semaphore = asyncio.Semaphore(MAX_CONCURRENT_MODULES)
+
             async def _run_one(mod):
                 if mod.should_stop():
                     log.warning(f"task {task_id} stopped before {mod.name}")
                     return None
-                try:
-                    log.info(f"[{mod.name}] running on {target}...")
-                    await mod.setup()
-                    result = await mod.run(target)
-                    await mod.teardown()
-                    log.info(
-                        f"[{mod.name}] done: found={result.found} "
-                        f"duration={result.duration_seconds:.1f}s errors={len(result.errors)}"
-                    )
-                    return result
-                except Exception as e:
-                    log.exception(f"[{mod.name}] crashed: {e}")
-                    return ModuleResult(
-                        success=False, target=target, found=0,
-                        duration_seconds=0, errors=[f"{mod.name} crashed: {e}"],
-                    )
+                async with semaphore:
+                    try:
+                        log.info(f"[{mod.name}] running on {target}...")
+                        await mod.setup()
+                        # 单 module 超时兜底:卡死的源降级成"失败"而不是拖死整个 task
+                        try:
+                            result = await asyncio.wait_for(
+                                mod.run(target), timeout=MODULE_TIMEOUT_SECONDS
+                            )
+                        except asyncio.TimeoutError:
+                            duration = MODULE_TIMEOUT_SECONDS
+                            log.error(
+                                f"[{mod.name}] timeout after {duration}s, marking as failed"
+                            )
+                            return ModuleResult(
+                                success=False, target=target, found=0,
+                                duration_seconds=duration,
+                                errors=[f"{mod.name} timeout after {duration}s"],
+                            )
+                        await mod.teardown()
+                        log.info(
+                            f"[{mod.name}] done: found={result.found} "
+                            f"duration={result.duration_seconds:.1f}s errors={len(result.errors)}"
+                        )
+                        return result
+                    except Exception as e:
+                        log.exception(f"[{mod.name}] crashed: {e}")
+                        return ModuleResult(
+                            success=False, target=target, found=0,
+                            duration_seconds=0, errors=[f"{mod.name} crashed: {e}"],
+                        )
 
-            # asyncio.gather 让所有 module 并发跑
+            # asyncio.gather 让所有 module 并发跑(semaphore 限制同时活跃数)
             # return_exceptions=True 防止一个 module 异常杀掉其他
             gathered = await asyncio.gather(
                 *(_run_one(mod) for mod in selected),

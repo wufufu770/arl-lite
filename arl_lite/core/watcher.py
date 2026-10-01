@@ -11,10 +11,13 @@ Watch 模式 — 持续监控目标,新发现/变化时告警。
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 
 log = logging.getLogger("arl_lite.core.watcher")
 
@@ -99,20 +102,46 @@ class Watcher:
     - SIGTERM / stop() 优雅退出
     """
 
-    def __init__(self, storage, webhook_config=None, on_run=None):
+    def __init__(self, storage, webhook_config=None, on_run=None, state_path=None):
         self.storage = storage
         self.webhook = webhook_config
         self.on_run = on_run  # 可选 callback(target, found, duration, new_count)
+        # 状态落盘路径:CLI 传入 ~/.arl-lite/watch/watch.json。
+        # 为 None 时 watcher 不落盘(库/测试场景,纯内存调度)。
+        self.state_path = state_path
         self._targets: dict[str, WatchTarget] = {}
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+
+    def _persist_state(self) -> None:
+        """把运行态写回 state_path(原子替换,避免半截文件)
+
+        last_run/next_run 之前只活在内存,进程一重启就丢,watcher 会认为
+        "从没跑过"从而立刻重复扫描。周期配得短的话等于自己打爆数据源。
+        """
+        if not self.state_path:
+            return
+        try:
+            with self._lock:
+                payload = [wt.to_dict() for wt in self._targets.values()]
+            path = Path(self.state_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
+            os.replace(tmp, path)  # 原子替换
+        except Exception as e:
+            # 落盘失败不该拖垮调度循环——watcher 主功能不依赖它
+            log.warning(f"watch: failed to persist state: {e}")
 
     def add(self, target: str, modules=None, interval_seconds: int = 86400) -> WatchTarget:
         """添加 watch target"""
         wt = WatchTarget(target, modules, interval_seconds)
         with self._lock:
             self._targets[target] = wt
+        self._persist_state()
         log.info(f"watch: added target={target} modules={wt.modules} interval={wt.interval_seconds}s")
         return wt
 
@@ -120,6 +149,7 @@ class Watcher:
         with self._lock:
             if target in self._targets:
                 del self._targets[target]
+                self._persist_state()
                 log.info(f"watch: removed target={target}")
                 return True
         return False
@@ -214,6 +244,9 @@ class Watcher:
                 wt.next_run = datetime.fromtimestamp(
                     time.time() + wt.interval_seconds
                 ).isoformat()
+                # 运行态回写落盘:之前 last_run/next_run 只活在内存里,
+                # 进程重启后 watcher 不知道上次跑过,会立刻重复扫一遍。
+                self._persist_state()
             # sleep 到下次(或 stop)
             if next_wake is None:
                 wait = 60.0  # 没目标时 60s 醒一次

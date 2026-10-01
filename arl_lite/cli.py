@@ -729,10 +729,17 @@ def cmd_watch_add(args) -> int:
         "target": args.target,
         "modules": modules or ["dns", "whois", "subfinder", "crtsh"],
         "interval_seconds": args.interval,
+        # 运行态也落盘:之前只存 3 个字段,进程重启后 watcher 不知道
+        # 上次什么时候跑的,会立刻重复扫一遍,周期越短越容易打爆数据源
+        "last_run": None,
+        "next_run": None,
+        "last_status": None,
     }
-    targets = [t for t in targets if t["target"] != args.target]
+    targets = [t for t in targets if t.get("target") != args.target]
     targets.append(entry)
-    state_file.write_text(json.dumps(targets, indent=2, ensure_ascii=False))
+    state_file.write_text(
+        json.dumps(targets, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     print(f"[+] watch: added {args.target} (interval={args.interval}s)")
     print(f"    state: {state_file}")
     return 0
@@ -745,10 +752,12 @@ def cmd_watch_remove(args) -> int:
     if not state_file.exists():
         print("[!] no watch state")
         return 1
-    targets = json.loads(state_file.read_text())
+    targets = json.loads(state_file.read_text(encoding="utf-8"))
     before = len(targets)
-    targets = [t for t in targets if t["target"] != args.target]
-    state_file.write_text(json.dumps(targets, indent=2, ensure_ascii=False))
+    targets = [t for t in targets if t.get("target") != args.target]
+    state_file.write_text(
+        json.dumps(targets, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     if len(targets) < before:
         print(f"[+] removed {args.target}")
         return 0
@@ -763,7 +772,7 @@ def cmd_watch_list(args) -> int:
     if not state_file.exists():
         print("[i] no watch targets (use `arl-lite watch add` first)")
         return 0
-    targets = json.loads(state_file.read_text())
+    targets = json.loads(state_file.read_text(encoding="utf-8"))
     if not targets:
         print("[i] watch list empty")
         return 0
@@ -772,6 +781,9 @@ def cmd_watch_list(args) -> int:
         modules = ",".join(t.get("modules", []) or []) or "(default)"
         interval = t.get("interval_seconds", 86400)
         print(f"  - {t['target']:30} modules={modules} interval={interval}s")
+        last_run = t.get("last_run")
+        if last_run:
+            print(f"    last_run={last_run} status={t.get('last_status') or '-'}")
     return 0
 
 
@@ -790,7 +802,7 @@ def cmd_watch_start(args) -> int:
         return 1
 
     storage = Storage(workspace=getattr(args, "workspace", "default"))
-    w = Watcher(storage)
+    w = Watcher(storage, state_path=state_file)
     skipped = 0
     for t in targets_data:
         # 历史坏 entry(如空 target)跳过并告警,不中断整个 watch
@@ -800,7 +812,18 @@ def cmd_watch_start(args) -> int:
             skipped += 1
             continue
         try:
-            w.add(target, modules=t.get("modules"), interval_seconds=t.get("interval_seconds", 86400))
+            wt = w.add(
+                target,
+                modules=t.get("modules"),
+                interval_seconds=t.get("interval_seconds", 86400),
+            )
+            # 恢复持久化的运行态:不恢复的话 next_run 为空 → watcher 认为
+            # "从没跑过" → 重启后立刻重复扫一遍,把数据源打爆
+            if isinstance(t, dict):
+                for key in ("last_run", "next_run", "last_count", "run_count", "new_count"):
+                    val = t.get(key)
+                    if val is not None:
+                        setattr(wt, key, val)
         except (ValueError, TypeError) as e:
             log.warning(f"watch: skipping invalid entry {target!r}: {e}")
             skipped += 1
