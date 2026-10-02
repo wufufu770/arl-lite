@@ -239,6 +239,43 @@ def test_recover_stale_is_idempotent(loop):
 
 
 # =====================================================================
+# done 由谁断言
+# =====================================================================
+
+
+def test_operator_asserted_completion_is_labelled(loop):
+    """纯人工模式下,done 必须标明是人工断言而非引擎核实
+
+    引擎只看到"门禁全绿",看不到"活干了没有"。实测里误报率实测这条
+    待办被连标两次 done,而那两轮都没真的做它 —— 不标注就等于
+    让状态文件替执行者背书它没做过的事。
+    """
+    q = Queue(loop.dev_dir / "queue.json")
+    q.save([Item(id="todo", title="要做的事", detail="d",
+                 priority=1, kind="change")])
+
+    outcome = loop.round()
+
+    assert outcome.record.completion_source == "operator"
+    assert any("no build executor" in m for m in outcome.messages), outcome.messages
+    # summary 里也要看得见
+    assert "asserted by operator" in outcome.summary()
+
+
+def test_build_fn_completion_is_marked_as_verified(loop):
+    """注入了 build 回调时,done 才是引擎问过执行者的"""
+    q = Queue(loop.dev_dir / "queue.json")
+    q.save([Item(id="todo", title="要做的事", detail="d",
+                 priority=1, kind="change")])
+
+    outcome = loop.round(build=lambda item: (True, "做了"))
+
+    assert outcome.record.completion_source == "build_fn"
+    assert not any("no build executor" in m for m in outcome.messages)
+    assert "asserted by operator" not in outcome.summary()
+
+
+# =====================================================================
 # id 唯一性:重复 id 会让循环原地空转
 # =====================================================================
 #

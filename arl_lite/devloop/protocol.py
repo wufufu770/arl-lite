@@ -70,6 +70,13 @@ class RoundOutcome:
             f"  gates     : {r.gates_passed} passed, {r.gates_failed} failed, {r.gates_warned} warned",
             f"  duration  : {r.duration:.1f}s",
         ]
+        if r.item_id and r.completion_source == "operator" and r.result in (
+            RESULT_DONE, RESULT_DONE_WITH_FAILURES
+        ):
+            lines.append(
+                "  completion: asserted by operator (no build executor; "
+                "the engine only verified the gates)"
+            )
         if r.blocking_failures:
             lines.append(f"  blocking  : {', '.join(r.blocking_failures)}")
         if r.metrics:
@@ -409,6 +416,13 @@ class Loop:
         b = self.phase_build(state, item)
         if not b.ok:
             messages.append(f"BUILD failed: {b.detail}")
+        # 记下这一轮的 done 由谁断言。纯人工模式下引擎只看到"门禁全绿",
+        # 看不到"活干了没有"——不区分,状态文件就是在替执行者背书。
+        record.completion_source = "build_fn" if builder is not None else "operator"
+        if item is not None and builder is None:
+            messages.append(
+                f"no build executor: '{item.id}' 的完成由人工断言,引擎只验证了门禁"
+            )
 
         # 3. TEST
         t = self.phase_test(state, only=only_gates)

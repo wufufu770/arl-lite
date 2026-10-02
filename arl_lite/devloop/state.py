@@ -58,6 +58,15 @@ class RoundRecord:
     blocking_failures: list[str] = field(default_factory=list)
     metrics: dict[str, Any] = field(default_factory=dict)
     note: str = ""
+    # 这一轮的 done 是**谁**断言的。
+    #   "build_fn"     —— 注入了 build 回调,引擎问过执行者,它说做完了
+    #   "operator"     —— 纯人工:门禁绿了就标 done,引擎无从核实
+    #
+    # 为什么必须记:引擎的设计是"不自动改代码",没有 build_fn 时它只能
+    # 看到"门禁全绿",看不到"活到底干了没有"。实测里多次出现门禁全绿但
+    # 那一轮其实没做队列里那条待办的情况(误报率实测被连标两次 done)。
+    # 不区分这两种 done,状态文件就是在替执行者背书它没做过的事。
+    completion_source: str = "operator"
 
     @property
     def duration(self) -> float:

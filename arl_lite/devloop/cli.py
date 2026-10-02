@@ -102,10 +102,12 @@ def _cmd_history(args) -> int:
     print(f"last {min(n, len(state.history))} of {len(state.history)} rounds:\n")
     for rec in state.history[-n:]:
         mark = "OK " if rec.result in ("DONE", "DONE_WITH_FAILURES") else "-- "
+        # 人工断言的完成要标出来,否则 history 读起来像是引擎核实过的
+        src = " [op]" if rec.completion_source == "operator" and rec.item_id else ""
         print(
             f"  {mark}r{rec.round:<4} {rec.result:<22} "
             f"{rec.gates_passed}P/{rec.gates_failed}F  {rec.duration:>6.1f}s  "
-            f"{rec.item_id or '(none)'}"
+            f"{rec.item_id or '(none)'}{src}"
         )
         if rec.blocking_failures:
             print(f"        blocking: {', '.join(rec.blocking_failures)}")
