@@ -11,3 +11,6 @@ devloop/state.json
 devloop/queue.json
 devloop/*.tmp
 devloop/*.corrupt
+
+# 测试产物:tests/test_phase6.py::test_html_report 会生成在 CWD
+cli_test_report.html
