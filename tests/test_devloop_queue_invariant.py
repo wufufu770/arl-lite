@@ -700,3 +700,146 @@ def test_real_repo_queue_has_at_most_one_in_progress():
         f"真实队列有 {len(in_progress)} 条同时 in_progress: {in_progress}\n"
         f"  一轮最多一条;多条说明引擎在按 id 改同一条的另一份副本。"
     )
+
+
+# =====================================================================
+# 队列基础操作的覆盖
+# =====================================================================
+#
+# 这几条是从 `arl_lite/devloop/queue.py` 里那个 62 行的 `_self_test`
+# 迁过来的。那是个手写自测,挂在 `python3 -m arl_lite.devloop.queue` 上,
+# 问题是三重的:
+#
+#   1. 它用裸 `assert`,而 `python -O` 会把 assert 整条剥掉 —— 那个开关下
+#      它会"通过"而什么都没验
+#   2. 它不进 CI,没人跑它,坏了也没人知道
+#   3. 它是**第二套**测试入口,和 pytest 各验一遍,漂移了没人发现
+#
+# 更要紧的是它是这四个行为的**唯一**覆盖:`mark_dropped` / `stats` /
+# `next` 的排序键 / `by_priority` 分档,在 pytest 里一条都没有。删掉它
+# 等于删掉真覆盖,所以顺序是:先在这里补上,验住,再删。
+# 生产代码里不该留测试 —— 该留的是被测逻辑。
+
+
+def test_sort_key_orders_by_priority_then_round_then_id():
+    """next() 的排序键:(priority, created_round, id) 升序
+
+    三个键的顺序是刻意的:优先级高的先做,同优先级先做早提出的,
+    还一样就按 id 稳定排 —— 最后一键保证同样输入永远给同样结果,
+    否则队列顺序会在两次运行之间抖动。
+    """
+    items = [
+        Item(id="c", title="c", detail="", priority=1, created_round=1),
+        Item(id="a", title="a", detail="", priority=0, created_round=9),
+        Item(id="b", title="b", detail="", priority=1, created_round=0),
+        Item(id="d", title="d", detail="", priority=1, created_round=1),
+    ]
+    for it in items:
+        it.status = "pending"
+    q = Queue(Path("/nonexistent/q.json"))
+    got = []
+    rest = list(items)
+    while rest:
+        it = q.next(rest)
+        got.append(it.id)
+        rest = [x for x in rest if x.id != it.id]
+    # P0 优先;同为 P1 时先 created_round=0 的 b,再 round=1 的 c/d
+    # (同 round 同 priority 按 id 字典序:c < d)
+    assert got == ["a", "b", "c", "d"], got
+
+
+def test_next_skips_non_pending(tmp_path):
+    """done / dropped / in_progress 都不该被 next 选中"""
+    q = Queue(tmp_path / "q.json")
+    items = [
+        Item(id="done", title="d", detail="", status="done"),
+        Item(id="dropped", title="d", detail="", status="dropped"),
+        Item(id="busy", title="b", detail="", status="in_progress"),
+        Item(id="open", title="o", detail="", status="pending", priority=3),
+    ]
+    q.save(items)
+    assert q.next().id == "open", "next 必须跳过非 pending"
+
+
+def test_mark_dropped_records_the_reason_and_keeps_done_round(tmp_path):
+    """dropped 要记原因,且**不覆盖**已有的 done_round
+
+    保留 done_round 是为了审计:一条被丢掉的活曾经是在第几轮被做过的,
+    这个事实不能因为后续丢弃而消失。
+    """
+    q = Queue(tmp_path / "q.json")
+    it = Item(id="x", title="t", detail="")
+    it.done_round = 5
+    q.save([it])
+
+    loaded = q.load()[0]
+    q.mark_dropped(loaded, "前提不成立")
+    q.save([loaded])
+
+    back = q.load()[0]
+    assert back.status == "dropped"
+    assert "前提不成立" in back.note
+    assert "dropped:" in back.note
+    assert back.done_round == 5, "dropped 不该抹掉它曾经被做过的轮次"
+
+
+def test_mark_dropped_appends_to_existing_note(tmp_path):
+    """已有的备注不能被丢弃原因覆盖掉"""
+    q = Queue(tmp_path / "q.json")
+    it = Item(id="x", title="t", detail="", note="前情提要")
+    q.save([it])
+    loaded = q.load()[0]
+    q.mark_dropped(loaded, "原因二")
+    q.save([loaded])
+    note = q.load()[0].note
+    assert "前情提要" in note and "原因二" in note, note
+
+
+def test_stats_counts_every_status_and_buckets_by_priority(tmp_path):
+    """stats 是 status 面板的数据源,漏一个状态就看不出真实分布
+
+    `status_text` 打印的 pending/in_progress/done/dropped 和 by_priority
+    全从这里来,少统计一个,面板就会安静地少显示一类条目 ——
+    正是第 12 轮"8 条鬼影"能潜伏那么久的原因。
+    """
+    q = Queue(tmp_path / "q.json")
+    # 5 条 pending 的优先级 0,1,2,3,0 —— 0 故意出现两次,
+    # 用来验 by_priority 数的是**条目数**而不是去重后的档位数
+    q.save([
+        Item(id=f"p{i}", title="t", detail="", status="pending", priority=i % 4)
+        for i in range(5)
+    ] + [
+        Item(id="b", title="t", detail="", status="in_progress", priority=1),
+        Item(id="d1", title="t", detail="", status="done", priority=1),
+        Item(id="d2", title="t", detail="", status="dropped", priority=2),
+    ])
+    st = q.stats()
+    assert st["pending"] == 5, st
+    assert st["in_progress"] == 1, st
+    assert st["done"] == 1, st
+    assert st["dropped"] == 1, st
+    assert st["total"] == 8, st
+    # by_priority 必须四个档都在,即使某档是 0 —— 面板要稳定显示 P0..P3
+    assert set(st["by_priority"]) == {0, 1, 2, 3}, st
+    assert st["by_priority"][0] == 2, st   # p0, p4
+    assert st["by_priority"][1] == 3, st   # p1, p3 + in_progress + done
+    assert st["by_priority"][2] == 2, st   # p2 + dropped
+    assert st["by_priority"][3] == 1, st   # p1... i=3
+    assert sum(st["by_priority"].values()) == st["total"], (
+        f"by_priority 漏了条目:{st}"
+    )
+
+
+def test_exhausted_is_false_while_anything_is_claimable(tmp_path):
+    """pending 或 in_progress 任一存在,队列就算没耗尽
+
+    这条是"永远有下一步"不变式的判据。in_progress 也算没耗尽,
+    因为那条活确实有人在做 —— 早先的软死局正是这里判错:
+    只认 pending 时,一条永远没人认领的 in_progress 会让队列
+    永远"非空"却永远选不出待办。
+    """
+    q = Queue(tmp_path / "q.json")
+    q.save([Item(id="a", title="t", detail="", status="in_progress")])
+    assert q.exhausted() is False
+    q.save([Item(id="a", title="t", detail="", status="done")])
+    assert q.exhausted() is True

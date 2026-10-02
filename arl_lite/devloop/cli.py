@@ -14,6 +14,15 @@
     arl-lite devloop repair          修复队列里的重复 id
     arl-lite devloop unmark <id>     把误标的 done 改回 pending
 
+多 agent 并行(三个命令构成"领活→干活→交活"的闭环):
+
+    arl-lite devloop claim                    原子认领一条待办
+    arl-lite devloop release <id>             放弃认领(挂掉/超时时)
+    arl-lite devloop done-item <id>           交活,标 done
+
+这三个必须走,不能直接改 queue.json —— 读-改-写整段不是原子的,
+并发下会丢更新(实测见 devloop/lock.py 的模块 docstring)。
+
 设计:所有子命令都不需要预先初始化,首次调用自动建目录和文件。
 循环必须自持——没有"先手动 setup 一步"这种事。
 """
@@ -58,8 +67,89 @@ def cmd_devloop(args) -> int:
         return _cmd_repair(args)
     if sub == "unmark":
         return _cmd_unmark(args)
+    if sub == "claim":
+        return _cmd_claim(args)
+    if sub == "release":
+        return _cmd_release(args)
+    if sub == "done-item":
+        return _cmd_finish_item(args)
     print("[!] unknown devloop subcommand; use --help", file=sys.stderr)
     return 2
+
+
+def _default_owner() -> str:
+    """默认认领者标识:agent 名(有就用)+ pid
+
+    pid 是必须的 —— 同一个 agent 名起两次也要能区分,
+    否则 status 里分不清是谁占着。
+    """
+    import os
+    name = os.environ.get("ARL_AGENT") or os.environ.get("AGENT_NAME") or "agent"
+    return f"{name}#{os.getpid()}"
+
+
+def _cmd_claim(args) -> int:
+    """原子认领一条待办 —— 多 agent 并行的入口"""
+    from .queue import Queue
+    owner = getattr(args, "owner", "") or _default_owner()
+    q = Queue(_loop().dev_dir / "queue.json")
+    it = q.claim(
+        owner=owner,
+        item_id=getattr(args, "item_id", None),
+    )
+    if it is None:
+        print("[i] nothing to claim (queue has no pending item)")
+        return 1
+    print(f"[+] claimed {it.id} — {it.title}")
+    print(f"    priority={it.priority} kind={it.kind} attempts={it.attempts}")
+    if it.verify:
+        print(f"    verify: {it.verify}")
+    return 0
+
+
+def _cmd_release(args) -> int:
+    """放弃认领(agent 挂掉/超时后用)"""
+    from .queue import Queue
+    q = Queue(_loop().dev_dir / "queue.json")
+    # 参数名必须是 note:Queue.release 的签名是 (item_id, note="")。
+    # 早先这里传的是 reason=,一调就 TypeError —— 命令看着存在,实际不可用。
+    ok = q.release(args.item_id, note=getattr(args, "reason", "") or "")
+    if not ok:
+        print(f"[!] {args.item_id} is not claimed by anyone", file=sys.stderr)
+        return 1
+    print(f"[+] released {args.item_id}")
+    return 0
+
+
+def _cmd_finish_item(args) -> int:
+    """收尾:标 done 或退回 pending
+
+    走这个而不是直接改 queue.json,是为了拿到 owner 校验 ——
+    万一两个 agent 领了同一条,后者不能覆盖前者的结果。
+    """
+    from .queue import Queue
+    loop = _loop()
+    q = Queue(loop.dev_dir / "queue.json")
+    failed = bool(getattr(args, "fail", False))
+    # done_round 取**当前轮次**。交活常常发生在两次 devloop round 之间
+    # (agent 独立干活),写 None 等于丢掉"这件事是第几轮完成的",
+    # 后面 history 里出现 done_round=null 就没法归因了。
+    round_no = None if failed else loop.status().round
+    ok = q.finish(
+        args.item_id,
+        ok=not failed,
+        owner=getattr(args, "owner", "") or "",
+        round_no=round_no,
+    )
+    if not ok:
+        print(f"[!] finish failed for {args.item_id} "
+              f"(条目不存在,或 owner 与认领者不符)", file=sys.stderr)
+        return 1
+    if failed:
+        print(f"[+] {args.item_id} -> pending (退回,下轮可再领)")
+    else:
+        print(f"[+] {args.item_id} -> done (round {round_no})")
+    return 0
 
 
 def _cmd_status(args) -> int:
@@ -298,5 +388,43 @@ def add_devloop_parser(sub) -> None:
     )
     pu.add_argument("item_id")
     pu.add_argument("--reason", default="", help="为什么改回(记进 item.note)")
+
+    # ── 多 agent 协作 ──
+    # 三个命令合起来是"领活 → 干 → 交活"的闭环。少任何一个,
+    # agent 就只能靠 load/save 直接改 queue.json —— 那在并发下会丢更新
+    # (实测见 devloop/lock.py 的模块 docstring)。
+    pcl = dsub.add_parser(
+        "claim",
+        help="原子认领一条待办(多 agent 并行的入口)",
+    )
+    pcl.add_argument(
+        "--owner", default="",
+        help="认领者标识(默认取 $ARL_AGENT#pid)。会写进 item.owner",
+    )
+    pcl.add_argument(
+        "--item-id", default=None,
+        help="指定要领哪一条;不给就按优先级自动挑",
+    )
+
+    prl = dsub.add_parser(
+        "release",
+        help="放弃认领(agent 挂掉/超时时用,否则那条被永远锁住)",
+    )
+    prl.add_argument("item_id")
+    prl.add_argument("--reason", default="", help="为什么放弃(记进 item.note)")
+
+    pfi = dsub.add_parser(
+        "done-item",
+        help="交活:标 done,或 --fail 退回 pending",
+    )
+    pfi.add_argument("item_id")
+    pfi.add_argument(
+        "--fail", action="store_true",
+        help="这轮没做完,退回 pending 让别人(或下轮)接着干",
+    )
+    pfi.add_argument(
+        "--owner", default="",
+        help="校验用:与当前认领者不符时拒绝覆盖(留空=不校验)",
+    )
 
     p.set_defaults(func=cmd_devloop)

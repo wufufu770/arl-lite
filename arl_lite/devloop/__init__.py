@@ -12,6 +12,17 @@
 4. 待办队列永远非空(耗尽时从 backlog.md 补充)
 5. 状态落盘原子化,崩溃后可恢复
 
+多 agent 并行下追加的不变式(第 15 轮):
+
+6. 认领唯一:同一时刻一条待办只能被一个 agent 持有
+7. **活着的认领不被轮次抹掉** —— in_progress 不等于上轮残留,
+   复位必须是认领感知的(见 queue.Queue.is_stale_claim)
+8. 读-改-写整段进临界区:load/save 各自原子,组合起来不原子
+   (queue.Queue.claim/release/finish/recover_stale 是唯一正确入口)
+
+第 6-8 条都是"看起来能跑、并发下静默丢东西"的那一类 ——
+不报错,不告警,只是让两个 agent 改了同一处代码。
+
 零依赖:只用 stdlib。
 """
 from __future__ import annotations

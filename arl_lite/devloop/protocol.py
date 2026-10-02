@@ -140,8 +140,29 @@ class Loop:
             f"  barren     : {s.barren_rounds}/{RETREAT_THRESHOLD}",
             f"  retreats   : {s.retreats}",
             f"  gates      : {s.total_gates_passed} passed / {s.total_gates_failed} failed (cumulative)",
-            f"  items      : {stt.get('pending', 0)} pending / {stt.get('done', 0)} done / {stt.get('dropped', 0)} dropped",
+            f"  items      : {stt.get('pending', 0)} pending"
+            f" / {stt.get('in_progress', 0)} in_progress"
+            f" / {stt.get('done', 0)} done / {stt.get('dropped', 0)} dropped",
         ]
+        # 被别人认领的条目。多 agent 场景下"队列里没活可选"经常不是
+        # 队列空了,而是活被别人拿走了 —— 不显示出来会让人以为队列有毛病。
+        claimed = q.claimed_by()
+        if claimed:
+            lines.append(f"  claimed    : {len(claimed)} 条正在被别人做")
+            for iid, owner in sorted(claimed.items()):
+                age = ""
+                by_id = next((i for i in items if i.id == iid), None)
+                if by_id and by_id.claimed_at:
+                    age = f", 已领 {_age_str(_now() - by_id.claimed_at)}"
+                lines.append(f"                 {iid} ← {owner or '(无主)'}{age}")
+        # 有人正在写队列时提示一下。"队列看着没变"和"另一个 agent 正在
+        # 写、等一下就好了"必须能区分开,否则会把正常的并发写误判成故障。
+        from . import lock as _lock
+        qpath = self.dev_dir / "queue.json"
+        if _lock.is_locked(qpath):
+            holder = _lock.lock_holder(qpath) or "(未知)"
+            lines.append(f"  writing    : 队列正被 {holder} 持锁写入中")
+
         nxt = q.next()
         if nxt:
             lines.append(f"  next       : [{_prio_name(nxt.priority)}] {nxt.id} — {nxt.title}")
@@ -318,7 +339,7 @@ class Loop:
         )
 
     def recover_stale_in_progress(self) -> int:
-        """把上一轮遗留的 in_progress 复位成 pending。返回复位条数。
+        """把**真正没人管**的 in_progress 复位成 pending。返回复位条数。
 
         ## 为什么需要
 
@@ -334,25 +355,43 @@ class Loop:
         实测第 11 轮就是这样空转的。所以每轮开头把上一轮的残留复位,
         让"有人在处理"这个状态**不跨轮存活**。
 
-        ## 边界
+        ## 多 agent 之后这条规则必须改
 
-        本轮自己刚标的那条不在复位范围内 —— 调用点在"取待办"之前,
-        此时队列里所有的 in_progress 都是上一轮遗留的。
+        认领机制(见 queue.Queue.claim)落地后,"所有 in_progress 都是
+        上轮残留"这个前提**不成立**了 —— agent 可以合法地跨轮持有认领。
+
+        早先的实现无条件复位全部 in_progress,于是:
+
+            agent A: claim task-x      → in_progress, owner=A,A 在改代码
+            agent B: devloop round     → 复位 → task-x 回 pending
+            agent B: next()             → 捡起 task-x,去改同一处代码
+
+        文件锁防不了这个 —— 锁保证"写不撕裂",这里是**语义完整地
+        覆盖了别人的进度**。两个 agent 同时改同一处代码,正是这把锁
+        想防的后果,从后门进来了。
+
+        所以复位改成**认领感知**:活着的认领一律保留,只复位没人管的
+        (无 owner / owner 进程已退出 / 认领超时的)。判定细则见
+        `Queue.is_stale_claim`。
         """
         q = self.queue_mod.Queue(self.dev_dir / "queue.json")
-        items = q.load()
-        stale = [i for i in items if i.status == "in_progress"]
-        for it in stale:
-            it.status = "pending"
-            it.note = (it.note + " | " if it.note else "") + \
-                "recovered from a previous round"
-        if stale:
-            q.save(items)
+        # 复位逻辑住在 Queue 里,不在这里。早先版本把 lock+load+判+save
+        # 整套写在 protocol 里,而 Queue 那边同时又有一套加锁的原子操作
+        # —— 同一个"读-改-写要加锁"的规则存在两个实现。规则一旦有两处,
+        # 迟早有一处漏掉,而漏掉的那处不会报错,只会安静地丢更新。
+        n, held = q.recover_stale()
+        if n:
             log.warning(
-                "recover_stale_in_progress: 复位 %d 条上轮遗留的 in_progress: %s",
-                len(stale), [i.id for i in stale],
+                "recover_stale_in_progress: 复位 %d 条无人认领的 in_progress", n
             )
-        return len(stale)
+        if held:
+            # info 而不是静默:这是**正常的**多 agent 状态,但它改变了本轮
+            # 能看到什么(那些条被别人拿走了),不提示会让人以为队列有毛病。
+            log.info(
+                "recover_stale_in_progress: %d 条 in_progress 有人认领,保留: %s",
+                len(held), held,
+            )
+        return n
 
     # ------------------------------------------------------------------
     # 整轮
@@ -509,3 +548,21 @@ class Loop:
 
 def _prio_name(p: int) -> str:
     return {0: "P0", 1: "P1", 2: "P2", 3: "P3"}.get(p, f"P{p}")
+
+
+def _now() -> float:
+    """当前 unix 时间。抽出来是为了测试能替掉它。"""
+    return time.time()
+
+
+def _age_str(sec: float) -> str:
+    """把秒数说成人话。给人看的东西不该要求心算。"""
+    if sec < 0:
+        return "0s"
+    if sec < 90:
+        return f"{sec:.0f}s"
+    if sec < 5400:
+        return f"{sec / 60:.0f}m"
+    if sec < 172800:
+        return f"{sec / 3600:.1f}h"
+    return f"{sec / 86400:.1f}d"

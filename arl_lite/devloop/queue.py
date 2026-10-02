@@ -27,6 +27,7 @@ import os
 import re
 import hashlib
 import tempfile
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -41,6 +42,10 @@ P3 = 3  # 低:有精力再说
 
 _VALID_KINDS = {"change", "test", "doc", "research", "refactor"}
 _VALID_STATUS = {"pending", "in_progress", "done", "dropped"}
+
+# 队列锁的默认等待秒数。临界区只有一次 json 读写,几毫秒就该结束,
+# 等 5 秒还没拿到基本就是死锁或别人卡住了。
+_LOCK_TIMEOUT = 5.0
 
 
 def _slugify_id(title: str, idx: int = 0) -> str:
@@ -99,6 +104,12 @@ class Item:
     created_round: int = 0  # 创建时的轮次(protocol.round_no)
     done_round: int | None = None
     note: str = ""  # 执行备注/失败原因
+    # 谁认领了这条(多 agent 并行时用来避免两个 agent 做同一件事)
+    owner: str = ""
+    # 认领时刻(unix 时间戳,0 = 没被认领过)。
+    # 只有 owner 时没法判断"活人还在干"还是"人已经没了" —— owner
+    # 只是个字符串。认领时间是第二个独立信号,见 recover_stale 的策略。
+    claimed_at: float = 0.0
 
 
 # ─── 持久化 ────────────────────────────────────────────────────────────────
@@ -155,6 +166,10 @@ def _coerce_item(raw: dict) -> Item | None:
         created_round = int(raw.get("created_round", 0))
     except (TypeError, ValueError):
         created_round = 0
+    try:
+        claimed_at = float(raw.get("claimed_at", 0) or 0)
+    except (TypeError, ValueError):
+        claimed_at = 0.0
     return Item(
         id=str(raw["id"]),
         title=str(raw["title"]),
@@ -168,6 +183,8 @@ def _coerce_item(raw: dict) -> Item | None:
         created_round=created_round,
         done_round=done_round,
         note=str(raw.get("note", "")),
+        owner=str(raw.get("owner", "") or ""),
+        claimed_at=claimed_at,
     )
 
 
@@ -227,6 +244,282 @@ class Queue:
             "items": [_item_to_dict(i) for i in items],
         }
         _atomic_write_json(self.path, payload)
+
+    # ── 多 agent:加锁的原子操作 ────────────────────────────────────────
+    #
+    # 上面 load()/save() 各自原子,但"load → 改 → save"这一整段不是。
+    # 两个 agent 各领一条活、各自保存时,后保存的会覆盖先保存的:
+    # 实测 A 领到 task-0、B 领到 task-1,A.save() 后 B.save(),
+    # task-0 退回 pending —— A 正在干的活被第三个 agent 重复领走。
+    #
+    # 下面这几个方法是"加锁 + 读 + 改 + 写"打包,多 agent 并行的
+    # **唯一正确入口**。绕开它们直接 load/save 的代码在并发下不安全。
+
+    def _locked(self, owner: str, timeout: float = _LOCK_TIMEOUT):
+        """取队列锁的上下文管理器(独立出来方便测试替换)"""
+        from .lock import file_lock
+        return file_lock(self.path, timeout=timeout, owner=owner)
+
+    def claim(self, owner: str = "", timeout: float = _LOCK_TIMEOUT,
+              item_id: str | None = None) -> Item | None:
+        """原子地认领一条待办。返回认领到的条目,没有可领的返回 None。
+
+        这是多 agent 并行的基本动作:在**一把锁里**完成
+        load → 挑一条 → 标 in_progress + 记 owner → save,
+        所以两个 agent 同时调用,拿到的一定是**不同的条目**。
+
+        Args:
+            owner: 认领者标识(pid / agent 名),写进 Item.owner
+            timeout: 等锁秒数
+            item_id: 指定要领哪一条;None = 按优先级自动挑
+
+        Returns:
+            认领到的 Item(同时也在队列里,状态 in_progress),或 None
+        """
+        with self._locked(owner, timeout):
+            items = self.load()
+            if item_id is not None:
+                cand = next(
+                    (i for i in items
+                     if i.id == item_id and i.status in ("pending", "in_progress")),
+                    None,
+                )
+            else:
+                cand = self.next(items)
+            if cand is None:
+                return None
+            cand.status = "in_progress"
+            cand.owner = owner or f"pid-{os.getpid()}"
+            cand.claimed_at = time.time()
+            cand.attempts = int(cand.attempts or 0) + 1
+            self.save(items)
+            return cand
+
+    def release(self, item_id: str, note: str = "",
+               timeout: float = _LOCK_TIMEOUT) -> bool:
+        """放弃认领:把 in_progress 退回 pending,清掉 owner。
+
+        agent 干一半挂掉时必须走这里,否则那条会被永远锁在
+        in_progress,别人不敢碰。`recover_stale_in_progress` 是
+        跨进程启动时的兜底,这个是 agent 自己的主动释放。
+        """
+        with self._locked("release", timeout):
+            items = self.load()
+            target = next((i for i in items if i.id == item_id), None)
+            if target is None or target.status != "in_progress":
+                return False
+            target.status = "pending"
+            target.owner = ""
+            target.claimed_at = 0.0
+            if note:
+                target.note = (target.note + " | " if target.note else "") + note
+            self.save(items)
+            return True
+
+    def finish(self, item_id: str, ok: bool, owner: str = "",
+               round_no: int | None = None,
+               timeout: float = _LOCK_TIMEOUT) -> bool:
+        """收尾:ok=True 标 done,False 退回 pending。带 owner 校验。
+
+        带 owner 校验是关键:两个 agent 领了同一条(不该发生,但万一),
+        后收的那个会发现 owner 不对,拒绝覆盖别人的结果。
+        """
+        with self._locked("finish", timeout):
+            items = self.load()
+            target = next((i for i in items if i.id == item_id), None)
+            if target is None:
+                return False
+            if owner and target.owner and target.owner != owner:
+                log.warning(
+                    "queue.finish: %s 的 owner 是 %r,与提交方 %r 不符,拒绝覆盖",
+                    item_id, target.owner, owner,
+                )
+                return False
+            if ok:
+                target.status = "done"
+                target.done_round = round_no
+            else:
+                target.status = "pending"
+            target.owner = ""
+            target.claimed_at = 0.0
+            self.save(items)
+            return True
+
+    def claimed_by(self) -> dict[str, str]:
+        """当前被认领的条目 → {id: owner}(status 用来判断状态里,给 CLI 显示用)"""
+        return {
+            i.id: i.owner
+            for i in self.load()
+            if i.status == "in_progress"
+        }
+
+    # ── 认领是否还活着 ─────────────────────────────────────────────────
+    #
+    # `recover_stale_in_progress` 每轮开头复位上轮残留的 in_progress。
+    # 在只有单人同步轮次的世界里这条规则是对的(跑完的轮次不该有残留,
+    # 残留就是软死局)。但认领机制一落地,这个"无条件复位"就变成了
+    # **主动破坏别人的活**:
+    #
+    #     agent A: claim task-x   → in_progress, owner=A, A 开始改代码
+    #     agent B: devloop round  → 复位 → task-x 回 pending
+    #     agent B: next()          → 捡起 task-x,也去改同一处代码
+    #
+    # 文件锁防不了这个:锁保证的是"写不撕裂",而这里是**语义上合法地
+    # 覆盖了别人的进度**。两个 agent 同时改同一处代码,正是这把锁
+    # 想防的后果,却从后门进来了。
+    #
+    # 所以复位必须**认领感知**。判断信号有两个,独立且互补:
+    #   1. owner 里的 pid 还在不在(硬信号,准)
+    #   2. 认领了多久(软信号,兜底)
+    # 详见 `is_stale_claim`。
+
+    # pid 出现在 owner 串末尾:CLI 默认名是 `agent#1234`,内部兜底是 `pid-1234`
+    _OWNER_PID = re.compile(r"(?:#|^pid-)(\d+)$")
+
+    @classmethod
+    def owner_pid(cls, owner: str) -> int | None:
+        """从 owner 标识里解析 pid;解析不出来返回 None"""
+        m = cls._OWNER_PID.search((owner or "").strip())
+        return int(m.group(1)) if m else None
+
+    @staticmethod
+    def owner_alive(owner: str) -> bool | None:
+        """owner 那个进程还活着吗?None = 判断不了。
+
+        ## Windows 上不能用 `os.kill(pid, 0)`
+
+        这是个会出人命的坑。CPython 在 Windows 上把 `os.kill(pid, sig)`
+        实现成 `TerminateProcess(handle, sig)` —— 也就是说
+        **`os.kill(pid, 0)` 不是"探测",是"把这个进程杀掉,退出码 0"**。
+    测活性的时候拿别人的 pid 去探测,等于在探测的一瞬间把它杀了。
+
+        所以 POSIX 走 `os.kill(pid, 0)`(signal 0 只做权限/存在性检查),
+        Windows 走 ctypes `OpenProcess`,拿到句柄立刻关掉,**不碰任何
+        终止函数**。
+        """
+        pid = Queue.owner_pid(owner)
+        if pid is None:
+            return None
+        if pid <= 0:
+            return False
+        if os.name == "nt":  # pragma: no cover — 仅 Windows
+            try:
+                import ctypes
+                # PROCESS_QUERY_LIMITED_INFORMATION:只要"存在吗"的信息,
+                # 权限要求最低,别人的进程也能开
+                SYNCHRONIZE = 0x00100000
+                kernel32 = ctypes.windll.kernel32
+                handle = kernel32.OpenProcess(SYNCHRONIZE, False, pid)
+                if not handle:
+                    # 87 = ERROR_INVALID_PARAMETER → 这个 pid 不存在
+                    return kernel32.GetLastError() != 87
+                kernel32.CloseHandle(handle)
+                return True
+            except Exception:
+                return None  # 探测不了就说探测不了,不猜
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # 存在,只是不是我们的进程
+        except OSError:
+            return None
+        return True
+
+    # 认领超过这么久,且无法证明 owner 还活着 → 判定为过期。
+    # 默认 6 小时:足够覆盖一个 agent 从领活到交活的时长,又不至于
+    # 让"人跑了忘了 release"的条目永久锁死。
+    STALE_CLAIM_SEC = 6 * 3600.0
+
+    @classmethod
+    def is_stale_claim(
+        cls,
+        item: Item,
+        now: float | None = None,
+        stale_after_sec: float | None = None,
+    ) -> tuple[bool, str]:
+        """这条 in_progress 是不是"上一轮残留"?返回 (是否复位, 依据)。
+
+        判定规则,按可靠性排序 —— **不确定时倾向不复位**:
+        1. owner 为空 → 复位。这是 r11 软死局的老形态:没有任何人
+           认领它却卡在 in_progress,留着它队列就永远选不出待办。
+        2. owner 的进程死了 → 复位。人没了,活不可能还在推进。
+        3. owner 活着 → **不复位**。有人在正经干活,抢它就是重复劳动。
+        4. 判断不了(没有 pid / 探测失败)且认领已超过
+           `stale_after_sec` → 复位。不复位的话,一个崩在 CI 里的
+           agent 能把队列永久锁死,那比重复劳动更难恢复。
+        5. 判断不了但认领还很新 → 不复位。刚领的东西当它是活的。
+
+        ## pid 复用的已知局限
+
+        规则 2 认的是"pid 还在不在",不是"还是不是同一个进程"。
+        原来那个 agent 崩了之后,它的 pid 被系统分给别的进程,规则 2
+        就会误判成"活着",于是该条一直不复位,直到规则 4 的超时兜底。
+        代价是**多锁一段时间**,不是丢工作或重复劳动,所以这个方向的
+        误差是安全的。真要根治得记录进程启动时间,超出当前范围。
+        """
+        if item.status != "in_progress":
+            return False, "not in_progress"
+        if not item.owner:
+            return True, "no owner (r11 软死局形态)"
+
+        alive = cls.owner_alive(item.owner)
+        if alive is True:
+            return False, f"owner {item.owner} 仍在运行"
+        if alive is False:
+            return True, f"owner {item.owner} 的进程已退出"
+
+        # 到这里 = 判断不了
+        now = time.time() if now is None else now
+        limit = cls.STALE_CLAIM_SEC if stale_after_sec is None else stale_after_sec
+        # claimed_at 为 0 = 这条是老格式文件里的 in_progress,没有认领时间。
+        # 那只能当成"很老"处理,否则 r11 的软死局又会回来。
+        age = now - item.claimed_at if item.claimed_at else float("inf")
+        if age >= limit:
+            return True, f"认领者无法探测且已超过 {limit:.0f}s 未交活"
+        return False, f"认领者无法探测,但认领才 {age:.0f}s,当它是活的"
+
+    def recover_stale(self, timeout: float = _LOCK_TIMEOUT,
+                      stale_after_sec: float | None = None
+                      ) -> tuple[int, list[tuple[str, str]]]:
+        """把**真正没人管**的 in_progress 退回 pending。
+
+        返回 (复位条数, [(id, 保留原因)])。
+
+        ## 为什么这个方法住在 Queue 而不是 protocol
+
+        它需要三样东西:文件锁、判据(`is_stale_claim`)、读写。
+        早先把它写进 `Loop.recover_stale_in_progress`,于是 protocol 里
+        出现了一套独立的 lock+load+判+save —— 而 Queue 里同时又有一套
+        加锁的原子操作。**同一条"读-改-写必须加锁"的规则存在两个实现**,
+        而两个实现里只要有一个漏了锁,它不会报错,只会安静地丢更新。
+
+        早先那一版真的漏了:load 在锁外、save 在锁内。丢的不是"我们要
+        复位的这几条",而是"我们压根没打算碰的那些" —— 别的 agent 期间
+        刚抢到的活,被我们的过期快照一并抹掉了。
+
+        规则只该有一处实现。
+        """
+        stale, kept = [], []
+        with self._locked("recover_stale", timeout):
+            # load 在锁**内**:整段读-改-写必须是一次临界区。
+            # 锁外的 load 看着无害,恰恰因为丢的是"没打算碰的那些"。
+            items = self.load()
+            for i in items:
+                reset, why = self.is_stale_claim(i, stale_after_sec=stale_after_sec)
+                if reset:
+                    stale.append((i, why))
+                elif i.status == "in_progress":
+                    kept.append((i.id, why))
+            for it, why in stale:
+                it.status = "pending"
+                it.owner = ""
+                it.claimed_at = 0.0
+                it.note = (it.note + " | " if it.note else "") + f"recovered: {why}"
+            if stale:
+                self.save(items)
+        return len(stale), kept
 
     # ── 调度 ─────────────────────────────────────────────────────────────
     @staticmethod
@@ -906,90 +1199,3 @@ class Queue:
                 )
             )
         return out
-
-
-# ─── 自测 ──────────────────────────────────────────────────────────────────
-def _self_test() -> int:
-    """跑一遍最小回路,作为 `python3 -m arl_lite.devloop.queue` 的入口。"""
-    import shutil
-    import sys
-    import tempfile as _tf
-
-    tmpdir = Path(_tf.mkdtemp(prefix="devloop-q-self-"))
-    try:
-        qpath = tmpdir / "queue.json"
-        q = Queue(qpath)
-        # 0. 初始:空文件 → 空列表
-        assert q.load() == []
-        assert q.exhausted() is True
-        # 1. 种子第一次
-        n1 = q.seed_if_empty()
-        assert n1 > 0, "seed_if_empty 没产出任何 item"
-        items1 = q.load()
-        assert any(i.status == "pending" for i in items1)
-        # 2. next() 可取
-        first = q.next()
-        assert first is not None
-        # 3. 模拟一轮: in_progress → done(原地修改,需直接 save 当前 list)
-        items_after_seed = q.load()
-        q.mark_in_progress(first)
-        q.mark_done(first, round_no=1)
-        # first 还在 items_after_seed 里(同一对象引用),已就地修改
-        # 4. 把所有 pending 都 done
-        for it in items_after_seed:
-            if it.status == "pending":
-                q.mark_in_progress(it)
-                q.mark_done(it, round_no=1)
-        q.save(items_after_seed)
-        assert q.exhausted() is True
-        # 5. 再 seed 一次(可能产出 Tier 2 / Tier 3)
-        n2 = q.seed_if_empty()
-        assert n2 > 0, "二次 seed 失败"
-        # 6. 排序验证
-        items2 = q.load()
-        pending = [i for i in items2 if i.status == "pending"]
-        pending.sort(key=q._sort_key)
-        for a, b in zip(pending, pending[1:]):
-            assert (a.priority, a.created_round, a.id) <= (
-                b.priority,
-                b.created_round,
-                b.id,
-            )
-        # 7. stats()
-        st = q.stats()
-        assert "pending" in st and "done" in st and "dropped" in st
-        assert "by_priority" in st and len(st["by_priority"]) == 4
-        # 8. mark_dropped
-        items_now = q.load()
-        target = q.next()
-        if target is not None:
-            # 找到并原地修改
-            for i, it in enumerate(items_now):
-                if it.id == target.id:
-                    q.mark_in_progress(it)
-                    q.mark_dropped(it, "self-test reason")
-                    items_now[i] = it
-                    break
-            q.save(items_now)
-        # 9. atomic write smoke:并发触发 save 不破坏文件
-        for _ in range(5):
-            q.save(q.load())
-        assert qpath.exists()
-        # 10. backlog.md 被自动创建
-        bp = q._backlog_path()
-        assert bp.exists()
-
-        print(
-            f"[OK] self-test passed. "
-            f"first seed +{n1}, second seed +{n2}, "
-            f"final stats={q.stats()}"
-        )
-        return 0
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-if __name__ == "__main__":
-    import sys as _sys
-
-    _sys.exit(_self_test())

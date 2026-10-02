@@ -11,6 +11,11 @@ devloop/state.json
 devloop/queue.json
 devloop/*.tmp
 devloop/*.corrupt
+# 文件锁。里面记的是"当前谁持锁 + pid",每机一份,而且是运行期状态。
+# 提交它只会制造无意义的 diff 和合并冲突;锁的语义不依赖它在版本库里
+# (协作式锁,谁没走 file_lock 谁就绕过去了,跟文件在不在仓库里无关)。
+devloop/*.lock
+*.lock
 
 # 测试产物:tests/test_phase6.py::test_html_report 会生成在 CWD
 cli_test_report.html
