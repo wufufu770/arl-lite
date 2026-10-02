@@ -33,7 +33,7 @@ GREEN = [GateResult("fake", True, "ok", 0, 0, True)]
 
 def _seed(q: Queue, item_id: str, priority: int = 2) -> Item:
     q.add(Item(id=item_id, title=f"标题 {item_id}", priority=priority,
-               kind="change", verify="true", detail="", tags=[]))  # r35: 占位 verify 必须是**通过**的,收尾闸门会真跑它
+               kind="change", verify="test -f pyproject.toml", detail="", tags=[]))  # r35: 占位 verify 必须是**通过**的,收尾闸门会真跑它
     return next(i for i in q.load() if i.id == item_id)
 
 

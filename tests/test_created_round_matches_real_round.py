@@ -98,7 +98,7 @@ def test_created_round_never_exceeds_done_round(tmp_path, monkeypatch):
         encoding="utf-8")
     q = _q(lp)
     q.add(Item(id="done-item", title="会被完成的活", priority=1, kind="change",
-               verify="true", detail="", tags=[]))
+               verify="test -f pyproject.toml", detail="", tags=[]))
 
     lp.round()
 
@@ -143,7 +143,7 @@ def test_an_in_progress_item_counts_as_work_in_flight(tmp_path):
     (tmp_path / "backlog.md").write_text(
         "# backlog\n\n- [P1] change : 活 G | 细节 | true\n", encoding="utf-8")
     q.add(Item(id="busy", title="别人正在做的活", priority=1, kind="change",
-               verify="true", detail="", tags=[]))
+               verify="test -f pyproject.toml", detail="", tags=[]))
     it = q.claim(owner="other-agent", item_id="busy")
     assert it is not None and it.status == "in_progress"
 

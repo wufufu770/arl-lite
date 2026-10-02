@@ -73,7 +73,7 @@ class TestRedGateIsDowngradedNotSwallowed(unittest.TestCase):
         from arl_lite.devloop.queue import Item, Queue
         q = Queue(self.lp.dev_dir / "queue.json")
         q.add(Item(id="fixture-work", title="给门禁测试备的活", priority=1,
-                   kind="change", verify="true", detail="", tags=[]))
+                   kind="change", verify="test -f pyproject.toml", detail="", tags=[]))
 
     def _round_with(self, *results):
         """用假门禁结果跑一整轮。finally 恢复,不留污染。"""

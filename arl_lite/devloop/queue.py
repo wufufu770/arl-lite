@@ -110,6 +110,43 @@ def is_signal_id(item_id: str) -> bool:
     return item_id == _SIGNAL_ID or item_id.startswith(_SIGNAL_ID + "-r")
 
 
+# 恒真命令。写成列表而不是只有一个 `true`,是因为:
+#   `true` / `: ` / `true && true` / `|| true` / `echo`  全都恒过,
+# 而判据若只认字面量 `true`,下一个人换个写法就绕过去了。
+# 完整判据在 `Queue.is_constant_true`。
+_VACUOUS_EXACT = frozenset({"true", ":", "exit 0"})
+_VACUOUS_CONTAINS = ("|| true", "||true", "&& true", "&&true")
+
+
+def _is_vacuous_verify(verify: str) -> bool:
+    """这条 verify 是不是恒真命令(跑了也证明不了任何事)
+
+    r37 新增。信号条目(`no-due-maintenance-review*`)的完成判据就是
+    「人确认过」,所以它必须能写一条恒真的 verify —— 但**真活**不能:
+    那等于把「做完没有」这个问题换成了一个永远回答「是」的问题。
+
+    ## 为什么要认这么多写法
+
+    判据若只认字面量 `true`,下一个人写 `true && true` 就绕过去了。
+    而**每多认一种写法,就多一条要维护的规则** —— 所以这里是
+    「精确匹配少数几种 + 包含少数几个连接词」的混合,并且把这份清单
+    写成一个常量,让 `test_constant_true_verify_is_signal_only.py`
+    能反过来断言它没有悄悄变短。
+
+    `echo` 之类**故意不收**:它有副作用(真的打印),且很少被当成
+    「我承认这条验收没有判别力」来写。收不进来的写法由
+    `test_every_backlog_verify_is_a_runnable_command` 那侧的
+    白名单兜 —— 不在白名单里的首词一律 `unknown`,而 `unknown`
+    不拦(见 r35 的取舍)。
+    """
+    v = verify.strip()
+    if not v:
+        return False
+    if v in _VACUOUS_EXACT:
+        return True
+    return any(tok in v for tok in _VACUOUS_CONTAINS)
+
+
 REMOVED_TIER2_WHY = """\
 「扫项目现状自动推导」这一层播种已被整层删除(2026-10,第 16 轮)。
 
@@ -1205,6 +1242,16 @@ class Queue:
     # 只有以这些开头的 verify 才算数(第一个空白前的词)。
     # 全部来自本仓库真实在用的写法,实测见 `verify_result` 的说明。
     VERIFY_RUNNERS = ("python3", "test", "true")
+
+    # r37:恒真判据的公开入口(收尾闸门用)
+    @staticmethod
+    def is_constant_true(verify: str) -> bool:
+        """这条 verify 是不是恒真命令(跑了也证明不了任何事)
+
+        见模块级 `_is_vacuous_verify` 的说明:信号条目可以用恒真的
+        verify(它的完成判据就是「人确认过」),**真活不行**。
+        """
+        return _is_vacuous_verify(verify)
 
     @classmethod
     def verify_result(cls, verify: str, timeout: float = 30.0) -> str:

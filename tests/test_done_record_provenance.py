@@ -62,7 +62,7 @@ def _q(loop) -> Queue:
 
 def _seed(q: Queue, item_id: str) -> None:
     q.add(Item(id=item_id, title=f"标题 {item_id}", priority=2,
-               kind="change", verify="true", detail="", tags=[]))  # r35: 占位 verify 必须是**通过**的,收尾闸门会真跑它
+               kind="change", verify="test -f pyproject.toml", detail="", tags=[]))  # r35: 占位 verify 必须是**通过**的,收尾闸门会真跑它
 
 
 # --- 引擎写的 done 必须自带 provenance ---
@@ -155,7 +155,7 @@ def test_finish_appends_to_an_existing_note(tmp_path):
     """
     q = Queue(tmp_path / "queue.json")
     q.add(Item(id="t", title="t", priority=2, kind="change",
-               verify="true", detail="", tags=[], note="人写的:验收方式是 grep 不是声明"))
+               verify="test -f pyproject.toml", detail="", tags=[], note="人写的:验收方式是 grep 不是声明"))
     it = q.claim(owner="o", item_id="t")
 
     ok = q.finish(it.id, ok=True, owner="o", round_no=3, note="done r3 · source=operator")
@@ -177,7 +177,7 @@ def test_finish_without_note_still_works(tmp_path):
     """
     q = Queue(tmp_path / "queue.json")
     q.add(Item(id="t", title="t", priority=2, kind="change",
-               verify="true", detail="", tags=[]))
+               verify="test -f pyproject.toml", detail="", tags=[]))
     it = q.claim(owner="o", item_id="t")
 
     ok = q.finish(it.id, ok=True, owner="o", round_no=3)
@@ -202,7 +202,7 @@ def test_finish_without_note_leaves_an_existing_note_untouched(tmp_path):
     """
     q = Queue(tmp_path / "queue.json")
     q.add(Item(id="t", title="t", priority=2, kind="change",
-               verify="true", detail="", tags=[], note="r21 实际完成:验收方式是 grep"))
+               verify="test -f pyproject.toml", detail="", tags=[], note="r21 实际完成:验收方式是 grep"))
     it = q.claim(owner="o", item_id="t")
 
     q.finish(it.id, ok=True, owner="o", round_no=22)
@@ -221,7 +221,7 @@ def test_failed_finish_does_not_write_a_done_provenance(tmp_path):
     """
     q = Queue(tmp_path / "queue.json")
     q.add(Item(id="t", title="t", priority=2, kind="change",
-               verify="true", detail="", tags=[]))
+               verify="test -f pyproject.toml", detail="", tags=[]))
     it = q.claim(owner="o", item_id="t")
 
     q.finish(it.id, ok=False, owner="o", note="done r9 · source=operator")
@@ -252,7 +252,7 @@ def test_cli_done_item_also_writes_provenance(tmp_path):
     (d / "devloop").mkdir()
     q = Queue(d / "devloop" / "queue.json")
     q.add(Item(id="hand-done", title="手工交上来的活", priority=1, kind="change",
-               verify="true", detail="", tags=[]))
+               verify="test -f pyproject.toml", detail="", tags=[]))
     q.claim(owner="agent-x", item_id="hand-done")
 
     class _Args:

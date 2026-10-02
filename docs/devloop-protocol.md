@@ -2400,6 +2400,64 @@ python3 -m pytest tests/test_no_real_home_writes.py -k stray
 
 ---
 
+### 7.28 恒真的验收:它伪装成一道**通过了**的检查
+
+r36 收尾时顺手查的下一个真活。漏洞不是读代码读出来的,是**跑出来的**
+——往队列里塞一条 `verify="true"` 的**真活**,跑完整 `round`:
+
+```
+活干了没有?  没有 —— 一行代码没写
+round 结果 : DONE
+队列状态   : done
+note       : done r1 · source=operator
+```
+
+## 三条防线全部失效,而且每一条都是绿的
+
+| 防线 | 为什么没拦住 |
+|---|---|
+| r35 收尾闸门 | 它问 `verify_result(verify) == FAIL`。`true` 跑出来是 `pass`,所以**放行** |
+| r36 `test_backlog_verify_is_commandable.py` | `true` **确实**在白名单里、**确实**是合法 shell、**确实**语法正确 |
+| detail 是不是散文 | 这里根本没写 detail |
+
+闸门**问对了问题,拿到的是假答案**。
+
+判据恒真是第 16 轮「恒真测试」那篇的**极端形式**:那一篇里恒真的测试
+至少还会误导人;这里的恒真**连测试都绿着** —— 它伪装成一道**通过了**的
+验收。
+
+## 修法:按 id 分流,不按 verify 内容分流
+
+信号条目(`no-due-maintenance-review*`)的完成判据就是「人确认过」,
+它**必须**能写恒真的 verify,否则永远关不掉。所以拦的是
+「**非信号**条目拿恒真 verify」,不是「恒真 verify」本身。
+
+判据认四种写法(`true` / `true && true` / `:` / `... || true`)。只认
+字面量 `true` 的话,下一个人换个写法就绕过去了。
+
+## 第一版写错的地方
+
+判断写成 `vr == VERIFY_PASS and is_constant_true(verify)`,结果 `:`
+漏网 —— 它的首词不在 `VERIFY_RUNNERS` 白名单里,`vr` 是 `unknown`,
+恒真判断被**整个短路**掉。而 `:` 恰恰是最该拦的那种。
+
+**恒真与否是 verify 内容自身的性质,和机器能不能评它无关。**
+`test_vacuous_detection_does_not_depend_on_evaluation` 钉住这一点。
+
+## 顺带:我 r35 的捷径被本轮的规矩逮住了
+
+r35 为了让"闸门会真跑 verify"这件事成立,把一批测试 fixture 的占位
+verify 从 `test -f 不存在的文件`(故意失败)改成了 `true`(故意通过)。
+本轮立了新规矩,那 15 处 `true` 全都成了违规 —— 13 条既有测试当场红。
+
+**我自己的捷径违反了本轮新立的规矩。** 全部换成 `test -f pyproject.toml`:
+真能跑通,且不是恒真。
+
+> 测试 fixture 里的"通过型占位"也会过期。规矩变了,占位值要跟着换 ——
+> 换的过程会疼一下,那一下正是新规矩在生效的证据。
+
+---
+
 ## 8. 状态落盘（state.json）
 
 ### 8.1 文件路径与写时机

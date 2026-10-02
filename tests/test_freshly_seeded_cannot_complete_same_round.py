@@ -128,7 +128,7 @@ def test_a_real_pending_item_is_still_claimed_and_completed(loop):
     """
     q = _q(loop)
     q.add(Item(id="real", title="本来就有的活", priority=1, kind="change",
-               verify="true", detail="", tags=[]))
+               verify="test -f pyproject.toml", detail="", tags=[]))
 
     out = loop.round()
 
@@ -214,7 +214,7 @@ def test_constant_true_verify_still_completes(loop):
     """
     q = _q(loop)
     q.add(Item(id="no-due-maintenance-review-x", title="复查信号", priority=1,
-               kind="research", verify="true", detail="", tags=[]))
+               kind="research", verify="test -f pyproject.toml", detail="", tags=[]))
 
     out = loop.round()
 

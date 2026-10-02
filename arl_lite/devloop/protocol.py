@@ -624,16 +624,43 @@ class Loop:
             # `unknown`(散文 verify)不拦 —— 拿散文去挡完成,会把所有人
             # 写的待办永久卡死,那道闸门活不过三轮就会被拆掉。
             vr = q.verify_result(item.verify) if t.ok else "unknown"
-            if t.ok and vr == q.VERIFY_FAIL:
+            # r37:`verify="true"` 是恒真命令,信号之外不许拿它当验收。
+            #
+            # r36 实测的漏洞:塞一条 `verify="true"` 的**真活**进队列,
+            # 跑完整 round —— 它被标成 done,note 写着 "done r1 ·
+            # source=operator"。而那行代码一行没写。
+            #
+            # 为什么这个洞特别难堵:上一行 `vr` 判的是 `pass` 不是 `fail`,
+            # 所以 r35 那道闸门**放行**;r36 写的
+            # `test_backlog_verify_is_commandable.py` 也**抓不到**它 ——
+            # `true` 确实在白名单里、确实是合法命令、确实语法正确。
+            # 判据恒真是第 16 轮「恒真测试」那篇的极端形式:这次连
+            # 测试都绿着。
+            #
+            # 信号条目(`no-due-maintenance-review*`)用它完全合法 —— 它的
+            # 完成判据本来就是「人确认过」,不是某条命令。所以按 id 分流,
+            # 不按 `verify` 的内容分流。
+            # 恒真与否是 verify **内容**的性质,和机器能不能评它无关。
+            # 早一版写成 `vr == VERIFY_PASS and is_constant_true(...)`,
+            # 结果 `:` 漏网 —— 它首词不在白名单里,`vr` 是 `unknown`,
+            # 于是恒真判断被短路掉了。而 `:` 恰恰是最该拦的那种。
+            vacuous = (t.ok and not is_signal
+                       and q.is_constant_true(item.verify))
+            if t.ok and (vr == q.VERIFY_FAIL or vacuous):
+                why = ("its own verify does not pass"
+                       if not vacuous else
+                       "its verify is the constant command `true`, which "
+                       "cannot distinguish done from not-done")
                 record.result = RESULT_DONE_WITH_FAILURES
-                record.blocking_failures.append(f"verify_failed: {item.verify}")
-                q.release(item.id, note=(
-                    f"refused done: its own verify does not pass -> "
-                    f"{item.verify}"))
+                record.blocking_failures.append(
+                    f"verify_failed: {item.verify}" if not vacuous
+                    else f"vacuous_verify: {item.verify}")
+                q.release(item.id, note=f"refused done: {why} -> {item.verify}")
                 messages.append(
-                    f"refused to mark {item.id!r} done: its verify command "
-                    f"fails right now ({item.verify}). 门禁全绿不等于这条活"
-                    f"做完了 —— 门禁查代码,这条查的是记账是否属实。"
+                    f"refused to mark {item.id!r} done: {why} ({item.verify}). "
+                    f"门禁全绿不等于这条活做完了 —— 门禁查代码,"
+                    f"这条查的是记账是否属实。信号条目可以用 `true`,"
+                    f"真活不行:恒真的判据回答不了「做完没有」。"
                 )
             elif t.ok:
                 record.result = RESULT_DONE
