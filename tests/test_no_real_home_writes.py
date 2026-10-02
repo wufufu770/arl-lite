@@ -403,5 +403,95 @@ class TestThisFileIsSelfConsistent(unittest.TestCase):
                              "判据在没写入时误报了")
 
 
+# =====================================================================
+# r27:conftest 的会话级回收器不许删别的会话的目录
+# =====================================================================
+
+
+class TestTmpReaperStaysInsideItsOwnSession(unittest.TestCase):
+    """回收器是给"我建的、我没清的"兜底的,不是替别人做清洁的
+
+    r27 实测撞上过一次:两个 pytest 同时跑,一个会话的回收器把另一个
+    **正在用**的目录删了,表现为别的测试莫名失败("目录不存在")。
+    """
+
+    def test_reaps_only_what_it_was_given(self):
+        """单元判据:只删登记过的,别的目录原样不动
+
+        抽成 `_reap_created` 就是为了能这样问它 —— 会话级 fixture
+        从外面是问不出来的。
+        """
+        import conftest as cf
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td)
+            owned = base / "tmp_mine"
+            unowned = base / "tmp_someone_else"
+            owned.mkdir()
+            unowned.mkdir()
+
+            reaped = cf._reap_created([str(owned)], base=base)
+
+            self.assertEqual(reaped, [owned.name])
+            self.assertFalse(owned.exists(), "登记过的目录没被回收")
+            self.assertTrue(
+                unowned.exists(),
+                "回收器删了没登记的目录 —— 多 agent 并行时这就是灾难",
+            )
+
+    def test_never_reaches_outside_the_temp_root(self):
+        """base 守卫:传错参数也不能把别处的目录清掉"""
+        import conftest as cf
+
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "tmp_root"
+            outside = Path(td) / "precious"
+            base.mkdir()
+            outside.mkdir()
+            (outside / "keep.txt").write_text("x", encoding="utf-8")
+
+            cf._reap_created([str(outside)], base=base)
+
+            self.assertTrue((outside / "keep.txt").exists(),
+                            "回收器删到了 base 之外的路径")
+
+    def test_another_pytest_session_does_not_lose_its_dir(self):
+        """端到端:子 pytest 跑的时候,别的进程建的目录必须活着
+
+        时序假设(decoy 必须在子进程**运行期间**创建,否则旧实现本来
+        也不会删它,测试就假通过了):子进程跑 test_devloop.py +
+        test_phase4.py 实测十几秒,3 秒时建 decoy 足够靠前。
+        """
+        import threading
+        import time
+
+        decoy: dict = {}
+
+        def make_decoy():
+            time.sleep(3.0)
+            decoy["d"] = Path(tempfile.mkdtemp(prefix="tmp_decoy_"))
+
+        t = threading.Thread(target=make_decoy, daemon=True)
+        t.start()
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                 "tests/test_devloop.py", "tests/test_phase4.py"],
+                cwd=REPO, capture_output=True, text=True, timeout=900,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            t.join(timeout=30)
+            self.assertIn("d", decoy, "decoy 没建成,这条用例失效了")
+            self.assertTrue(
+                decoy["d"].exists(),
+                "子 pytest 的会话级回收器删掉了别的进程正在用的目录"
+                f"（子进程退出码 {proc.returncode}）",
+            )
+        finally:
+            if "d" in decoy:
+                import shutil
+                shutil.rmtree(decoy["d"], ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()

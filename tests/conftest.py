@@ -24,9 +24,9 @@ r23 实测发现:跑一次 `tests/test_devloop.py` + `tests/test_phase4.py`
 
 ## 它不碰什么
 
-- 不删会话开始前就存在的目录(可能是别的进程正在用的)
+- 不删别的进程正在用的目录(r27 起:只删本会话自己 `mkdtemp` 建的)
 - 不删当前正在使用的目录
-- 只删**本次会话期间新建**、且符合 `tmp*` 命名、且是空目录或
+- 只删**本次会话期间登记过**的、且名字符合 `tmp*` 命名、且是空目录或
   含 `data.db`/`state.json` 这类测试产物的
 """
 from __future__ import annotations
@@ -91,49 +91,77 @@ def _snapshot() -> set[str]:
     return {p.name for p in Path(tempfile.gettempdir()).iterdir()}
 
 
+def _reap_created(created: list, base: Path | None = None) -> list:
+    """删掉 `created` 里登记过的目录,返回删掉的名字
+
+    抽成函数是为了能被单测 —— 回收器是会话级 autouse fixture,
+    "它会不会误删别人的东西"这种问题没法从外面问它。
+
+    `base` 守卫:只碰 base 底下的路径。少这道判断,一次传错参数就能把
+    用户的目录清掉 —— 这类操作宁可多挡一层。
+    """
+    root = Path(base) if base is not None else Path(tempfile.gettempdir())
+    names = []
+    for d in created:
+        p = Path(d)
+        # 测试自己可能已经清过了(用了 addCleanup),exists 守卫
+        if not p.exists() or root not in p.parents:
+            continue
+        shutil.rmtree(p, ignore_errors=True)
+        names.append(p.name)
+    return names
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _reap_stray_tmp_dirs():
-    """会话结束时清掉本次新建的 `tmp*` 目录
+    """会话结束时清掉**本会话自己建**的、没人清理的临时目录
 
-    ## 判据为什么是"会话期间新建",而不是"内容像不像测试产物"
+    ## r27:判据从"会话期间新增的 tmp* 目录"改成"本会话 mkdtemp 建的目录"
 
-    第一版按内容过滤(空目录 / 只含 `data.db`、`state.json`),
-    实测只兜住一半 —— 另外一半长这样:
+    原判据认不出"这个目录是别的进程刚建的"。这不是理论风险 ——
+    协议明确要求支持多 agent 并行,r27 实测就撞上了:两个 pytest 同时跑,
+    一个会话的回收器把另一个**正在用**的目录删掉,表现为别的测试莫名
+    失败("目录不存在"),从结果上完全看不出跟这里有关系。
+
+    (中间还有过一版按内容过滤的:空目录 / 只含 `data.db`、`state.json`,
+    实测只兜住一半 —— 另一半长这样:
 
         /tmp/tmp832__a93/p4reg          ← workspace 目录
         /tmp/tmpwbj3be1i/.arl-lite      ← 另一个 workspace 根
         /tmp/tmpae2aoaq2/{backlog.md,queue.json,state.json}
 
-    形态太杂,按内容猜必然漏 —— 而"漏"就等于这条兜底没用。
-    所以改成:会话开始时拍一张 `/tmp` 快照,结束时把**新增的**
-    `tmp*` 目录全收掉。
+    形态太杂,按内容猜必然漏,而"漏"就等于这条兜底没用。)
 
-    ## 这个判据的代价,说在前面
+    现在改成**追踪制**:会话开始时包一层 `tempfile.mkdtemp`,谁建的记下
+    路径,结束时只删自己那份。别的进程的东西一概不碰。
 
-    它认不出"这个目录是别的进程刚建的"。如果有人**同时**在别的
-    终端跑测试或跑一个用 `tempfile.mkdtemp()` 的程序,理论上会被
-    误删。
+    这不是把职责收窄 —— 原来的职责本来就写错了。它一直声称"回收无人
+    负责的目录",实际回收的是"我猜是无人负责的目录",而"猜"这个动作
+    在多 agent 场景下必然会猜错。
 
-    实测这个项目没有这种用法(冒烟时 `arl-lite` 自己不建 tmp 目录),
-    所以按"只在跑测试时生效 + 只碰新增目录"承担这个风险。
-    真撞上了,表现为那个程序报"目录不存在",不会静默出错 ——
-    这是这个判据可接受的原因。
+    ## 它不碰什么
 
-    宁可漏收,也不能误删用户数据:所以只碰 `tempfile.gettempdir()`
-    底下、且名字以 `tmp` 开头的**目录**,不碰文件,不碰别的路径。
+    - 不碰别的进程建的目录(本会话没登记过的一律不删)
+    - 不碰 `tempfile.TemporaryDirectory` 自己会清的目录
+    - 只删 `tempfile.gettempdir()` 底下的目录,不删文件,不删别处路径
     """
-    before = _snapshot()
-    yield
-    tmp = Path(tempfile.gettempdir())
-    strays = []
-    for p in tmp.iterdir():
-        if p.name in before or not p.is_dir() or not p.name.startswith("tmp"):
-            continue
-        shutil.rmtree(p, ignore_errors=True)
-        strays.append(p.name)
-    if strays:
-        print(
-            f"\n[conftest] 本次会话回收了 {len(strays)} 个无人清理的临时目录"
-            f"(/tmp 共 {len(before)} → {len(_snapshot())})。"
-            f"写测试请用 tempfile.TemporaryDirectory() 或 addCleanup。"
-        )
+    created: list = []
+    orig = tempfile.mkdtemp
+
+    def tracking_mkdtemp(*args, **kwargs):
+        path = orig(*args, **kwargs)
+        created.append(path)
+        return path
+
+    tempfile.mkdtemp = tracking_mkdtemp
+    try:
+        yield
+    finally:
+        tempfile.mkdtemp = orig
+        reaped = _reap_created(created)
+        if reaped:
+            print(
+                f"\n[conftest] 本次会话回收了 {len(reaped)} 个自己建的临时目录"
+                f"(/tmp 共 {len(_snapshot())} 个)。"
+                f"写测试请用 tempfile.TemporaryDirectory() 或 addCleanup。"
+            )
