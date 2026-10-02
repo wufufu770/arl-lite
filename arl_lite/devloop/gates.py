@@ -314,6 +314,25 @@ def _has_pytest_timeout() -> bool:
 # - 相对导入 (level > 0) 永远放行——那一定指向 arl_lite 内部
 
 
+def _dynamic_import_name(node: ast.AST) -> str:
+    """从 `__import__("x")` / `importlib.import_module("x")` 里取出模块名
+
+    只认**字面量**实参。变量传入的模块名静态不可判定,硬猜会误报 ——
+    而一个会误报的依赖门禁,总有一天会被加白名单绕过去。
+
+    `(r25)` 实测过的绕过:`importlib.import_module("requests")` 和
+    `__import__("httpx")` 在加这个检测之前都能让门禁全绿。
+    """
+    if not (isinstance(node, ast.Call) and node.args):
+        return ""
+    f = node.func
+    name = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else "")
+    if name not in ("__import__", "import_module"):
+        return ""
+    first = node.args[0]
+    return first.value if isinstance(first, ast.Constant) and isinstance(first.value, str) else ""
+
+
 class NoThirdPartyImportGate:
     """防的退化:任何 pip 依赖偷偷溜进核心代码。
 
@@ -361,6 +380,21 @@ class NoThirdPartyImportGate:
                     top = node.module.split(".")[0]
                     if top not in self._stdlib and top not in self._allowed:
                         violations.append((str(py), node.lineno, top))
+                else:
+                    # `(r25)` 动态 import:__import__("x") / importlib.import_module("x")
+                    #
+                    # 原来只看静态 import,于是这两种藏法一个都抓不到 ——
+                    # 实测 `importlib.import_module("requests")` 和
+                    # `__import__("httpx")` 都能让门禁全绿,
+                    # 而项目铁律是"零第三方依赖"。
+                    #
+                    # 只认**字面量实参**:变量传入的模块名无法静态判定,
+                    # 硬猜只会制造误报。抓不到就在 detail 里说清楚,
+                    # 不让门禁的措辞比它能证明的更强。
+                    mod = _dynamic_import_name(node)
+                    if mod and mod.split(".")[0] not in self._stdlib \
+                            and mod.split(".")[0] not in self._allowed:
+                        violations.append((str(py), node.lineno, mod))
 
         if not violations:
             return GateResult(
@@ -776,28 +810,52 @@ class LocBudgetGate:
 
 _RULES_REQUIRED_KEYS = ("advice:", "name:", "risk:", "confidence:")
 
+# `(r25)` 门禁改成走引擎加载器之后,查的是**解析后的对象**而不是文本。
+# 键在但值为空(`advice: ""`)也算缺 —— 旧的子串检查看不见这种。
+_RULE_REQUIRED_FIELDS = (("name", lambda r: r.name), ("risk", lambda r: r.risk),
+                         ("confidence", lambda r: r.confidence),
+                         ("advice", lambda r: r.advice))
+
 
 class RulesHaveAdviceGate:
-    """防的退化:分析规则的 advice / name / risk / confidence 字段被删。
+    """防的退化:分析规则**加载不了**,或 advice/name/risk/confidence 缺失。
 
-    扫描 arl_lite/modules/analysis/rules/*.yml,用文本子串检查,
-    避免引入 PyYAML 解析(项目零依赖铁律)。
+    ## `(r25 修)` 从文本子串检查改成真加载
 
-    ## 为什么 confidence 在这个门禁里,而不在播种里
+    原来是这样:
 
-    「每条规则都要有 confidence」是一条**常驻不变式**,不是一件一次性的活。
-    它原先被放在 `queue._seed_from_project_state` 里当"缺了才提一条待办",
-    后果有两层:
+    ```python
+    content = p.read_text()
+    missing = [k for k in _RULES_REQUIRED_KEYS if k not in content]
+    ```
 
-    - 提过一次之后就不响了。之后谁新加一条没写 confidence 的规则,
-      没人知道 —— 不变式只在**第一次**被检查,之后形同虚设
-    - 实测它已经永远产不出东西了(37/37 条都有 confidence,包括 25 条
-      risk>=7 的),是个纯死代码
+    纯文本子串检查。**它分不清「字段是活的」和「字段被注释掉了」。**
 
-    放进门禁之后,它每轮都被检查,而且是**阻塞级**的:新规则漏了字段,
-    门禁立刻红,而不是等到某天有人碰巧重跑播种。
+    r25 实测:把 `redis_public.yml` 的四个顶层键全部加 `#` 注释掉 ——
+    文本里 `"advice:"` 这些子串**一个都没少**,于是门禁报
 
-    > 一条不变式该住在会反复执行的地方,不该住在"缺了才响一次"的地方。
+        OK  rules_have_advice: all 37 rules compliant
+
+    而实际上:
+
+        failed to load rule redis_public.yml: missing 'name'
+        规则总数: 36        ← 一整条从引擎里消失了
+
+    一条 **risk 9** 的高危规则静默失效,门禁全绿。
+    这正是本项目铁律禁止的那种检查:
+    **不得用文本匹配区分「在用某标记」与「在解释该标记为何废弃」。**
+
+    ## 修法:走引擎自己的加载器
+
+    用 `correlation_engine.load_all_rules()` —— 它是手写的 YAML 解析
+    (项目零依赖铁律,不用 PyYAML),正是引擎实际使用的那条路径。
+
+    门禁现在查两件事:
+    1. **每个 .yml 文件都真的能被引擎加载**(新增 —— 以前完全不查)
+    2. 加载后的 `Rule` 对象上有 name/risk/confidence/advice 且非空
+
+    第 1 条比第 2 条更重要:一条加载不了的规则不是"少个字段",
+    是**整条规则不存在**,而报告里不会有任何提示。
     """
 
     name = "rules_have_advice"
@@ -813,38 +871,34 @@ class RulesHaveAdviceGate:
                 measured=0,
                 blocking=self.blocking,
             )
+        return self._check(rules_dir, repo)
 
-        bad: list[str] = []
-        total = 0
-        for p in sorted(rules_dir.glob("*.yml")):
-            total += 1
-            try:
-                content = p.read_text(encoding="utf-8")
-            except OSError:
-                bad.append(f"{p.name}:read_error")
-                continue
-            missing = [k for k in _RULES_REQUIRED_KEYS if k not in content]
-            if missing:
-                bad.append(f"{p.name}:missing={','.join(missing)}")
-
-        compliant = total - len(bad)
-        if bad:
-            return GateResult(
-                name=self.name,
-                passed=False,
-                detail=f"{compliant}/{total} compliant\n  " + "\n  ".join(bad),
-                measured=compliant,
-                baseline=total,
-                blocking=self.blocking,
-            )
+    def _check(self, rules_dir: Path, repo: Path) -> GateResult:
+        from arl_lite.core.correlation_engine import load_all_rules
+        files = sorted(rules_dir.glob("*.yml"))
+        total = len(files)
+        try:
+            rules = load_all_rules(rules_dir)
+        except Exception as e:                      # 加载器本身炸了 = 门禁失能
+            return GateResult(name=self.name, passed=False,
+                              detail=f"rule loader raised: {e}", measured=0,
+                              baseline=total, blocking=self.blocking)
+        # ① 文件 → 规则:对不上的就是"静默消失"的那些
+        loaded = {r.name for r in rules}
+        bad = [f"{p.name}: 加载失败(引擎里找不到它)" for p in files
+               if not any(p.stem in n for n in loaded)]
+        # ② 加载后的对象上,必填字段必须**非空**(键在但值为空也算缺)
+        for r in rules:
+            empty = [k for k, v in _RULE_REQUIRED_FIELDS
+                     if v(r) is None or (isinstance(v(r), str) and not v(r).strip())]
+            if empty:
+                bad.append(f"{r.name}: 空字段={','.join(empty)}")
+        compliant = total - sum("加载失败" in b for b in bad)
+        detail = (f"all {total} rules load and carry the required fields" if not bad
+                  else f"{compliant}/{total} compliant\n  " + "\n  ".join(bad))
         return GateResult(
-            name=self.name,
-            passed=True,
-            detail=f"all {total} rules compliant",
-            measured=compliant,
-            baseline=total,
-            blocking=self.blocking,
-        )
+            name=self.name, passed=not bad, detail=detail,
+            measured=compliant, baseline=total, blocking=self.blocking)
 
 
 # =====================================================================
