@@ -201,23 +201,127 @@ def test_high_confidence_hit_is_not_truncated_by_id_order(st):
     assert "共 61 条" in html or "已排除" in html or "仅显示前 50" in html
 
 
-def test_status_field_actually_has_a_consumer():
+def test_status_field_actually_has_a_consumer(st):
     """`confidence_status` 必须有读取方,不只是写入方
 
-    这条是本文件最直接的守门:r21 之前它只出现在 `storage.py` 的
-    建表语句里 —— 有 schema、有 INSERT、有字段,就是没人读。
+    r21 之前它只出现在 `storage.py` 的建表语句里 —— 有 schema、
+    有 INSERT、有字段,就是没人读。后果就是第 1 轮想解决的问题
+    原封不动留着。
 
-    判据是**在渲染路径里**出现,而不是"全仓出现过"。后者在有建表
-    语句时就成立,那正是它失效了整个 r1 的原因。
+    ## 这条测试改过一次(r22)
+
+    原来它是这么写的:
+
+    ```python
+    src = (REPO / "arl_lite" / "cli_report_html.py").read_text()
+    assert "confidence_status" in src       # ← 文本匹配
+    assert "discard" in src and "observe" in src
+    ```
+
+    r22 把判定下沉到 `core.confidence.status_of()` 之后,
+    **`confidence_status` 这个字符串在报告层不再出现**,
+    测试红了 —— 而代码其实比改之前更正确。
+
+    这暴露了原测试的毛病:它测的是"字段名字符串在不在",
+    不是"处置有没有真的影响输出"。按项目铁律,
+    **能用行为断言就别用文本匹配** —— 文本匹配分不清
+    「真的在按它分流」和「只是在解释为什么按它分流」,
+    而且会把正确的重构判成回归。
+
+    现在改成跑真报告、看三档的行各自落在哪儿。
     """
-    src = (REPO / "arl_lite" / "cli_report_html.py").read_text(encoding="utf-8")
-    # 排除注释/docstring:用可执行代码里是否出现该字段名判断
-    code_lines = [
-        ln for ln in src.splitlines()
-        if not ln.strip().startswith("#")
-    ]
-    code = "\n".join(code_lines)
-    assert "confidence_status" in code, \
-        "报告渲染代码里没有 confidence_status —— 模型的处置判断没被消费"
-    assert "discard" in code and "observe" in code, \
-        "没有按三档处置分流 —— 只是把字段读出来而已"
+
+    _seed(st, [
+        ("该直接报的真问题", 90, "report"),
+        ("要人自己判断的", 55, "observe"),
+        ("指纹误报", 10, "discard"),
+    ])
+    html = generate_html_report(st, "t")
+    main = _main_table(html)
+
+    assert "该直接报的真问题" in main, "report 档没进主表"
+    assert "要人自己判断的" in main, "observe 档没进主表"
+    assert "待观察" in main, "observe 档没有可见标记 —— 用户看不出它待定"
+    assert "指纹误报" not in main, "discard 档混进了主表"
+    # discard 不删,折叠起来(见"折叠而非删除"那条决策)
+    assert "指纹误报" in html, "discard 被整条删掉了 —— 模型判断可能错,藏起来就没人能发现它错了"
+
+
+# =====================================================================
+# 风险聚合:第三处消费路径
+# =====================================================================
+
+
+def test_discard_hits_do_not_inflate_risk_scores(st):
+    """discard 命中的关联不许参与风险评分
+
+    第 21 轮把 discard 从报告主表沉到折叠区。但 `compute_asset_risks`
+    只读 `risk`,照样把它算进去 —— 于是用户看到「这个资产风险 9 分」,
+    却在报告里找不到对应条目,两个数字对不上账。
+
+    这和 confidence-risks 那条 P2 待办是同一件事:
+    confidence 决定**算不算数**,risk 决定**算数之后有多严重**。
+    """
+    from arl_lite.core.risk_score import compute_asset_risks
+
+    _seed(st, [("真问题", 90, "report"), ("指纹误报", 10, "discard")])
+    # 两条的 target 不同,各自成一个资产;误报那条 risk 也是 9
+    risks = {a.target: a.risk_score for a in compute_asset_risks(st)}
+    assert "真问题.example.com" in risks
+    assert "指纹误报.example.com" not in risks, \
+        "discard 命中的关联仍然参与了风险评分 —— 报告里看不到它,风险却算了"
+
+
+def test_observe_hits_still_count_toward_risk(st):
+    """observe **要**参与 —— 它是「算出来但不足以直接报」,不是「不算」
+
+    把 observe 也排除会**低估**真实风险,那比高估更危险:
+    用户会以为资产是安全的。
+    """
+    from arl_lite.core.risk_score import compute_asset_risks
+
+    _seed(st, [("待观察的高危", 70, "observe")])
+    risks = {a.target for a in compute_asset_risks(st)}
+    assert "待观察的高危.example.com" in risks, \
+        "observe 被排除了 —— 那会低估真实风险,比高估更危险"
+
+
+def test_risk_summary_uses_the_same_filter(st):
+    """risk_summary 和 compute_asset_risks 必须是同一个口径
+
+    这条守的是「规则只该有一个实现」。r22 实测:`risk_summary` 是
+    第三处读 correlations 的地方,它直接 `storage.query`,于是 discard
+    照样进 `by_level` 和 `max_risk`。三处各写一遍判断,漏一处
+    discard 就从那个口子回来 —— 而且不会报错,只会安静地给出错误的数。
+    """
+    from arl_lite.core.risk_score import risk_summary
+
+    _seed(st, [("真问题", 90, "report"), ("指纹误报", 10, "discard")])
+    s = risk_summary(st)
+    assert s["total_correlations"] == 1, \
+        f"概览把 discard 也算进去了:{s}"
+    assert s["discarded_correlations"] == 1, \
+        f"被排除的条数没有单独报出来,用户对不上账:{s}"
+    # max_risk 也不能被 discard 拉高
+    assert s["max_risk"] == 9 or s["max_risk"] >= 9
+
+
+def test_missing_status_counts_in(st):
+    """字段缺失的老数据照常计入(保守:不因缺字段就少算风险)"""
+    from arl_lite.core.risk_score import risk_summary
+
+    with st._conn() as conn:
+        conn.execute(
+            """INSERT INTO correlations
+               (workspace_id, rule_name, risk, target, target_type, headline,
+                advice, tags, matched_count, evidence, confidence,
+                confidence_level, confidence_status, confidence_factors, detected_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (st.workspace_id, "老数据", 7, "old.example.com", "host",
+             "升级前的命中", "", "[]", 1, "{}", 55, "low",
+             None, None, "2025-01-01T00:00:00"),
+        )
+        conn.commit()
+    s = risk_summary(st)
+    assert s["total_correlations"] == 1, "缺 status 的历史命中被排除了"
+    assert s["discarded_correlations"] == 0

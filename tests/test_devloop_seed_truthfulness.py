@@ -178,6 +178,242 @@ def test_no_auto_seeded_item_is_already_done():
         )
 
 
+def test_signal_does_not_multiply_while_one_is_still_pending():
+    """队里已有一条 **pending** 信号时,不许再提第二条
+
+    ## r22 抓到的自指空转
+
+    第 19 轮加了 `no-due-maintenance-review` 兜底,条件是
+    `not out and not existing_ids`。但 `seed_if_empty` 传给
+    `_seed_fallback` 的是 `set()`(第 16 轮为了让保底层总能提出候选
+    才改的),于是 `existing_ids` 恒为空。
+
+    ## 这条测试改过一次,因为它原本是恒真的
+
+    初版循环里写的是:
+
+    ```python
+    for i in q.load():
+        if i.status == "pending": i.status = "done"
+    q.save(q.load())        # ← 又 load 了一次
+    ```
+
+    `q.load()` 第二次返回的是**重新读出来的、没被改动过**的列表。
+    信号自始至终是 pending,于是"每轮只有一条"的原因是
+    **"它一直没被关掉"**,不是"修复起了作用"。
+
+    恒真测试比没有测试更糟:它让人以为这一支被守住了。
+    证据是三个变异(判据恒假 / 删掉 id 判断 / 前缀退化)全都全绿。
+    把 close 真正做对之后,才暴露出下面那件更要紧的事 ——
+    close 之后**本来就会**重提(那是 #4 要求的,见
+    `test_a_closed_signal_is_deliberately_reproposed`),
+    所以这条测试守的是"**别在同一次等待里提两条**",
+    而把"别追问"交给 drop 开关去管。
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        q = Queue(Path(td) / "queue.json")
+        for rnd in range(1, 6):
+            q.seed_if_empty()
+            sig = [i for i in q.load() if "no-due" in i.id]
+            assert len(sig) == 1, (
+                f"第 {rnd} 轮后有 {len(sig)} 条信号:{[i.id for i in sig]}\n"
+                f"  同一次等待里提了两条 —— 人还是得回答同一个问题一次,"
+                f"只是队列里多了个位置"
+            )
+            assert sig[0].status == "pending", (
+                f"第 {rnd} 轮信号状态是 {sig[0].status} —— "
+                "前置条件不成立:本测试要守的是'已有 pending 时不重复提'"
+            )
+
+
+def test_a_pending_derived_signal_copy_also_blocks_reproposal():
+    """队里躺着一条 **pending 的 `-rN` 派生副本**时,不再提新的
+
+    ## 这条是被变异测试逼出来的
+
+    `_no_signal_pending()` 写的是「精确 id **或** `-rN` 前缀」。
+    但 `test_signal_does_not_multiply_itself_across_rounds` 里,
+    信号是**引擎自己提的** —— 修好之后第二轮根本不会产生 `-r1`,
+    于是前缀那一支**永远走不到**。
+
+    变异 18(把前缀退化成精确 id)和变异 19(把 pending 判据改成恒假)
+    都是 **16 条测试全绿**。也就是说那段防御代码当时是死的,
+    而没人发现。
+
+    ## 它为什么不是死代码
+
+    真实的 `devloop/queue.json` 里**确实躺着**
+    `no-due-maintenance-review-r1` 和 `-r2` —— 那是修复前长出来的。
+    把前缀退化成精确 id 的话,一旦有一条派生副本还挂在 pending 上,
+    引擎就会当成"没有信号"再提一条,同一个问题在队列里占两个位置。
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        q = Queue(Path(td) / "queue.json")
+        # 手工放一条 pending 的派生副本,模拟修复前遗留的数据
+        q.add(Item(
+            id="no-due-maintenance-review-r7",
+            title="当前无到期维护项,请人工确认下一步",
+            detail="(测试构造:模拟修复前遗留的派生副本)",
+            verify="人为确认",
+            kind="research",
+            tags=["maintenance", "review"],
+        ))
+        assert [i for i in q.load() if i.status == "pending"], "前置条件不成立"
+
+        q.seed_if_empty()
+
+        sigs = [i for i in q.load() if "no-due" in i.id]
+        ids = sorted(i.id for i in sigs)
+        assert ids == ["no-due-maintenance-review-r7"], (
+            f"队里已有 pending 的派生副本,却又提了新的:{ids} —— "
+            "前缀匹配这一支是死的,同一个问题会在队列里占两个位置"
+        )
+
+
+def test_a_dropped_derived_signal_also_blocks_reproposal():
+    """dropped 的**派生副本**同样关闭提醒
+
+    和上一条是同一件事的两个方向:前缀匹配必须对 `-rN` 成立,
+    否则人 drop 掉的那条拦不住下一条长出来。
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        q = Queue(Path(td) / "queue.json")
+        q.add(Item(
+            id="no-due-maintenance-review-r9",
+            title="当前无到期维护项,请人工确认下一步",
+            detail="(测试构造:模拟遗留的派生副本)",
+            verify="人为确认",
+            kind="research",
+            tags=["maintenance", "review"],
+        ))
+        ok, _ = q.drop("no-due-maintenance-review-r9", reason="别再提了")
+        assert ok
+
+        q.seed_if_empty()
+        assert not [i for i in q.load()
+                    if "no-due" in i.id and i.status == "pending"], \
+            "drop 了派生副本却又提了新的 —— 前缀匹配对 -rN 不成立"
+
+
+def test_a_dropped_unrelated_item_does_not_disable_the_signal():
+    """一条**被 drop 的普通待办**不该永久关掉「那接下来干什么」
+
+    ## 这条是被变异测试逼出来的
+
+    把 `_should_propose_signal()` 里的 id 判断整个删掉(变成
+    「只要队里有任何 pending/dropped 就算有信号」),
+    **62 条测试全绿**。
+
+    原因很直白:此前所有测试的队列里**只装过信号**,
+    所以「同类信号才拦」和「随便什么都拦」分不开。
+
+    ## 为什么这个区分在真实队列里重要
+
+    真实队列里同时躺着信号和**普通待办**(比如被 drop 掉的
+    `false-positive-rate-measurement` 误报率实测 —— 那条和信号无关)。
+    如果 id 判断失效,那条 dropped 的旧待办会**永久压住**复查信号:
+    人明明已经回答过一次"暂时没活",引擎却再也不提醒了。
+
+    症状是队列长期空转而不报错 —— 比队列直接空掉更难发现,
+    因为所有不变式看起来都还满足。
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        q = Queue(Path(td) / "queue.json")
+        # 一条和信号毫无关系的、被 drop 的旧待办
+        q.add(Item(
+            id="false-positive-rate-measurement",
+            title="误报率实测",
+            detail="(测试构造:与信号无关的旧待办)",
+            verify="跑 fp-bench",
+            kind="research",
+        ))
+        ok, _ = q.drop("false-positive-rate-measurement", reason="已由 r14 覆盖,重复")
+        assert ok
+
+        q.seed_if_empty()
+
+        assert [i for i in q.load()
+                if "no-due" in i.id and i.status == "pending"], (
+            "一条无关的 dropped 待办把复查信号压住了 —— "
+            "id 判断失效,队里随便什么都算数。"
+            "症状是队列长期空转且所有不变式看起来都还满足"
+        )
+
+
+def test_a_closed_signal_is_deliberately_reproposed():
+    """信号被 close 之后,**会**再提一条 —— 这是不变的 #4 要求的
+
+    真实队列里 `no-due-maintenance-review`(done) 后面跟着
+    `-r1`、`-r2`,一开始看着像引擎抽风。查下来不是:
+    人 close 掉信号,队列就空了,不变式 #4(队列永远非空)要求引擎
+    重新挂点什么,而"眼下确实没有自动推导的活"这个事实
+    需要有人持续面对 —— 信号就是那个逼迫。
+
+    所以重提本身是**设计**,不是 bug。真正该测的是下一条:
+    人要是不想被反复问,有 `drop` 这个显式开关(见下一条测试)。
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        q = Queue(Path(td) / "queue.json")
+        q.seed_if_empty()
+        sig = next(i for i in q.load() if "no-due" in i.id)
+
+        items = q.load()
+        target = next(i for i in items if i.id == sig.id)
+        target.status = "done"
+        q.save(items)
+
+        q.seed_if_empty()
+        assert [i for i in q.load() if "no-due" in i.id and i.status == "pending"], \
+            "close 之后没重提 —— 不变式 #4 会因为队列空掉而破"
+
+
+def test_a_dropped_signal_is_never_reproposed():
+    """但人**主动 drop** 之后,永远不再提 —— drop 是显式关闭开关
+
+    `(r22 改写)` 这条测试原先断言的是**反的**:"信号被 drop 后该再提,
+    因为人丢掉它正是想继续被提醒"。
+
+    那句话是我自己推的,推错了。真实队列里躺着两条 dropped 副本
+    (`-r1`、`-r2`),说明人当时**正是在试图让它闭嘴**,
+    而引擎照提不误 —— 一个接一个地又长出新的。
+
+    `drop` 在 r17 加的时候是**必须带理由**的,语义就是
+    "我明确不要这条,并且我知道为什么"。静默覆盖人的显式指令,
+    比队列空掉更坏:队列空掉至少是诚实的。
+
+    注意这和上一条不矛盾:close 之后重提(维持 #4),
+    drop 之后不提(尊重显式指令)。人想关,有专门的开关。
+    """
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        q = Queue(Path(td) / "queue.json")
+        q.seed_if_empty()
+        sig = next(i for i in q.load() if "no-due" in i.id)
+        ok, _ = q.drop(sig.id, reason="别再提醒,我已确认暂时没有活")
+        assert ok
+
+        # 连喊三轮,一次都不许再提
+        for rnd in range(1, 4):
+            q.seed_if_empty()
+            pend = [i for i in q.load()
+                    if "no-due" in i.id and i.status == "pending"]
+            assert not pend, (
+                f"第 {rnd} 轮又提了信号:{[i.id for i in pend]} —— "
+                "人已经明确 drop 过了。静默覆盖显式指令,比队列空掉更坏"
+            )
+
+
 def test_signal_items_must_say_so():
     """信号类条目必须自报家门 —— 豁免不许变成万能后门
 

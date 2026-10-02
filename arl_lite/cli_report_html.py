@@ -58,14 +58,14 @@ def generate_html_report(storage: "Storage", workspace: str, title: str = "ARL-L
     # 消费者,整轮 r1 的承诺在用户看到的地方是空的。
     #
     # 排序键:discard 沉底,同档内按 confidence 降序,再按 risk 降序。
-    # 拿不到 confidence 的老数据(status 为空)按 observe 处理 —— 保守:
-    # 不因为字段缺失就把东西藏起来。
+    # 档位判定与"是不是 discard"的判定都走 `core.confidence`,
+    # 和 `core.risk_score` 同一份实现 —— 之前这里是内联写的,
+    # 于是"三个消费方口径一致"这句话当时并不成立(见 risk_score 注释)。
+    from arl_lite.core.confidence import is_discarded, status_of
     _STATUS_RANK = {"discard": 0, "observe": 1, "report": 2}
 
     def _corr_key(c):
-        st = (c.get("confidence_status") or "observe").strip().lower()
-        if st not in _STATUS_RANK:
-            st = "observe"
+        st = status_of(c)
         try:
             conf = int(c.get("confidence") or 0)
         except (TypeError, ValueError):
@@ -77,10 +77,8 @@ def generate_html_report(storage: "Storage", workspace: str, title: str = "ARL-L
         return (_STATUS_RANK[st], -conf, -rk)
 
     correlations = sorted(correlations, key=_corr_key)
-    reported = [c for c in correlations
-                if (c.get("confidence_status") or "observe").strip().lower() != "discard"]
-    discarded = [c for c in correlations
-                 if (c.get("confidence_status") or "").strip().lower() == "discard"]
+    reported = [c for c in correlations if not is_discarded(c)]
+    discarded = [c for c in correlations if is_discarded(c)]
     host_samples = [h.get("host", "?") for h in hosts[:20] if h.get("host")]
     stats.setdefault("monitors", len(storage.query("monitors", limit=10000)))
 
@@ -275,7 +273,7 @@ def generate_html_report(storage: "Storage", workspace: str, title: str = "ARL-L
                 conf = int(c.get("confidence") or 0)
             except (TypeError, ValueError):
                 conf = 0
-            cstat = (c.get("confidence_status") or "").strip().lower()
+            cstat = status_of(c)
             level = "critical" if risk >= 9 else "high" if risk >= 7 else "medium" if risk >= 4 else "low"
             # observe = 算出来但不足以直接报,标出来让人自己判断
             badge = (' <span class="level level-medium">待观察</span>'
