@@ -403,15 +403,28 @@ def test_real_repo_queue_has_no_duplicate_ids():
     )
 
 
-def test_real_repo_queue_has_no_stranded_in_progress(loop):
-    """真实队列里不该有卡在 in_progress 的条目
+def test_real_repo_queue_has_at_most_one_in_progress():
+    """真实队列里 in_progress 的条目最多一条 —— 这条曾经红过
 
-    引擎在轮次结束时会把处理过的条目落到 pending 或 done,
-    留在 in_progress 说明有条目被重复 id 掩盖了(引擎改的是另一条)。
+    ## 为什么不是"一条都没有"
+
+    原本写的是"不该有卡在 in_progress 的条目",结果在第 10 轮红了一次:
+    `devloop round` 的 TEST 阶段会在队列更新**之前**跑 pytest,
+    那一刻当前条目正当着 in_progress(引擎直到门禁跑完才落 done/pending)。
+    于是测试读到了轮次中间态,把合法状态当成损坏。
+
+    单独跑 pytest 时不会红 —— 所以它只在 `devloop round` 里偶发,
+    这种"换个入口才复现"的失败比稳定失败更难查。
+
+    真正的不变式是"**轮次结束后**不该有残留",但那没法从一轮自己的
+    测试运行里断言(测试就跑在这一轮中间)。所以退一步断言随时都成立的
+    性质:一轮最多一条 in_progress。
+
+    这仍然抓得住真实事故的signature —— 当时是 8 条同时 in_progress。
     """
     real = Queue(REPO / "devloop" / "queue.json")
-    stuck = [i.id for i in real.load() if i.status == "in_progress"]
-    assert not stuck, (
-        f"真实队列有卡在 in_progress 的条目: {stuck}\n"
-        f"  说明引擎一直在改同 id 的另一条记录,跑 `arl-lite devloop repair`"
+    in_progress = [i.id for i in real.load() if i.status == "in_progress"]
+    assert len(in_progress) <= 1, (
+        f"真实队列有 {len(in_progress)} 条同时 in_progress: {in_progress}\n"
+        f"  一轮最多一条;多条说明引擎在按 id 改同一条的另一份副本。"
     )
