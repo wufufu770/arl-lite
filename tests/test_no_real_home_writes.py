@@ -345,8 +345,27 @@ class TestNoStrayTmpDirsSurviveARun(unittest.TestCase):
         tmp = Path(_tf.gettempdir())
 
         def snapshot():
+            """只收 `tmp*` 的目录 —— 判据必须比它守的事**窄**(r36)
+
+            原来这里收的是**整个 `/tmp` 的目录名集合**,于是判据变成
+            「系统上任何目录都不许新增」。它守的是「conftest 的会话级
+            回收器没把 devloop 自己的临时目录漏掉」,信号范围却宽了十万倍。
+
+            r36 实测后果:同时在别处 `mkdir /tmp/unrelated-probe-aaa`
+            (与本项目毫无关系),它立刻红:
+
+                跑完测试后 /tmp 里多出 1 个目录:['unrelated-probe-aaa']
+
+            假绿不可怕,**假红才可怕** —— 它让 `test_baseline` 门禁随机
+            飘红,而门禁飘红会被当成真回归去查。
+
+            收窄到 `tmp*` 是有依据的:`tempfile.mkdtemp()` 造出来的目录
+            一律以 `tmp` 开头,而 conftest 的回收器只可能漏掉**这一类**。
+            与本项目无关的目录本来就不归它管,进来只会变成噪音。
+            """
             try:
-                return {p.name for p in tmp.iterdir() if p.is_dir()}
+                return {p.name for p in tmp.iterdir()
+                        if p.is_dir() and p.name.startswith("tmp")}
             except OSError:
                 self.skipTest(f"读不了临时目录:{tmp}")
 
@@ -361,7 +380,7 @@ class TestNoStrayTmpDirsSurviveARun(unittest.TestCase):
         strays = sorted(after - before)
         self.assertEqual(
             strays, [],
-            f"跑完测试后 /tmp 里多出 {len(strays)} 个目录:{strays[:10]}\n"
+            f"跑完测试后 /tmp 里多出 {len(strays)} 个 tmp* 目录:{strays[:10]}\n"
             f"conftest 的会话级兜底没兜住。\n"
             f"pytest 输出尾部:\n{proc.stdout[-1200:]}"
         )
