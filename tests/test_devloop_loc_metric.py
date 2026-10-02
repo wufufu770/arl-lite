@@ -210,11 +210,39 @@ def test_devloop_red_line_can_only_move_through_an_audited_path():
     assert MIN_REASON_LEN >= 10, "理由门槛被削弱了"
 
     # 门禁必须正在失败才给提升 —— 用一个绿的仓库状态验这条
-    res = g.run(REPO)
-    if res.passed:
-        out = accept_baseline(REPO, "loc_budget", reason="这条理由够长了用于测试")
+    #
+    # `(r26 修)` 这里原来调的是 `accept_baseline(REPO, ...)` —— **真实
+    # 仓库**,不是临时目录。而 accept_baseline 是会写盘的。
+    #
+    # 它当时没出事纯属运气:测试自己先 `g.run(REPO)` 拿到绿,才走进
+    # `if res.passed:` 分支;而 accept_baseline 内部**又跑一遍**
+    # `gate.run(repo)`。两次调用之间只要状态翻转(比如并发的探针文件
+    # 增删),内部那次就变成红,于是**提升被真的写进了
+    # devloop/baselines.json**。
+    #
+    # r26 实测到了:baseline 被从 14254 抬到 15014,理由是那句
+    # "这条理由够长了用于测试"。而这行代码的本意只是验**拒绝路径**。
+    #
+    # 换句话说:一个只想验证"系统会说不"的测试,把红线抬了 760 行。
+    # 和第 23 轮"测试往用户真实 HOME 写数据"是同一个病,
+    # 只是这次写的是协议自己的审计轨迹。
+    #
+    # 改成临时仓库,和其他所有 accept 测试一致。
+    import shutil
+    import tempfile
+    from pathlib import Path as _P
+    tmp_repo = _P(tempfile.mkdtemp())
+    try:
+        (tmp_repo / "devloop").mkdir(parents=True, exist_ok=True)
+        (tmp_repo / "arl_lite").mkdir(parents=True, exist_ok=True)
+        (tmp_repo / "arl_lite" / "x.py").write_text("x = 1\n", encoding="utf-8")
+        (tmp_repo / "devloop" / "backlog.md").write_text("# backlog\n", encoding="utf-8")
+        gates.update_baseline(tmp_repo, "loc_budget", {"total_loc": 1})
+        out = accept_baseline(tmp_repo, "loc_budget", reason="这条理由够长了用于测试")
         assert out.ok is False, "门禁是绿的却接受了提升 —— 提前买预算没被挡住"
         assert "green" in out.detail.lower() or "nothing" in out.detail.lower(), out.detail
+    finally:
+        shutil.rmtree(tmp_repo, ignore_errors=True)
 
 
 def test_devloop_red_line_value_is_not_silently_changed():

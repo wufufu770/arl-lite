@@ -31,11 +31,60 @@ r23 实测发现:跑一次 `tests/test_devloop.py` + `tests/test_phase4.py`
 """
 from __future__ import annotations
 
+import hashlib
 import shutil
 import tempfile
 from pathlib import Path
 
 import pytest
+
+
+def _find_repo_root() -> Path:
+    here = Path(__file__).resolve()
+    for cand in here.parents:
+        if (cand / "pyproject.toml").is_file() and (cand / "arl_lite").is_dir():
+            return cand
+    raise RuntimeError("找不到项目根")
+
+
+# 测试期间**不许被写**的真实文件。
+#
+# 第 23 轮抓到"测试往用户真实 HOME 写数据",第 26 轮抓到同一个病的
+# 另一副面孔:一条只想验"accept 会拒绝"的测试,对**真实仓库**调了
+# `accept_baseline(REPO, ...)`。accept_baseline 是会写盘的。
+#
+# 当时没出事纯属运气 —— 测试先 `g.run(REPO)` 拿到绿才进分支,而
+# accept_baseline 内部**又跑一遍** gate;两次调用之间状态一翻转,
+# 提升就真写进 devloop/baselines.json 了。实测 baseline 被从 14254
+# 抬到 15014,理由是测试里那句"这条理由够长了用于测试"。
+#
+# **一个只想验证"系统会说不"的测试,把红线抬了 760 行。**
+#
+# baselines.json 是红线的唯一真相来源,也是 r20 花了整轮才做成
+# 可审计的留痕。它在任何测试里都不该被改 —— 所以按内容哈希守,
+# 而不是靠"大家记得别改"。
+_PROTECTED = ("devloop/baselines.json",)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _real_state_untouched_by_tests():
+    """测试会话期间,真实的状态文件必须一字未改"""
+    root = _find_repo_root()
+    before = {}
+    for rel in _PROTECTED:
+        p = root / rel
+        before[rel] = hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None
+    yield
+    for rel in _PROTECTED:
+        p = root / rel
+        after = hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None
+        if before[rel] != after:
+            pytest.fail(
+                f"测试改了真实状态文件 {rel}(内容哈希变了)。\n"
+                "  状态文件是协议的真相来源,不是测试的沙箱。\n"
+                "  要测写盘行为就用临时仓库,别拿 REPO 当参数。\n"
+                f"  改前 {before[rel]}\n  改后 {after}",
+                pytrace=False)
 
 
 def _snapshot() -> set[str]:

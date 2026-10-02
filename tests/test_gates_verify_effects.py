@@ -229,3 +229,110 @@ class TestTheseGatesAreNotTextMatching(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestImportCycleGateSeesAbsoluteImports(unittest.TestCase):
+    """循环门禁必须看得见**绝对导入**形成的环
+
+    ## r26 实测的失败
+
+    旧实现是 `if mod in files`,而 `mod` 是点号全名
+    `"arl_lite._cyc_b"`,`files` 的键却是相对 arl_lite/ 的斜杠路径
+    `"_cyc_b"` —— 两者永远对不上。于是**绝对导入一条边都没进图**。
+
+    造一个最直白的循环:
+
+        arl_lite/_cyc_a.py:  from arl_lite._cyc_b import helper_b
+        arl_lite/_cyc_b.py:  from arl_lite._cyc_a import helper_a
+
+    门禁报 `no cycles`。量化:159 条内部导入里,绝对导入 5 条
+    **命中 0 条**,相对导入 154 条正常。
+
+    修完之后导入计数从 101 变成 106 —— 那 5 条终于被算进去了。
+    现有代码本来就没有真环(修完门禁仍然绿),所以这个修复
+    没有揭露既有问题,只是让门禁**有能力**发现它们。
+    """
+
+    def setUp(self):
+        self.a = REPO / "arl_lite" / "_cyc_a.py"
+        self.b = REPO / "arl_lite" / "_cyc_b.py"
+
+    def tearDown(self):
+        for p in (self.a, self.b):
+            if p.exists():
+                p.unlink()
+
+    def _write_cycle(self, a_mod: str, b_mod: str):
+        self.a.write_text(f"from {a_mod} import helper_b\n"
+                          "def helper_a(): return helper_b()\n", encoding="utf-8")
+        self.b.write_text(f"from {b_mod} import helper_a\n"
+                          "def helper_b(): return helper_a()\n", encoding="utf-8")
+
+    def _gate(self):
+        from arl_lite.devloop.gates import NoImportCycleGate
+        return NoImportCycleGate().run(REPO)
+
+    def test_baseline_is_clean_before_writing_the_cycle(self):
+        """前置条件:先证明基线是绿的,否则后面两条可能假通过"""
+        self.assertFalse(self.a.exists() and self.b.exists())
+        self.assertTrue(self._gate().passed, "没造环之前门禁就不绿了")
+
+    def test_absolute_import_cycle_is_caught(self):
+        self._write_cycle("arl_lite._cyc_b", "arl_lite._cyc_a")
+        result = self._gate()
+        self.assertFalse(result.passed,
+                         f"绝对导入形成的环没被抓到 —— detail={result.detail}")
+        self.assertIn("_cyc_a", result.detail)
+        self.assertIn("_cyc_b", result.detail)
+
+    def test_relative_import_cycle_is_still_caught(self):
+        """相对导入那一支本来是好的 —— 修绝对导入不能把它弄坏"""
+        import shutil
+        import tempfile
+        pkg = REPO / "arl_lite" / "_cycpkg"
+        pkg.mkdir(exist_ok=True)
+        self.addCleanup(shutil.rmtree, pkg, True)
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+        (pkg / "x.py").write_text("from .y import gy\ndef gx(): return gy()\n",
+                                  encoding="utf-8")
+        (pkg / "y.py").write_text("from .x import gx\ndef gy(): return gx()\n",
+                                  encoding="utf-8")
+        result = self._gate()
+        self.assertFalse(result.passed,
+                         f"相对导入形成的环没被抓到(回归)—— detail={result.detail}")
+
+
+class TestImportCycleGateCountsWhatItSees(unittest.TestCase):
+    """门禁报的「内部导入数」必须和它真的看进图的数量对得上
+
+    r26 的 bug 还有一个更隐蔽的表现:detail 里写「101 internal imports」,
+    而实际有 159 条。**一个报出来的数字和它做的事对不上,就是在
+    给使用者虚假的安全感** —— 报 101 的人不会想到还有 5 条被漏了。
+    """
+
+    def test_absolute_imports_are_actually_in_the_graph(self):
+        from arl_lite.devloop import gates
+        import ast
+        from pathlib import Path
+
+        root = REPO / "arl_lite"
+        files = {p.relative_to(root).with_suffix("").as_posix()
+                 for p in root.rglob("*.py")}
+        # 找一条**绝对** arl_lite.* 导入,确认它的名字能映射到 files 里的键
+        found = 0
+        for p in root.rglob("*.py"):
+            try:
+                tree = ast.parse(p.read_text(encoding="utf-8"))
+            except SyntaxError:
+                continue
+            for n in ast.walk(tree):
+                if isinstance(n, ast.ImportFrom) and n.level == 0 \
+                        and n.module and n.module.startswith("arl_lite."):
+                    key = n.module[len("arl_lite."):].replace(".", "/")
+                    if key in files:
+                        found += 1
+        self.assertGreaterEqual(
+            found, 1,
+            "找不到任何能映射成功的绝对 arl_lite.* 导入 —— "
+            "要么代码里没有绝对导入(r26 之前正好是这种情况),"
+            "要么门禁的映射规则又坏了")

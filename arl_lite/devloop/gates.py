@@ -595,10 +595,21 @@ class NoImportCycleGate:
                         graph[rel].add(target)
                     continue
                 # 绝对 import:只关心 arl_lite.* 内部模块
-                if node.module and node.module.startswith("arl_lite"):
-                    mod = node.module
-                    if mod in files and mod != rel:
-                        graph[rel].add(mod)
+                #
+                # `(r26 修)` 原来写的是 `if mod in files`,而 `mod` 是
+                # **点号全名** `"arl_lite._cyc_b"`,`files` 的键却是
+                # **相对 arl_lite/ 的斜杠路径** `"_cyc_b"`。
+                # 两者永远对不上 —— 所以**绝对导入一条边都没进图**。
+                #
+                # r26 实测:造一个最直白的循环
+                #     arl_lite/_cyc_a.py: from arl_lite._cyc_b import helper_b
+                #     arl_lite/_cyc_b.py: from arl_lite._cyc_a import helper_a
+                # 门禁报 `no cycles`。量化:159 条内部导入里,
+                # 绝对导入 5 条 **命中 0 条**,相对导入 154 条正常。
+                if node.module and node.module.startswith("arl_lite."):
+                    key = node.module[len("arl_lite."):].replace(".", "/")
+                    if key in files and key != rel:
+                        graph[rel].add(key)
 
         # DFS 找环
         WHITE, GRAY, BLACK = 0, 1, 2
