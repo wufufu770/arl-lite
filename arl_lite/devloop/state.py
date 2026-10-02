@@ -61,12 +61,27 @@ class RoundRecord:
     # 这一轮的 done 是**谁**断言的。
     #   "build_fn"     —— 注入了 build 回调,引擎问过执行者,它说做完了
     #   "operator"     —— 纯人工:门禁绿了就标 done,引擎无从核实
+    #   "signal_ack"   —— 本轮处理的是复查信号(见 queue._SIGNAL_ID)。
+    #                     它**不是工作**,只是"确认眼下没有到期维护项"。
+    #                     混进 "operator" 就等于让 history 声称"完成了一项
+    #                     任务",而实际上一行代码都没动。
     #
     # 为什么必须记:引擎的设计是"不自动改代码",没有 build_fn 时它只能
     # 看到"门禁全绿",看不到"活到底干了没有"。实测里多次出现门禁全绿但
     # 那一轮其实没做队列里那条待办的情况(误报率实测被连标两次 done)。
     # 不区分这两种 done,状态文件就是在替执行者背书它没做过的事。
     completion_source: str = "operator"
+
+    # 本轮的 item_id 是**谁**定的。
+    #   "explicit" —— 执行者用 item_id= 明确声明"我这轮做的是这条"
+    #   "auto"     —— 引擎按优先级自己挑的队列首项
+    #
+    # 为什么必须记(r28):`round` 原来根本没有 item_id 参数,永远取队列
+    # 首项。于是执行者做完的是另一条,记录里 item_id 指向的却是一条
+    # **没人做过**的待办 —— 而且引擎顺手把它标成了 done。
+    # 光有 completion_source 还不够:"operator" 只能说明"由人工断言",
+    # 说明不了"人工做的是不是这一条"。两件事都记,假账才露得出来。
+    item_selection: str = "auto"
 
     @property
     def duration(self) -> float:

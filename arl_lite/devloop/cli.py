@@ -193,7 +193,14 @@ def _cmd_round(args) -> int:
     only = None
     if getattr(args, "gates", None):
         only = [g.strip() for g in args.gates.split(",") if g.strip()]
-    outcome = _loop().round(only_gates=only)
+    try:
+        outcome = _loop().round(only_gates=only,
+                                item_id=getattr(args, "item_id", None))
+    except (LookupError, ValueError) as e:
+        # 指了一条不存在的/不可做的待办 —— 这是**调用方**的错,不是协议的错。
+        # 回 2(区别于 1/3 的门禁结果),让脚本能分辨"我指错了"和"门禁没过"。
+        print(f"[!] {e}")
+        return 2
     print(outcome.summary())
     # 门禁失败不是 CLI 错误——协议允许 DONE_WITH_FAILURES,如实报告即可
     return 0 if outcome.ok else 3
@@ -380,6 +387,7 @@ def add_devloop_parser(sub) -> None:
 
     pr = dsub.add_parser("round", help="跑一整轮")
     pr.add_argument("--gates", help="逗号分隔的门禁名(默认全跑)")
+    pr.add_argument("--item-id", help="本轮实际做完的是哪一条(不给则按优先级自动挑,并记为 auto)")
 
     dsub.add_parser("plan", help="只做规划,看下一步")
 

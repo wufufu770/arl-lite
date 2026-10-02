@@ -96,6 +96,20 @@ def _slugify_id(title: str, idx: int = 0) -> str:
     return f"item-{digest}{suffix}"
 
 
+def is_signal_id(item_id: str) -> bool:
+    """这是不是"复查信号"条目,而不是一件工作
+
+    信号的内容是「当前无到期维护项,请人工确认下一步」—— 它**不可完成**,
+    存在的唯一目的是让不变式 #4(队列永远非空)有个交代。把它和真活
+    一视同仁地标成 done,history 里就会出现"完成了一项任务",而实际
+    一行代码都没动。
+
+    这里给唯一判据(r28):`round` / CLI / 测试各写一份前缀匹配,迟早
+    有一处漏掉 `-rN` 派生副本 —— 真实队列里就有那种 id。
+    """
+    return item_id == _SIGNAL_ID or item_id.startswith(_SIGNAL_ID + "-r")
+
+
 REMOVED_TIER2_WHY = """\
 「扫项目现状自动推导」这一层播种已被整层删除(2026-10,第 16 轮)。
 
@@ -1250,7 +1264,6 @@ class Queue:
         匹配含 `-rN` 派生副本:真实队列里就有,不是假想场景。
         """
         return not any(
-            (i.id == _SIGNAL_ID or i.id.startswith(_SIGNAL_ID + "-r"))
-            and i.status in ("pending", "dropped")
+            is_signal_id(i.id) and i.status in ("pending", "dropped")
             for i in self.load()
         )

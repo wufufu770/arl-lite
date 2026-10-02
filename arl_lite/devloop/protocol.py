@@ -397,12 +397,54 @@ class Loop:
     # 整轮
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _pick_item(q, items, item_id, record):
+        """取本轮要做的待办,并把"谁定的"记进 record(r28)
+
+        显式指定优先。显式指的那条必须**当前可做**(pending / in_progress),
+        否则直接抛错:对一条已经 done 的条目记"本轮完成了它",是本协议
+        见过最恶劣的一类假账(7.17 / 7.18 各记了一例同族症状)。
+        """
+        if item_id:
+            found = next((i for i in items if i.id == item_id), None)
+            if found is None:
+                raise LookupError(f"no such item in queue: {item_id!r}")
+            if found.status not in ("pending", "in_progress"):
+                raise ValueError(
+                    f"item {item_id!r} is {found.status!r}, not workable; "
+                    f"refusing to record a round against it"
+                )
+            record.item_selection = "explicit"
+            return found
+        record.item_selection = "auto"
+        return q.next(items)
+
     def round(
         self,
         only_gates: list[str] | None = None,
         build: Callable | None = None,
+        item_id: str | None = None,
     ) -> RoundOutcome:
-        """跑一整轮:BUILD → TEST → IMPROVE → PLAN → 落盘。"""
+        """跑一整轮:BUILD → TEST → IMPROVE → PLAN → 落盘。
+
+        Args:
+            only_gates: 只跑这些门禁;None = 全跑
+            build: BUILD 回调;None 表示"由人做",引擎只验门禁
+            item_id: **本轮实际做完的是哪一条**(r28 新增)
+
+        ## 为什么要有 item_id
+
+        原来这个函数只按优先级取队列首项,然后在门禁全绿时把它标成 done。
+        可是执行者做完的往往是另一条 —— r27 实测:做完三条真活,round 记的
+        却是第四条,而且那条**没人做过**,引擎照样把它标成 done。
+
+        光有 `completion_source` 挡不住:它只说明"done 由谁断言",
+        说明不了"人工做的是不是这一条"。所以两项都得记
+        (`completion_source` + `item_selection`),假账才露得出来。
+
+        显式指一条**当前不可做**的条目(已 done / dropped)会直接拒绝:
+        记一笔"完成了它"的假账,比拒绝更坏。
+        """
         state = self.store.load()
         if not state.started_at:
             state.started_at = time.time()
@@ -439,7 +481,7 @@ class Loop:
             if seeded > 0:
                 messages.append(f"queue was empty, seeded {seeded} item(s)")
 
-        item = q.next(items)
+        item = self._pick_item(q, items, item_id, record)
         if item is not None:
             q.mark_in_progress(item)
             # 必须保存**同一个 list**——重新 load() 会拿到新对象,
@@ -457,10 +499,20 @@ class Loop:
             messages.append(f"BUILD failed: {b.detail}")
         # 记下这一轮的 done 由谁断言。纯人工模式下引擎只看到"门禁全绿",
         # 看不到"活干了没有"——不区分,状态文件就是在替执行者背书。
-        record.completion_source = "build_fn" if builder is not None else "operator"
+        is_signal = item is not None and self.queue_mod.is_signal_id(item.id)
+        if builder is not None:
+            record.completion_source = "build_fn"
+        elif is_signal:
+            # 信号不是工作。标成 operator 等于让 history 声称
+            # "完成了一项任务",而实际一行代码都没动。
+            record.completion_source = "signal_ack"
+        else:
+            record.completion_source = "operator"
         if item is not None and builder is None:
+            what = "复查信号的关闭" if is_signal else "完成"
             messages.append(
-                f"no build executor: '{item.id}' 的完成由人工断言,引擎只验证了门禁"
+                f"no build executor: '{item.id}' 的{what}由人工断言,"
+                f"引擎只验证了门禁"
             )
 
         # 3. TEST
