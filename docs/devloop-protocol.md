@@ -1820,6 +1820,61 @@ recover_stale_in_progress: 1 条 in_progress 有人认领,保留:
 
 ---
 
+### 7.23 判据本身也会骗人:审计脚本报了 `set.add`
+
+7.22 修完 `round()` 之后,我写了个脚本审计 `queue.py` 里哪些方法
+"load 完又 save、却没持锁":
+
+```
+claim / release / finish / recover_stale    带锁
+add / seed_if_empty / repair_duplicates
+drop / unmark                               裸 load->save,无锁
+```
+
+判定逻辑是"方法体里同时出现 `self.load()` 和 `self.save()`"。我顺手还打
+了一张方法间的调用表,想确认加锁不会死锁 —— 上面赫然写着:
+
+```
+_disambiguate  ->  ['add']
+```
+
+我当场读成"`_disambiguate` 调了 `Queue.add`,而 `seed_if_empty` 会调
+`_disambiguate`,那么 `add` 加锁 + `seed_if_empty` 加锁 = 死锁",于是
+**差点放弃修 `drop`** —— 恰恰是五个里最要紧的那个。
+
+实际那是 `taken.add(iid)`。`taken` 是个 `set`。脚本只收了
+`ast.Attribute.attr` 这个名字,不区分接收者,所以 `set.add` 和
+`Queue.add` 在它眼里是同一个东西。
+
+排除这个误报后真相很简单:那五个方法**互不调用**,而 `save` 本身不加锁
+(`claim` 等带锁方法内部都调 `self.save(items)` 就是证据),所以逐个用
+`with self._locked(...)` 包裹既不死锁也不多余。
+
+> 审计工具的输出和被审计对象一样需要复核。一个看起来"证实了我要放弃
+> 修复"的假信号,比没有信号更贵。
+
+`tests/test_queue_all_methods_locked.py` 里留了一条
+`test_the_audit_does_not_mistake_set_add_for_queue_add` 专门守这个判据:
+它断言 `_disambiguate` 的**原始** attr 集合里有 `add`、而
+`self.` 前缀的集合里没有。
+
+### drop 为什么最要紧
+
+r22 刚确立「**人的显式指令被静默覆盖,比队列空掉更坏**」。而人的显式指令
+正是走 `devloop drop` —— 它却在一个不互斥的临界区里:
+
+```
+8 个进程并发 drop 8 条
+无锁:只有最后一个进程的整份 save 留得下来,另外 7 条人的指令人间蒸发
+有锁:8 条全部停在 dropped,理由全部保留
+```
+
+测试直接验这条:`test_concurrent_drops_all_survive` 断言每条都
+`dropped`,且 `note` 里还留着人写的那句理由 —— 因为"三个月后没人记得当初
+为什么删"正是 `drop` 要求理由的全部意义。
+
+---
+
 ## 8. 状态落盘（state.json）
 
 ### 8.1 文件路径与写时机

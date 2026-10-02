@@ -99,11 +99,23 @@
       "gate": "loc_budget",
       "reason": "r29 给 StateStore 补并发安全,实测(8 进程 x 150 次 = 1200 次)修前 741 次 FileNotFoundError、10+ 次状态被读成损坏、1200 次写只剩 14 条历史;修后 0/0/round 精确 1200。改法:tmp 名每次唯一(病根,不是锁)+ 新增 mutate() 把读-改-写整段收进临界区(不变式 #8)。变异测试还证明 save 自己的锁是冗余的(os.replace 已原子,tmp 已唯一),已删。门禁逻辑净增 10 行。",
       "round": 27
+    },
+    {
+      "at": "2026-10-02T23:12:32",
+      "changes": {
+        "devloop_code_loc": {
+          "from": 2700,
+          "to": 2800
+        }
+      },
+      "gate": "loc_budget",
+      "reason": "r32 给 queue.py 里 5 个此前无锁的方法加 file_lock:add / seed_if_empty / repair_duplicates / drop / unmark。AST 审计(queue.py 全部类方法,判据=方法体同时有 self.load() 与 self.save() 且无 with self._locked)发现它们是裸 load→改→save 的整份写回;claim/release/finish/recover_stale 四个本就带锁。其中 drop 最要紧 —— r22 确立「人的显式指令被静默覆盖,比队列空掉更坏」,而人的显式指令正是走 devloop drop,它却在一个不互斥的临界区里,并发时人写的丢弃理由可能被整份覆盖抹掉。净增 68 行锁包装。",
+      "round": 30
     }
   ],
   "doc_freshness": 0,
   "loc_budget": {
-    "devloop_code_loc": 2700,
+    "devloop_code_loc": 2800,
     "devloop_loc": 2617,
     "total_loc": 14514
   },

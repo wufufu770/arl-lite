@@ -657,21 +657,22 @@ class Queue:
         item.note = (item.note + "\n" if item.note else "") + f"dropped: {reason}"
 
     # ── 添加 ─────────────────────────────────────────────────────────────
-    def add(self, item: Item) -> None:
-        """追加一条 pending item(若 id 已存在则替换原条目状态为 pending)。"""
-        items = self.load()
-        for i, ex in enumerate(items):
-            if ex.id == item.id:
-                # 重置为 pending,但保留 done_round/note 用于审计
-                item.attempts = ex.attempts
-                item.created_round = ex.created_round or item.created_round
-                item.done_round = ex.done_round
-                item.note = ex.note
-                items[i] = item
-                self.save(items)
-                return
-        items.append(item)
-        self.save(items)
+    def add(self, item: Item, timeout: float = _LOCK_TIMEOUT) -> None:
+        with self._locked("add", timeout):
+            """追加一条 pending item(若 id 已存在则替换原条目状态为 pending)。"""
+            items = self.load()
+            for i, ex in enumerate(items):
+                if ex.id == item.id:
+                    # 重置为 pending,但保留 done_round/note 用于审计
+                    item.attempts = ex.attempts
+                    item.created_round = ex.created_round or item.created_round
+                    item.done_round = ex.done_round
+                    item.note = ex.note
+                    items[i] = item
+                    self.save(items)
+                    return
+            items.append(item)
+            self.save(items)
 
     # ── 统计 ─────────────────────────────────────────────────────────────
     def stats(self) -> dict:
@@ -706,85 +707,86 @@ class Queue:
         return not any(i.status in ("pending", "in_progress") for i in items)
 
     # ── 播种(核心:队列永远非空) ──────────────────────────────────────────
-    def seed_if_empty(self) -> int:
-        """空了就播种。返回新增条数。
+    def seed_if_empty(self, timeout: float = _LOCK_TIMEOUT) -> int:
+        with self._locked("seed", timeout):
+            """空了就播种。返回新增条数。
 
-        两级策略(优先级递减):
-            1. 读 devloop/backlog.md(人工长期待办清单,跳过已完成的)
-            2. 保底 3 条长期演进项(只提已经到期的)
+            两级策略(优先级递减):
+                1. 读 devloop/backlog.md(人工长期待办清单,跳过已完成的)
+                2. 保底 3 条长期演进项(只提已经到期的)
 
-        旋转规则:补进来的 id 若与**任何**已有条目重名,一律加 -r{round}
-        后缀,保证 id 全局唯一。
+            旋转规则:补进来的 id 若与**任何**已有条目重名,一律加 -r{round}
+            后缀,保证 id 全局唯一。
 
-        ## 这里曾经有个能把队列彻底废掉的 bug
+            ## 这里曾经有个能把队列彻底废掉的 bug
 
-        原实现传给旋转逻辑的是 `active_ids`(只含 pending/in_progress)。
-        而 docstring 写的是"若已存在且处于 done/dropped 则加后缀"——
-        文档说一回事,代码做另一回事。后果是:
+            原实现传给旋转逻辑的是 `active_ids`(只含 pending/in_progress)。
+            而 docstring 写的是"若已存在且处于 done/dropped 则加后缀"——
+            文档说一回事,代码做另一回事。后果是:
 
-        队列里所有条目都 done 时 `active_ids` 是空集 → 旋转不触发
-        → 补进来一批**和已有条目完全同 id** 的新条目。
+            队列里所有条目都 done 时 `active_ids` 是空集 → 旋转不触发
+            → 补进来一批**和已有条目完全同 id** 的新条目。
 
-        而 `mark_in_progress` / `mark_done` / `round()` 全都靠
-        `next(i for i in items if i.id == ...)` 按 id 定位,永远命中
-        **第一条**。于是引擎反复翻转那条早已 done 的记录,新补的条目
-        永远卡在 pending —— 循环原地空转,永远走不到下一步。
+            而 `mark_in_progress` / `mark_done` / `round()` 全都靠
+            `next(i for i in items if i.id == ...)` 按 id 定位,永远命中
+            **第一条**。于是引擎反复翻转那条早已 done 的记录,新补的条目
+            永远卡在 pending —— 循环原地空转,永远走不到下一步。
 
-        实测:真实队列被搞成 8 个 id 各出现两次,8 条全"活跃"。
-        所以这里传的是**全部**已有 id,不是活跃的。
-        """
-        items = self.load()
-        # 注意:必须是全部 id,不是只有活跃的。见上方 docstring。
-        existing_ids = {i.id for i in items}
-        # 已经**做完**的 id。人工 backlog 里的条目做完就不该再被捡回来。
-        done_ids = {i.id for i in items if i.status in ("done", "dropped")}
-        max_round = max((i.created_round for i in items), default=0)
-        next_round = max_round + 1  # 每次 seed 视为新轮次
+            实测:真实队列被搞成 8 个 id 各出现两次,8 条全"活跃"。
+            所以这里传的是**全部**已有 id,不是活跃的。
+            """
+            items = self.load()
+            # 注意:必须是全部 id,不是只有活跃的。见上方 docstring。
+            existing_ids = {i.id for i in items}
+            # 已经**做完**的 id。人工 backlog 里的条目做完就不该再被捡回来。
+            done_ids = {i.id for i in items if i.status in ("done", "dropped")}
+            max_round = max((i.created_round for i in items), default=0)
+            next_round = max_round + 1  # 每次 seed 视为新轮次
 
-        added: list[Item] = []
-        # _disambiguate 要拿"加之前"的 id 集合。上面那几行 `existing_ids |=`
-        # 是给下一层做级联去重的,不能拿来当这个。
-        taken_before = set(existing_ids)
+            added: list[Item] = []
+            # _disambiguate 要拿"加之前"的 id 集合。上面那几行 `existing_ids |=`
+            # 是给下一层做级联去重的,不能拿来当这个。
+            taken_before = set(existing_ids)
 
-        # ── Tier 1:backlog.md ──
-        # 语义是"**跳过已完成的**",不是"改名复活"。
-        # backlog.md 是人写的清单,引擎做完一条就把它在 queue.json 里标 done,
-        # 但文件本身不会自动删行。于是播种再读它时会读到同一批条目。
-        # 如果这里"改名复活",就等于把已完成的活无限量地重新排队 ——
-        # 实测第 12 轮后队列里 8 条待办全是已完成工作的重推导
-        # (置信度/架构测试/UNION/证书/storage/DISAPPEARED ...),
-        # 队列"非空"但没有一件真活可干。不变式 #4 被满足成了文字游戏。
-        #
-        # 人想重做同一件事时,显式从 backlog.md 删掉或改 id 即可 ——
-        # "重做"应该是一个动作,不该是副作用。
-        added += self._seed_from_backlog(done_ids, next_round, skip_existing=True)
-        existing_ids |= {i.id for i in added}
-
-
-    # ── Tier 2:保底 ──
-        if not added:
-            # 长期演进项本来就是"做到就算一轮、还会再来"的,所以永远提出
-            # + 改名。保底层必须总能提出东西,否则它不是保底。
+            # ── Tier 1:backlog.md ──
+            # 语义是"**跳过已完成的**",不是"改名复活"。
+            # backlog.md 是人写的清单,引擎做完一条就把它在 queue.json 里标 done,
+            # 但文件本身不会自动删行。于是播种再读它时会读到同一批条目。
+            # 如果这里"改名复活",就等于把已完成的活无限量地重新排队 ——
+            # 实测第 12 轮后队列里 8 条待办全是已完成工作的重推导
+            # (置信度/架构测试/UNION/证书/storage/DISAPPEARED ...),
+            # 队列"非空"但没有一件真活可干。不变式 #4 被满足成了文字游戏。
             #
-            # 原来这里上面还有一层"扫项目现状自动推导"(Tier 2)。它已经
-            # 被整层删掉了,理由见 `REMOVED_TIER2_WHY`。删除之后不变式 #4
-            # 依然成立:本层是保底,永远能产出。
-            added += self._seed_fallback(set(), next_round)
+            # 人想重做同一件事时,显式从 backlog.md 删掉或改 id 即可 ——
+            # "重做"应该是一个动作,不该是副作用。
+            added += self._seed_from_backlog(done_ids, next_round, skip_existing=True)
+            existing_ids |= {i.id for i in added}
 
-        if added:
-            # 兜底:任何重复 id 都在这里被就地改名。
-            # 两级策略里哪一层写错了都不至于产出重复 id。
-            #
-            # 注意传的是**加之前**的快照。早先直接传 existing_ids,而上面
-            # 那些 `existing_ids |= {added}` 早就把新条目自己的 id 塞进去了,
-            # 于是 _disambiguate 拿新条目跟它自己比,全部改名 ——
-            # 连空队列播种都产出 `item-2-97ad0c-r1` 这种"本该是首次出现"
-            # 的 id。比 id 冲突更糟的是它让首次播种看起来像重跑。
-            added = self._disambiguate(added, taken_before)
-            items.extend(added)
-            self.save(items)
-            log.info("queue.seed_if_empty: +%d items", len(added))
-        return len(added)
+
+        # ── Tier 2:保底 ──
+            if not added:
+                # 长期演进项本来就是"做到就算一轮、还会再来"的,所以永远提出
+                # + 改名。保底层必须总能提出东西,否则它不是保底。
+                #
+                # 原来这里上面还有一层"扫项目现状自动推导"(Tier 2)。它已经
+                # 被整层删掉了,理由见 `REMOVED_TIER2_WHY`。删除之后不变式 #4
+                # 依然成立:本层是保底,永远能产出。
+                added += self._seed_fallback(set(), next_round)
+
+            if added:
+                # 兜底:任何重复 id 都在这里被就地改名。
+                # 两级策略里哪一层写错了都不至于产出重复 id。
+                #
+                # 注意传的是**加之前**的快照。早先直接传 existing_ids,而上面
+                # 那些 `existing_ids |= {added}` 早就把新条目自己的 id 塞进去了,
+                # 于是 _disambiguate 拿新条目跟它自己比,全部改名 ——
+                # 连空队列播种都产出 `item-2-97ad0c-r1` 这种"本该是首次出现"
+                # 的 id。比 id 冲突更糟的是它让首次播种看起来像重跑。
+                added = self._disambiguate(added, taken_before)
+                items.extend(added)
+                self.save(items)
+                log.info("queue.seed_if_empty: +%d items", len(added))
+            return len(added)
 
     @staticmethod
     def _disambiguate(items: list[Item], taken: set[str]) -> list[Item]:
@@ -805,65 +807,66 @@ class Queue:
             out.append(it)
         return out
 
-    def repair_duplicates(self) -> int:
-        """修复重复 id。返回被删除的条目数。
+    def repair_duplicates(self, timeout: float = _LOCK_TIMEOUT) -> int:
+        with self._locked("repair", timeout):
+            """修复重复 id。返回被删除的条目数。
 
-        ## 为什么需要它
+            ## 为什么需要它
 
-        重复 id 会让引擎的所有按 id 定位(`mark_in_progress` / `mark_done` /
-        `round()` 取待办)全部命中第一条记录,导致循环原地空转。
-        历史上 `seed_if_empty` 真的造出过这种队列(见该方法 docstring),
-        修好播种逻辑只能保证**将来**不再产生,已经写坏的文件仍需要修。
+            重复 id 会让引擎的所有按 id 定位(`mark_in_progress` / `mark_done` /
+            `round()` 取待办)全部命中第一条记录,导致循环原地空转。
+            历史上 `seed_if_empty` 真的造出过这种队列(见该方法 docstring),
+            修好播种逻辑只能保证**将来**不再产生,已经写坏的文件仍需要修。
 
-        ## 保留哪一条
+            ## 保留哪一条
 
-        同一个 id 保留**进度最靠前**的那条:
-            in_progress > pending > done > dropped
-        进度靠前的说明引擎已经认可它在干活;同状态下保留 attempts 最大的
-        (重试次数多 = 引擎已经为它付出过更多),再并列时保留 id 字典序最小的
-        以保证结果确定(同样的输入永远得到同样的队列)。
+            同一个 id 保留**进度最靠前**的那条:
+                in_progress > pending > done > dropped
+            进度靠前的说明引擎已经认可它在干活;同状态下保留 attempts 最大的
+            (重试次数多 = 引擎已经为它付出过更多),再并列时保留 id 字典序最小的
+            以保证结果确定(同样的输入永远得到同样的队列)。
 
-        调用方拿到的是被删条目的 id 列表,便于人工确认。
-        """
-        items = self.load()
-        if not items:
-            return 0
+            调用方拿到的是被删条目的 id 列表,便于人工确认。
+            """
+            items = self.load()
+            if not items:
+                return 0
 
-        rank = {"in_progress": 0, "pending": 1, "done": 2, "dropped": 3}
-        by_id: dict[str, list[Item]] = {}
-        for it in items:
-            by_id.setdefault(it.id, []).append(it)
+            rank = {"in_progress": 0, "pending": 1, "done": 2, "dropped": 3}
+            by_id: dict[str, list[Item]] = {}
+            for it in items:
+                by_id.setdefault(it.id, []).append(it)
 
-        keepers: list[Item] = []
-        removed = 0
-        for iid, group in by_id.items():
-            if len(group) == 1:
-                keepers.append(group[0])
-                continue
-            best = min(
-                group,
-                key=lambda g: (
-                    rank.get(g.status, 9),
-                    -int(g.attempts or 0),
-                    g.id,
-                ),
-            )
-            keepers.append(best)
-            removed += len(group) - 1
-            log.warning(
-                "queue.repair_duplicates: id %r 有 %d 条重复,保留 %s(%s),删除 %d 条",
-                iid, len(group), best.id, best.status, len(group) - 1,
-            )
+            keepers: list[Item] = []
+            removed = 0
+            for iid, group in by_id.items():
+                if len(group) == 1:
+                    keepers.append(group[0])
+                    continue
+                best = min(
+                    group,
+                    key=lambda g: (
+                        rank.get(g.status, 9),
+                        -int(g.attempts or 0),
+                        g.id,
+                    ),
+                )
+                keepers.append(best)
+                removed += len(group) - 1
+                log.warning(
+                    "queue.repair_duplicates: id %r 有 %d 条重复,保留 %s(%s),删除 %d 条",
+                    iid, len(group), best.id, best.status, len(group) - 1,
+                )
 
-        # 保持原有顺序感:按原文件里首次出现的位置排
-        first_pos = {}
-        for idx, it in enumerate(items):
-            first_pos.setdefault(it.id, idx)
-        keepers.sort(key=lambda g: first_pos.get(g.id, 0))
+            # 保持原有顺序感:按原文件里首次出现的位置排
+            first_pos = {}
+            for idx, it in enumerate(items):
+                first_pos.setdefault(it.id, idx)
+            keepers.sort(key=lambda g: first_pos.get(g.id, 0))
 
-        if removed:
-            self.save(keepers)
-        return removed
+            if removed:
+                self.save(keepers)
+            return removed
 
     def find_duplicates(self) -> dict[str, int]:
         """找出重复 id 及其出现次数(只读,不改文件)"""
@@ -872,89 +875,91 @@ class Queue:
             counts[it.id] = counts.get(it.id, 0) + 1
         return {k: v for k, v in counts.items() if v > 1}
 
-    def drop(self, item_id: str, reason: str) -> tuple[bool, str]:
-        """把一条待办标成 dropped。返回 (成功, 说明)。
+    def drop(self, item_id: str, reason: str, timeout: float = _LOCK_TIMEOUT) -> tuple[bool, str]:
+        with self._locked("drop", timeout):
+            """把一条待办标成 dropped。返回 (成功, 说明)。
 
-        ## 为什么需要这个操作
+            ## 为什么需要这个操作
 
-        `unmark` 是反方向的:把误标的 done 改回 pending。
-        但还有第三种情况它处理不了 —— **这条待办本身就是假的**。
+            `unmark` 是反方向的:把误标的 done 改回 pending。
+            但还有第三种情况它处理不了 —— **这条待办本身就是假的**。
 
-        实测抓到过三种假活:
-        - 判据是没人拥有的魔法数字(「规则数补到 40」)
-        - 它的 verify 此刻就已经通过(「对齐 PROJECT_PLAN.md」,而文件在)
-        - 判据是常驻不变式,不是「这次工作做没做」(「季度依赖审计」
-          验的是 `dependencies == []`,而它本来就成立)
+            实测抓到过三种假活:
+            - 判据是没人拥有的魔法数字(「规则数补到 40」)
+            - 它的 verify 此刻就已经通过(「对齐 PROJECT_PLAN.md」,而文件在)
+            - 判据是常驻不变式,不是「这次工作做没做」(「季度依赖审计」
+              验的是 `dependencies == []`,而它本来就成立)
 
-        对这类条目,改回 pending 是错的 —— 它会再次变成队列头,
-        再次被选中,再次做不出任何东西。必须让它**消失**,而且要
-        **带上原因**,否则三个月后没人记得当初为什么删。
+            对这类条目,改回 pending 是错的 —— 它会再次变成队列头,
+            再次被选中,再次做不出任何东西。必须让它**消失**,而且要
+            **带上原因**,否则三个月后没人记得当初为什么删。
 
-        为什么不能直接改 queue.json:那会让"为什么丢弃"这一条信息
-        绕过 review。而丢弃原因恰恰是这件事里最值钱的部分 ——
-        它记录的是"我们试过这条路,它不成立"。
+            为什么不能直接改 queue.json:那会让"为什么丢弃"这一条信息
+            绕过 review。而丢弃原因恰恰是这件事里最值钱的部分 ——
+            它记录的是"我们试过这条路,它不成立"。
 
-        dropped 的 id 也在 `done_ids` 里,所以人工 backlog 不会把它捡回来。
-        """
-        items = self.load()
-        matches = [it for it in items if it.id == item_id]
-        if not matches:
-            return False, f"no such item: {item_id!r}"
-        if len(matches) > 1:
-            return False, (
-                f"{item_id!r} has {len(matches)} records with the same id; "
-                f"run 'arl-lite devloop repair' first"
-            )
-        target = matches[0]
-        if target.status == "dropped":
-            return False, f"{item_id} is already dropped"
-        if not reason.strip():
-            return False, (
-                "丢弃必须给理由。丢弃原因记录的是'我们试过,它不成立',"
-                "那是这条记录里最值钱的部分 —— 没有它,三个月后"
-                "下一个人会把同样的东西再加回来。用 --reason 写清楚。"
-            )
-        old = target.status
-        target.status = "dropped"
-        target.owner = ""
-        target.claimed_at = 0.0
-        target.note = (target.note + "\n" if target.note else "") + \
-            f"dropped from {old}: {reason}"
-        self.save(items)
-        return True, f"{item_id}: {old} -> dropped"
+            dropped 的 id 也在 `done_ids` 里,所以人工 backlog 不会把它捡回来。
+            """
+            items = self.load()
+            matches = [it for it in items if it.id == item_id]
+            if not matches:
+                return False, f"no such item: {item_id!r}"
+            if len(matches) > 1:
+                return False, (
+                    f"{item_id!r} has {len(matches)} records with the same id; "
+                    f"run 'arl-lite devloop repair' first"
+                )
+            target = matches[0]
+            if target.status == "dropped":
+                return False, f"{item_id} is already dropped"
+            if not reason.strip():
+                return False, (
+                    "丢弃必须给理由。丢弃原因记录的是'我们试过,它不成立',"
+                    "那是这条记录里最值钱的部分 —— 没有它,三个月后"
+                    "下一个人会把同样的东西再加回来。用 --reason 写清楚。"
+                )
+            old = target.status
+            target.status = "dropped"
+            target.owner = ""
+            target.claimed_at = 0.0
+            target.note = (target.note + "\n" if target.note else "") + \
+                f"dropped from {old}: {reason}"
+            self.save(items)
+            return True, f"{item_id}: {old} -> dropped"
 
-    def unmark(self, item_id: str, reason: str = "") -> tuple[bool, str]:
-        """把误标的 done/dropped 改回 pending。返回 (成功, 说明)。
+    def unmark(self, item_id: str, reason: str = "", timeout: float = _LOCK_TIMEOUT) -> tuple[bool, str]:
+        with self._locked("unmark", timeout):
+            """把误标的 done/dropped 改回 pending。返回 (成功, 说明)。
 
-        ## 为什么需要这个操作
+            ## 为什么需要这个操作
 
-        引擎在没有 build_fn 时无法知道执行者到底做了什么,
-        门禁一绿就把队首标成 done。于是"这一轮其实没做那件事"会被
-        记成已完成 —— 队列和现实对不上,后面每轮都建在假记录上。
+            引擎在没有 build_fn 时无法知道执行者到底做了什么,
+            门禁一绿就把队首标成 done。于是"这一轮其实没做那件事"会被
+            记成已完成 —— 队列和现实对不上,后面每轮都建在假记录上。
 
-        有了它,纠正记录是一等操作,不用手改 queue.json。
+            有了它,纠正记录是一等操作,不用手改 queue.json。
 
-        只认 id **唯一命中**的那条。有重复 id 时直接拒绝并提示先 repair,
-        因为那时"改哪一条"是歧义的,猜错等于把记录改得更乱。
-        """
-        items = self.load()
-        matches = [it for it in items if it.id == item_id]
-        if not matches:
-            return False, f"no such item: {item_id!r}"
-        if len(matches) > 1:
-            return False, (
-                f"{item_id!r} has {len(matches)} records with the same id; "
-                f"run 'arl-lite devloop repair' first"
-            )
-        target = matches[0]
-        if target.status == "pending":
-            return False, f"{item_id} is already pending"
-        old = target.status
-        target.status = "pending"
-        target.done_round = None
-        target.note = f"unmarked from {old}" + (f": {reason}" if reason else "")
-        self.save(items)
-        return True, f"{item_id}: {old} -> pending"
+            只认 id **唯一命中**的那条。有重复 id 时直接拒绝并提示先 repair,
+            因为那时"改哪一条"是歧义的,猜错等于把记录改得更乱。
+            """
+            items = self.load()
+            matches = [it for it in items if it.id == item_id]
+            if not matches:
+                return False, f"no such item: {item_id!r}"
+            if len(matches) > 1:
+                return False, (
+                    f"{item_id!r} has {len(matches)} records with the same id; "
+                    f"run 'arl-lite devloop repair' first"
+                )
+            target = matches[0]
+            if target.status == "pending":
+                return False, f"{item_id} is already pending"
+            old = target.status
+            target.status = "pending"
+            target.done_round = None
+            target.note = f"unmarked from {old}" + (f": {reason}" if reason else "")
+            self.save(items)
+            return True, f"{item_id}: {old} -> pending"
 
     # ── Tier 1 ────────────────────────────────────────────────────────────
     _BACKLOG_LINE = re.compile(
