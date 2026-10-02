@@ -52,6 +52,8 @@ kind 取值：`change` / `test` / `doc` / `research` / `refactor`
 
 - [P1] test: `verify="true"` 是恒真命令,却对**真活**也放行 | r36 实测:`Queue.verify_result("true")` 恒返回 `pass`,而 r35 的收尾闸门只在 `fail` 时拦 —— 于是任何 `verify="true"` 的条目都**必然**被标 done。信号条目(`no-due-maintenance-review*`)用它完全合法,它的完成判据本来就是「人确认过」;但 `is_signal_id()` 只在 `completion_source` 那一侧用来区分,没有任何检查阻止**一条真活**也用它。那就是一条自动完成的假活。更麻烦的是 r36 刚写的 `test_backlog_verify_is_commandable.py` **抓不到它** —— `true` 确实在白名单里、确实是合法命令、确实语法正确。判据恒真是第 16 轮「恒真测试」那篇的极端形式:这次连测试都绿着 | python3 -m pytest tests/test_constant_true_verify_is_signal_only.py
 
+- [P1] change: 把「这一轮报完成,仓库里真的变了吗」变成常设检查 | r37 实测了一次:37 轮里 26 轮报 DONE,按「本轮 started_at → 下一轮 started_at」的区间去对 git 提交时间,**零可疑轮次** —— 每一条 DONE 都有对应提交。所以这不是在修一条已知的假账,而是把一次抽查变成常设的。理由很直白:正因为现在 35/35 干净,第一个违规出现时才需要有人当场发现;而这套循环这几轮反复栽的正是同一类(记录声称做了,现实没变)。做法:round 落盘时记 `head_before` / `head_after`(git rev-parse HEAD),当 result 是 DONE 而两个 HEAD 相同时,记进 `blocking_failures` 并如实降级 —— 和 r35/r37 的闸门同一套形状 | python3 -m pytest tests/test_round_head_moved_when_done.py
+
 ## 候选（待细化）
 
 - 离线内嵌 RIPE/APNIC/ARIN delegated 数据做 IP→ASN 归属（约 16MB，公约免费）
