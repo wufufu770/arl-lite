@@ -23,12 +23,24 @@
       "gate": "loc_budget",
       "reason": "",
       "round": 5
+    },
+    {
+      "at": "2026-10-02T12:49:39",
+      "changes": {
+        "total_loc": {
+          "from": 12786,
+          "to": 13112
+        }
+      },
+      "gate": "loc_budget",
+      "reason": "第8轮实现 DISAPPEARED 变更检测:monitor.py 新增 detect_disappeared/filter_newly_disappeared/parse_ts 约 200 行,是 PROJECT_PLAN 里挂了很久的待实现项,不是膨胀",
+      "round": 7
     }
   ],
   "doc_freshness": 0,
   "loc_budget": {
     "devloop_loc": 2617,
-    "total_loc": 12786
+    "total_loc": 13112
   },
   "no_import_cycle": 0,
   "no_thirdparty_import": 0,
@@ -36,6 +48,6 @@
   "rules_have_advice": 37,
   "test_baseline": {
     "failed": 9,
-    "passed": 166
+    "passed": 191
   }
 }

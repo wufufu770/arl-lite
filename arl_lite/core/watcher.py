@@ -321,14 +321,16 @@ class Watcher:
         # 变更检测接线:本次新增的资产逐条写 asset_changes(之前 detect_changes
         # 没有任何调用者,`monitor changes` 永远是空的)
         critical_findings: list[dict] = []
+        disappeared_total = 0
         for asset_type, table in (("domain", "domains"), ("host", "hosts"),
                                   ("port", "ports"), ("site", "sites"),
                                   ("finding", "findings")):
+            mon = Monitor(self.storage)
             try:
-                new_rows = Monitor(self.storage).detect_changes(asset_type, start_iso)
+                new_rows = mon.detect_changes(asset_type, start_iso)
             except Exception as e:
                 log.warning(f"watch: detect_changes({asset_type}) failed: {e}")
-                continue
+                new_rows = []
             for row in new_rows[:200]:  # 防止变更风暴刷爆 asset_changes
                 record_change(
                     self.storage, asset_type, "NEW_ASSET",
@@ -337,6 +339,26 @@ class Watcher:
                 )
             if table == "findings":
                 critical_findings = [r for r in new_rows if r.get("severity") == "critical"]
+
+            # 消失检测:本次运行没再出现的资产。宽限期默认 48h,
+            # 理由和已知局限见 Monitor.detect_disappeared 的文档。
+            try:
+                gone = mon.detect_disappeared(asset_type, start_iso)
+                # 状态转移去重:一直没人管的资产不会被每轮重复上报
+                gone = mon.filter_newly_disappeared(gone)
+            except Exception as e:
+                log.warning(f"watch: detect_disappeared({asset_type}) failed: {e}")
+                continue
+            for row in gone[:200]:
+                record_change(
+                    self.storage, asset_type, "DISAPPEARED",
+                    asset_hash=row.get("hash") or "",
+                    before=row, task_id=row.get("task_id"),
+                )
+            disappeared_total += len(gone)
+
+        if disappeared_total:
+            log.info(f"watch: target={wt.target} disappeared={disappeared_total}")
 
         # 同步 monitors 表状态(如果有对该 target 的监控)
         try:

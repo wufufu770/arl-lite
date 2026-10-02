@@ -9,15 +9,78 @@
 - monitors 表存监控任务配置
 - asset_changes 表存变更事件
 - diff 算法:用 last_run_at + first_seen 判断 NEW_ASSET
-- DISAPPEARED:这次没出现的 hash(需要 snapshot)
+- DISAPPEARED:靠 first_seen/last_seen 的时间差判断,不需要 snapshot 表
+  (资产表的 upsert 纪律「first_seen 永不变、last_seen 每次见到就 UPDATE」
+   已经把"存在过"和"最近还活着"编码进去了)
 """
 from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 log = logging.getLogger("arl_lite.core.monitor")
+
+# 变更类型。schema 注释里列了 6 种,目前实现 2 种——
+# 其余(TITLE_CHANGED 等)需要字段级快照对比,不在本轮范围内。
+CHANGE_TYPES = ("NEW_ASSET", "DISAPPEARED")
+
+# DISAPPEARED 默认宽限期:48 小时。
+# 取 2× 常见监控周期(24h),意思是"容得下一次漏扫,拦得住真下线"。
+# 0 = 立刻判定,会因单次不完整扫描刷出大量误报,只在明确知道扫描完整时用。
+DEFAULT_DISAPPEARED_GRACE = 48 * 3600
+
+
+def _iso_minus_seconds(iso: str, seconds: int) -> str:
+    """把 ISO 时间戳往前推 seconds 秒,返回同格式 ISO 字符串
+
+    解析失败时原样返回 —— 宁可退化成"无宽限"也不要抛异常打断整轮扫描。
+    (调用方 detect_disappeared 对参数已经做过类型/范围校验)
+    """
+    try:
+        dt = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        log.debug("_iso_minus_seconds: 无法解析 %r,按无宽限处理", iso)
+        return iso
+    return (dt - timedelta(seconds=seconds)).isoformat()
+
+
+def parse_ts(value) -> datetime | None:
+    """把 SQLite / Python 两种时间戳格式统一成可比较的 naive datetime
+
+    ## 为什么不能直接字符串比较
+
+    同一个库里的时间戳有两种来源,格式不一样:
+
+    - `record_change` 写入 → `datetime.utcnow().isoformat()` → `2026-10-02T04:46:53.083355`
+    - 走 schema 默认值的行 → SQLite `CURRENT_TIMESTAMP` → `2026-10-02 04:46:53`
+
+    分隔符一个是 `T`(0x54)一个是空格(0x20),**空格排在 T 前面**。
+    所以哪怕是同一秒,`'... 04:46:53' >= '...T04:46:53'` 也是 False。
+    按字符串比大小会得出"资产在上报之后还活着"的相反结论,
+    于是已经报过的下线被反复上报(刷屏),或者该报的没报。
+
+    ## 边界处理
+
+    - 带时区的 ISO(`+00:00`)→ 去掉 tzinfo 统一成 naive。
+      库里存的都是无时区的本地时间语义,混着比较会直接抛 TypeError。
+    - 解析不了 → 返回 None,交给调用方决定。**不猜**。
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    s = str(value).strip()
+    if not s:
+        return None
+    # SQLite CURRENT_TIMESTAMP 用空格分隔且不带微秒
+    if " " in s and "T" not in s:
+        s = s.replace(" ", "T", 1)
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=None)
 
 
 class Monitor:
@@ -125,6 +188,127 @@ class Monitor:
                 (self.s.workspace_id, since_iso)
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def detect_disappeared(
+        self,
+        asset_type: str,
+        since_iso: str,
+        grace_seconds: int = DEFAULT_DISAPPEARED_GRACE,
+    ) -> list[dict]:
+        """检测「本次运行没再出现」的资产(基于 last_seen)
+
+        ## 判定条件
+
+        某资产相对一次运行(起始 `since_iso`)算 DISAPPEARED,当且仅当:
+
+        - `first_seen < since_iso` —— 运行开始前它就存在(否则是新增,不是消失)
+        - `last_seen  < since_iso` —— 本次运行期间一次都没再见到
+
+        资产表的 upsert 纪律是「first_seen 永不变,last_seen 每次见到就 UPDATE」,
+        所以这两个时间戳天然编码了"存在过"和"最近还活着"。**不需要额外的
+        snapshot 表**——这就是当初把 last_seen 设计成必更新的原因。
+
+        ## 去抖(grace_seconds)
+
+        朴素实现有个致命问题:一次**不完整**的扫描(某个模块超时、crt.sh 限流、
+        DNS 解析失败)会让它本该覆盖的资产全部"消失",于是一条抖动就刷出
+        上千条 DISAPPEARED 告警。
+
+        所以加宽限期:资产必须连续 `grace_seconds` 没被见到才判定下线。
+        24h 周期 + 默认 48h 宽限 = 容得下一次漏扫,拦得住真下线。
+
+        ## 这个方法解决不了什么(重要)
+
+        **时间宽限区分不了「资产真没了」和「负责发现它的模块这轮挂了」。**
+        一次部分失败的扫描跑满两轮之后,宽限期照样会被耗尽,误报照样发生。
+        真正的解法需要按数据源的成功率来算(模块失败 → 该模块的数据不算"消失"),
+        而 arl-lite 目前没有采集这个信息。
+
+        所以这里选择:把机制做对(状态判定 + 状态转移去重 + 可配置宽限),
+        **把局限写明白**,而不是假装解决了。误报率的实测是队列里的
+        `item-21-c66b81`,它依赖真实数据源才能给结论。
+
+        Args:
+            asset_type: domain/host/port/site/finding
+            since_iso: 本次运行的起始时间(ISO),对应 detect_changes 的同一参数
+            grace_seconds: 宽限期秒数。0 = 立刻判定(慎用,会抖)
+
+        Returns:
+            消失资产行列表(与 detect_changes 同形状)
+        """
+        table = self._ASSET_TABLES.get(asset_type)
+        if table is None:
+            raise ValueError(f"unknown asset_type: {asset_type!r} "
+                             f"(choose from {sorted(self._ASSET_TABLES)})")
+        if grace_seconds < 0:
+            raise ValueError(f"grace_seconds must be >= 0, got {grace_seconds}")
+
+        # 宽限期换算成时间戳上界:比 since_iso 再早这么多仍没被见到 → 算消失。
+        # 用 Python 算而不是 SQL 的 datetime(),因为 since_iso 是 ISO 字符串,
+        # 交给 SQLite 解析会踩时区/格式的坑。
+        cutoff = _iso_minus_seconds(since_iso, grace_seconds)
+
+        # 表名来自上面的白名单映射,不接受外部拼接
+        sql = f"""SELECT * FROM {table}
+                  WHERE workspace_id = ?
+                    AND first_seen < ?
+                    AND (last_seen IS NULL OR last_seen < ?)"""
+        params = [self.s.workspace_id, since_iso, cutoff]
+        with self.s._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def filter_newly_disappeared(self, rows: list[dict]) -> list[dict]:
+        """从消失行里滤掉"已经报过 DISAPPEARED 且之后没复活"的
+
+        不做去重的话,一次下线会被每轮扫描重复上报一遍,`monitor changes`
+        里全是同一条hash 的刷屏。
+
+        判据:asset_changes 里已存在一条同 hash 的 DISAPPEARED 记录,且它的
+        detected_at **晚于**该资产的最后一次 last_seen —— 说明"消失"这个
+        状态转移已经报过了,还没恢复过。资产复活后 last_seen 会前移,
+        于是下次再消失时又能正常上报。
+
+        这是**状态转移**检测而不是水位检测:比"有没有报过"准,因为它能
+        区分"一直没复活"和"复活后又掉了"。
+        """
+        if not rows:
+            return []
+        out = []
+        with self.s._conn() as conn:
+            for row in rows:
+                asset_hash = row.get("hash")
+                if not asset_hash:
+                    continue
+                prior = conn.execute(
+                    """SELECT detected_at FROM asset_changes
+                       WHERE workspace_id = ? AND asset_hash = ?
+                         AND change_type = 'DISAPPEARED'
+                       ORDER BY id DESC LIMIT 1""",
+                    (self.s.workspace_id, asset_hash),
+                ).fetchone()
+                if not prior:
+                    out.append(row)
+                    continue
+                # 必须解析成 datetime 再比。直接比字符串的话,
+                # SQLite CURRENT_TIMESTAMP 的空格分隔格式永远小于
+                # Python isoformat 的 T 分隔格式,去重会完全失效。
+                reported_at = parse_ts(prior["detected_at"])
+                last_seen = parse_ts(row.get("last_seen"))
+                if reported_at is None or last_seen is None:
+                    # 时间戳认不出来就不去重:宁可重复报一次,也别漏报下线
+                    log.debug(
+                        "filter_newly_disappeared: hash=%s 时间戳无法比较,"
+                        "detected_at=%r last_seen=%r,按未上报处理",
+                        asset_hash, prior["detected_at"], row.get("last_seen"),
+                    )
+                    out.append(row)
+                    continue
+                if reported_at >= last_seen:
+                    # 已有上报记录,且记录时间不早于最后存活时间 → 已报过
+                    continue
+                out.append(row)
+        return out
 
 
 def record_change(storage, asset_type: str, change_type: str,
