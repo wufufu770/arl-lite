@@ -13,18 +13,6 @@
       "round": 5
     },
     {
-      "at": "2026-10-02T12:28:48",
-      "changes": {
-        "total_loc": {
-          "from": 12786,
-          "to": 17786
-        }
-      },
-      "gate": "loc_budget",
-      "reason": "",
-      "round": 5
-    },
-    {
       "at": "2026-10-02T12:49:39",
       "changes": {
         "total_loc": {
@@ -48,6 +36,6 @@
   "rules_have_advice": 37,
   "test_baseline": {
     "failed": 9,
-    "passed": 191
+    "passed": 193
   }
 }

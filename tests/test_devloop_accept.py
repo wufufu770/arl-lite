@@ -387,3 +387,66 @@ def test_cli_accept_requires_reason_flag():
     )
     assert proc.returncode != 0
     assert "--reason" in (proc.stderr + proc.stdout)
+
+
+# =====================================================================
+# 审计留痕的数据完整性
+# =====================================================================
+#
+# 背景:第一版变异测试拿真实仓库当靶子,往版本库写进了一条
+# 「total_loc 12786->17786、reason 为空」的假提升记录。
+# 原因字段是空的正好成了识别标志——accept 的库层要求理由 >= 10 字符,
+# 合法提升不可能留下空理由。基线数值当时被 finally 还原了,
+# 审计记录没有,于是它一路混进了 commit。
+#
+# 下面两条把它钉死。
+
+
+def test_committed_promotion_history_has_no_phantom_entries():
+    """版本库里已提交的提升记录必须每条都合法
+
+    这是对 baselines.json 这个**数据文件**的完整性检查。
+    审计留痕的价值全在于可信:混进一条假记录,整条链的可信度就没了。
+    """
+    path = REPO / "devloop" / "baselines.json"
+    data = gates.load_baseline(REPO)
+    hist = data.get(accept.PROMOTIONS_KEY)
+    assert hist, "本仓库应当至少有真实提升记录,没有的话这条用例等于没测"
+
+    for entry in hist:
+        reason = (entry.get("reason") or "").strip()
+        assert len(reason) >= accept.MIN_REASON_LEN, (
+            f"提升记录 {entry.get('at')} 的理由不合法(长度 {len(reason)}): {entry!r}\n"
+            f"  这多半是测试污染留下的幽灵记录 —— 真正的提升必须带理由"
+        )
+        assert entry.get("at"), f"提升记录缺时间戳: {entry!r}"
+        assert entry.get("gate") in gates._REGISTRY, (
+            f"提升记录指向未知门禁: {entry.get('gate')!r}"
+        )
+    assert path.exists()
+
+
+def test_mutation_workflow_does_not_touch_the_real_baselines(tmp_repo, monkeypatch):
+    """变异测试流程必须只碰 tmp —— 这条曾把假提升写进版本库
+
+    直接复现当初泄漏的那段流程(变异体 + 假门禁),但指向 tmp_repo,
+    然后断言**真实仓库的 baselines.json 一个字节都没变**。
+
+    不在子进程里跑整个测试文件是为了避免递归:这条用例自己就在
+    那个文件里。
+    """
+    real_path = gates.baseline_path(REPO)
+    before = real_path.read_bytes()
+
+    gates.update_baseline(tmp_repo, "loc_budget", {"total_loc": 100})
+    _install(monkeypatch, _FakeGate(
+        "loc_budget", {"total_loc": 999}, passed=False, fields=("total_loc",),
+    ))
+
+    # 正常路径 + 无理由路径,都只应作用在 tmp_repo 上
+    assert accept.accept_baseline(tmp_repo, "loc_budget", "").ok is False
+    assert accept.accept_baseline(
+        tmp_repo, "loc_budget", "一个足够长的合法理由文本"
+    ).ok is True
+
+    assert real_path.read_bytes() == before, "测试流程改动了版本库里的 baselines.json"
