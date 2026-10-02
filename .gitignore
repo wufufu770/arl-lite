@@ -1,12 +1,13 @@
 __pycache__/
-*.pyc
-.pytest_cache/
-.mimosa/
-.arl-lite/
+*.py[cod]
 *.egg-info/
-build/
-dist/
-cli_test_report*.html
-*.tar.gz
-*_export.json
-recon_results/recon_results_*/
+.venv/
+venv/
+
+# devloop 运行时状态——机具,不是源码。
+# baselines.json / backlog.md **要**进版本库(前者是防回归的基准,
+# 后者是人工维护的长期待办),state.json / queue.json 不进(每机一份)。
+devloop/state.json
+devloop/queue.json
+devloop/*.tmp
+devloop/*.corrupt

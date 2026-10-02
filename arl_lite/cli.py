@@ -907,6 +907,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = p.add_subparsers(dest="command", required=True)
 
+    # devloop — 自持迭代协议
+    from .devloop.cli import add_devloop_parser
+    add_devloop_parser(sub)
+
     # run
     pr = sub.add_parser("run", help="跑一个扫描任务")
     pr.add_argument("-t", "--target", required=True, help="目标(域名/IP/URL)")

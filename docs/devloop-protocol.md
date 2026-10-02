@@ -1,0 +1,447 @@
+# arl-lite 自持迭代协议（Devloop Protocol）
+
+> **状态**:活文档,跟随项目长期维护
+> **生效版本**:v0.7.8 起
+> **维护者**:项目所有者（单人）
+> **最后审计**:见 `devloop/state.json` 的 `last_audit_round`
+
+本文档定义 arl-lite 自我改进的**循环、门禁、退路与状态机**。它不是任务清单（任务在 `devloop/backlog.md`），而是约束任务如何被选、怎么被做、做到什么程度算完的元规则。
+
+---
+
+## 1. 为什么需要这个协议
+
+### 1.1 一个没有门禁的自我改进循环会怎么失控
+
+自我改进听起来很美,但放任自流的自我改进会稳定地走向以下五种坏结局。本协议存在的意义就是**给这五种失控装刹车**,不是为了学习如何为"持续改进"鼓掌。
+
+| 失控模式 | 触发场景 | 后果 | 协议如何防 |
+|---|---|---|---|
+| **改 A 坏 B** | 只跑新代码的测试,不跑回归 | 老功能默默退化,直到下次生产事故才暴露 | `test_baseline` 门禁:不允许新增失败 |
+| **门禁刷分** | 改门禁本身让指标变绿 | 防线被绕过,假装合规 | 门禁代码只增不删,变更必须走 IMPROVE 阶段 |
+| **文档腐化** | 改代码不更新 `docs/` | 新人/未来的自己读到错误信息 | `doc_freshness` 门禁(非阻断但记入产物) |
+| **重复造轮子** | 不读 backlog 就开新特性 | 解决已解决的问题 | `seed_if_empty()` 三层播种 |
+| **越改越大** | 每轮都加新功能不删除旧的 | LOC 爆炸、2G VPS 跑不动 | `loc_budget` 门禁 |
+
+### 1.2 为什么不能用"CI 跑过就行"代替本协议
+
+- CI 只能保证**当下没坏**,不能保证**没漏坏**（如 pytest 缺 `asyncio_mode` 导致 9 个 async 测试被静默 skip,这正是 CI 跑过但实则漏判的例子）。
+- CI 不能防止**架构腐化**（如 `import.cfrom` 出现、`risk_score.py` 越变越像不可读的胶水代码）。
+- CI 不能保证**长期演进有方向**（缺待办可以快速漂移到"什么都做一点,什么都不精"）。
+
+本协议是 CI 之上的**战略层**,CI 是战术层。
+
+---
+
+## 2. 项目铁律（约束集合）
+
+任何循环、门禁、决策都不得违反这些。它们是**不可议的**。
+
+| ID | 铁律 | 违反的代价 | 谁来检查 |
+|---|---|---|---|
+| **L1** | 零第三方 pip 依赖,纯 stdlib | 2G VPS 装不上、纯 stdlib 不可装 | `no_thirdparty_import` |
+| **L2** | 3 态纪律:`{ok, data, error, error_type}`,6 类 error_type | 死源被假数据替换、报告失真 | 模块 review |
+| **L3** | 死源可见:报告如实标出无出力的源 | 用户以为跑过实际没跑 | `correlation_engine` 输出契约 |
+| **L4** | 零假数据:指纹/端口/CDN 结果天然不可信 | 误导用户决策 | `risk_score` 输出契约 + 外部研究 §3 |
+
+### 2.1 L1 的特别说明
+
+`pyproject.toml` 的 `[project.optional-dependencies]` 当前声明了 7 个可选包（typer/rich/httpx/pyyaml/apscheduler/openpyxl,以及 dev 组的 pytest）。这些是**已实现但未启用**的探针,实现初期为了证明"零依赖也能做"曾推翻原计划的依赖引入。**当前不应启用任何 optional 依赖**——除非新规加入本表 L1.5 且写明"为何这次必须破例"。
+
+> **为什么不可议**:ark-lite 跟 ARL 灯塔的差异化卖点就是"2G 内存开箱即跑"。这个卖点倒了,项目定位就倒了。
+
+---
+
+## 3. 外部调研结论（设计依据）
+
+这些结论来自项目外的代码直读与作者实测,**作为本协议的硬性约束依据**,不是建议。
+
+### 3.1 结论表
+
+| 来源 | 结论 | 在本协议中的引用 |
+|---|---|---|
+| Aabyss-Team/ARL + smicallef/spiderfoot 源码直读 | 模块基类设计 / SQL schema 列选择是项目质量的两大锚点 | 强制所有新模块继承 `BaseModule` 3 态契约 |
+| HunterX 源码（26 个架构测试） | 架构测试是防架构腐化的有效手段 | §5 门禁体系引用此规模作参照 |
+| AtlasX 作者实测 1000 份 SRC 报告 | `P(真漏洞 \| 已被标记为高危) = 76%` | §5 `rules_have_advice` 门禁,以及 §7 待办里"置信度字段消费"项 |
+| Bayes 推导（基础率 1%,单次 FP 10% → 8.7%;要求 3 轮独立观测 → 99%） | 单一快照不可信,多轮观测才可信 | §9 落地路线的轮次优先级 |
+| IP2Location LITE 许可证 CC BY-SA | 传染性,不允许合入仓库 | 红线,任何 PR 含此数据直接拒 |
+| CAIDA 数据许可证 CC BY-NC | 禁商用 | 红线,与本项目 MIT 许可证不兼容 |
+
+### 3.2 置信度四因子乘法模型（写入门禁的事实依据）
+
+```
+confidence = base_prior × signal_factor × cross_evidence × temporal_consistency
+```
+
+| 因子 | 含义 | 当前状态 | 期望状态 |
+|---|---|---|---|
+| `base_prior` | 指纹/规则本身的先验可信度 | 缺 | 第一轮必做 |
+| `signal_factor` | 单信号强度（HTTP 200 / 证书签名 / 协议握手） | 缺 | 第一轮必做 |
+| `cross_evidence` | 跨源交叉印证（同一资产被 ≥2 个 source 命中） | 缺 | 第二轮候选 |
+| `temporal_consistency` | 多轮观察一致性（同一资产 ≥3 轮稳定出现） | 缺 | 第三轮候选 |
+
+> **为什么是乘法不是加法**:任一因子为 0,confidence 必须为 0。这是"任一防线失守就降级"的安全语义,加法做不到。
+
+> **为什么不是 AtlasX 的 76%**:那是 `P(真漏洞 \| 已被标记为高危)`,是**后验**。我们要的是工具自身的 `precision`,两者不能混。混淆这两个就会灾难性后果。
+
+---
+
+## 4. 循环的四个阶段与状态机
+
+### 4.1 状态机总图
+
+```
+            ┌──── 任何门禁超时 / 崩溃 ────┐
+            │                              │
+            ▼                              │
+   ┌─────────────┐   test_baseline 通过   ┌─────────────┐
+   │   BUILD     ├──────────────────────►│    TEST     │
+   │ (执行任务)  │                       │ (跑回归)    │
+   └──────┬──────┘                       └──────┬──────┘
+          │                                      │
+          │ 测试数下降 / LOC 超预算                │ 全部通过
+          │ / 连续 N 轮无净增量                    ▼
+          │                              ┌─────────────┐
+          │                              │  IMPROVE    │
+          │                              │ (重写/重构) │
+          │                              └──────┬──────┘
+          │                                     │
+          │                                     │ 提取通用模式
+          │                                     ▼
+          │                              ┌─────────────┐
+          │                              │   PLAN     │
+          │                              │ (生成下轮) │
+          │                              └──────┬────┘
+          │                                     │
+          ▼                                     ▼
+   ┌─────────────────────────────────────────────┐
+   │  STATE 落盘(写 devloop/state.json,原子写)  │
+   └─────────────────────┬───────────────────────┘
+                         │
+                         ▼
+                   BUILD (下一轮)
+```
+
+### 4.2 阶段定义表
+
+| 阶段 | 进入条件 | 做什么 | 退出条件 | 失败时怎么退 |
+|---|---|---|---|---|
+| **BUILD** | `backlog.md` 头部有未完成任务 | 执行一项任务,改代码,改文档,跑本地 smoke | 任务在 `backlog.md` 标为 done;或被 RETREAT 触发 | 进入 RETREAT(§6) |
+| **TEST** | BUILD 退出后 | 跑 `make test` 全套 9 套（phase1-7 + edge + concurrency）;对照 `state.json.baseline` 比对失败数 | 失败数 ≤ baseline 失败数 | 进入 RETREAT |
+| **IMPROVE** | TEST 通过 | 提取本轮发现的通用模式重写（如重复代码、参数传递冗长） | 重写后重跑 TEST 仍通过 | 进入 RETREAT |
+| **PLAN** | IMPROVE 完成或未触发 | 从 backlog 取下一项,或调 `seed_if_empty()`(§7) | 新任务加入 backlog 头部 | 退到 BUILD |
+
+### 4.3 进入条件的具体阈值
+
+- **BUILD**:backlog 头项非空且不是 `[BLOCKED]` 标记。
+- **TEST**:本轮代码有 git diff（无 diff 跳过 TEST 直接 PLAN）。
+- **IMPROVE**:本轮 BUILD 改动的文件数 ≥ 3 且 LOC 净增 > 50 行。
+- **PLAN**:任何时候 IMPROVE 退出后都必须执行。
+
+> **为什么 IMPROVE 有 LOC 阈值**:小改动（< 50 行 / < 3 文件）通常不需要重构,触发 IMPROVE 反而是过度工程。
+
+---
+
+## 5. 门禁（Gate）体系
+
+### 5.1 七道门禁总表
+
+| ID | 门禁 | 防什么退化 | 阻断/非阻断 | 触发命令 |
+|---|---|---|---|---|
+| **G1** | `no_thirdparty_import` | L1 铁律被破坏 | **blocking** | `grep -rE "^import (typer|rich|httpx|pyyaml|apscheduler|openpyxl|litellm|textual)" arl_lite/` 应返回空 |
+| **G2** | `test_baseline` | 回归（新增失败） | **blocking** | `make test` 失败数 ≤ `state.json.baseline.fail_count` |
+| **G3** | `no_import_cycle` | 循环依赖导致的 import 地狱 | **blocking** | 自写 `tools/check_imports.py` 跑 `import` 图 DFS |
+| **G4** | `loc_budget` | 无节制膨胀 | **blocking** | `find arl_lite -name "*.py" -exec cat {} + \| wc -l` ≤ 18,000 行 |
+| **G5** | `rules_have_advice` | 规则失去可操作性 | **blocking** | 每条 YAML 规则必须有 `advice:` 非空字段 |
+| **G6** | `prompt_injection_guard` | 安全防线回退 | **blocking** | `ai/prompts.py` 必须调用 `_sanitize` 处理 title/banner/whois/CN |
+| **G7** | `doc_freshness` | 文档过期 | **非阻断** | `state.json.last_doc_audit_round` 与当前轮差 ≤ 5 |
+
+### 5.2 blocking vs 非阻断的区分理由
+
+- **blocking**:违反会让**铁律被破坏或当前质量不回来**。任何时候不允许绕过。
+- **非阻断**:违反不会让铁律被破坏,但会随时间累积成大问题（如 `doc_freshness` 让 `PROJECT_PLAN.md` 完全过期,但代码本身不受影响）。
+
+> **为什么 doc_freshness 非阻断**:文档写得烂不等于代码写得烂。阻断会让循环卡死在"写文档"上,而真正的问题是代码改动没让文档同步。设非阻断 + 轮次累积告警更合理。
+
+### 5.3 门禁失败必须写进状态而不是被吞掉
+
+每道门禁的失败结果必须写入 `devloop/state.json` 的 `gate_history` 数组,字段:
+
+```json
+{
+  "round": 7,
+  "gate_id": "G2",
+  "status": "fail",
+  "fail_count_delta": 3,
+  "failed_tests": ["test_phase5.py::test_x", "..."],
+  "action": "retreat_to_round_5",
+  "timestamp": "2026-10-02T02:01:41+08:00"
+}
+```
+
+> **为什么必须持久化**:被吞掉的失败会成为"传说"——某轮跑挂了但谁也不知道是哪轮、为什么、改的是状态。门禁历史是协议自己可审计的唯一来源。
+
+### 5.4 门禁阈值与触发后处理
+
+| 门禁 | 阈值 | 触发后默认动作 |
+|---|---|---|
+| G1 | 任意非空 import | 立即 REVERT 本轮全部改动（不动 BUILD）；记入 RETREAT 计数 |
+| G2 | fail_count 增加 ≥ 1 | REVERT + 重新写一个最小失败用例 |
+| G3 | 检测到环 | REVERT 该次重构 |
+| G4 | > 18,000 行 | 暂停 BUILD,先进 IMPROVE 阶段瘦身 |
+| G5 | 任意规则缺 advice | REVERT 该规则的提交 |
+| G6 | 任意 title 变量未 `_sanitize` | REVERT 该 prompt 修改 |
+| G7 | last_doc_audit_round 差 > 5 | 仅记告警,不阻断 |
+
+> **为什么 loc_budget 是 18,000 而不是 20,000**:当前 13,466 行,留 4,500 行缓冲约等于 30% 增量。超过即触发瘦身而非继续放任。
+
+---
+
+## 6. 退路（Retreat）机制
+
+### 6.1 触发条件
+
+满足以下任一即触发退路:
+
+1. **连续 N 轮无净增量**:`N = max(3, ceil(baseline_pass_rate * 5))`,目前 baseline 全绿故 N=3。
+2. **测试数下降**:本轮 TEST 比上轮 TEST 的 pass_count 减少。
+3. **LOC 超预算**:触发 G4 退路（不同于普通 G4 REVERT）。
+4. **门禁历史连续 3 轮同一 G 失败**:说明该门禁设计本身有问题,需冻结该 G 并上升级到人工。
+
+### 6.2 退到哪里
+
+| 退路级别 | 触发条件 | 退到 |
+|---|---|---|
+| **R0 软退** | 单次 G1-G6 失败 | REVERT 本轮 git commit；`backlog.md` 该任务未标 done |
+| **R1 硬退** | 连续 2 轮同一 G 失败 | REVERT 到 `state.json.last_all_green_round` 的 git ref；任务保留 |
+| **R2 冻结** | 连续 4 轮同一 G 失败 | 冻结该 G（不要求生产代码满足），任务标 `[BLOCKED]`，等人工 |
+| **R3 暂停** | `RETREAT_COUNT` 累加到 5（自项目起累计） | 暂停协议，人工 review |
+
+### 6.3 为什么不自动 git reset
+
+- **危险**:reset 会丢工作,如果 reset 后发现上周签的不是问题源头,工作已经没了。
+- **更危险**:reset 不写状态,如果同一个人不读 git log 就跑下一轮,会重复做同样的事。
+- **本协议的做法**:REVERT 用 `git revert`（保留历史）+ 写 `gate_history` 记录为何 REVERT。
+
+> **核心原则**:**保留 commit 解释为什么**,而不是用 reset 抹掉为什么。
+
+### 6.4 RETREAT_COUNT 的语义
+
+- 每次进入 R1 即 `RETREAT_COUNT += 1`。
+- 达到 5 触发 R3 暂停,需要人工确认是否调整门禁阈值或协议本身。
+- `RETREAT_COUNT` 仅在**所有门禁连续 5 轮全绿**时才能 `--reset` 归零,防止"刷绿就忘痛"。
+
+---
+
+## 7. 待办队列永不枯竭（seed_if_empty）
+
+人不可能一直盯着。协议必须自持。`seed_if_empty()` 在 backlog 为空时被调用,**绝不返回空**。
+
+### 7.1 三层播种
+
+```
+def seed_if_empty(backlog: list, code_state: dict) -> list:
+    if backlog:
+        return backlog
+    return (
+        layer1_human_backlog()
+        or layer2_code_derived()
+        or layer3_long_horizon()
+    )
+```
+
+| 层 | 名称 | 来源 | 何时使用 |
+|---|---|---|---|
+| **L1** | 人工 backlog | `devloop/backlog.md` 由人写入 | 永远优先 |
+| **L2** | 代码现状自动推导 | 扫描代码 TODO/FIXME/XXX；grep `pass  # TODO`；扫描 `db/schema.sql` 中无消费者的字段 | L1 耗尽 |
+| **L3** | 固定长期演进项 | `devloop/seed_long_horizon.json` 硬编码 | L2 也耗尽时,保底 |
+
+### 7.3 L2 自动推导的扫描规则
+
+| 扫描器 | 触发词 | 产出任务模板 |
+|---|---|---|
+| `scan_todo_comments` | `TODO\|FIXME\|XXX\|HACK` | "处理 `path:line` 注释：`{content}`" |
+| `scan_orphan_schema` | grep schema.sql 中字段无任何 module 引用 | "为 `db/schema.sql:{line}` 字段 `confidence` 接入消费者" |
+| `scan_disabled_tests` | pytest 中 `@pytest.mark.skip` | "评估 `tests/{file}::{func}` 是否可启用" |
+| `scan_dead_imports` | `importlib.util.find_spec` 失败 | "清理 `path:line` 的死 import" |
+
+### 7.4 为什么不允许 `return None`
+
+> 单点项目跑完了"自动推导"循环回来了发现 backlog 为空,循环空转,协议就死了。L3 永远给硬编码任务保底,代价是这些任务可能永不完成——但**永有任务**比**循环停转**重要得多。
+
+### 7.5 L3 长期演进项清单（当前硬编码）
+
+| ID | 任务 | 为什么是 L3 |
+|---|---|---|
+| LH-1 | "为 `risk_score.py` 接入 `confidence` 字段消费" | 见 §3.2 |
+| LH-2 | "为关联规则加 `confidence` 概念替代直接 `risk: 9/10`" | 见 §3.1 |
+| LH-3 | "`check_filter_sql` 禁 `UNION`" | 安全防御 |
+| LH-4 | "异常分类改为子类化而非字符串匹配" | 重构项,L4 才做 |
+| LH-5 | "更新过期的 `docs/PROJECT_PLAN.md`" | 文档同步 |
+
+---
+
+## 8. 状态落盘（state.json）
+
+### 8.1 文件路径与写时机
+
+- **路径**:`devloop/state.json`（git tracked,以便代码状态通过 git 恢复协议状态）。
+- **写时机**:每轮 PLAN 阶段结束时,以及任意门禁失败后立即写。
+
+### 8.2 字段定义
+
+```jsonc
+{
+  "schema_version": 1,
+  "round": 7,                              // 当前轮次,自增
+  "phase": "TEST",                         // 当前阶段
+  "last_all_green_round": 5,               // 上次全绿轮次(供 R1 用)
+  "retreat_count": 1,                      // 累计退路次数
+  "baseline": {
+    "fail_count": 0,                       // 当前允许的失败数
+    "pass_count": 87,                      // 当前通过的测试数
+    "loc": 13466,                          // 当前 LOC 快照
+    "asof_round": 5                        // baseline 是在哪一轮确立的
+  },
+  "current_metrics": {                     // 上轮跑出来的指标
+    "fail_count": 0,
+    "pass_count": 87,
+    "loc": 13510
+  },
+  "gate_history": [                        // 门禁历史,数组,新事件 push 末尾
+  ],
+  "backlog_snapshot": [                     // 上轮 PLAN 时的 backlog 头部 3 项
+  ],
+  "last_doc_audit_round": 5                // 用于 G7
+}
+```
+
+### 8.3 原子写
+
+```python
+import json, tempfile, os
+
+def save_state(state: dict, path: str) -> None:
+    """原子写:写到 tmp 文件,os.replace 原子替换。"""
+    dirpath = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=dirpath, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+```
+
+> **为什么必须原子写**:崩溃恢复——若进程在写一半被 SIGKILL,非原子写会留下半个 JSON,下次启动协议读 state 就崩。原子写要么是旧 state 要么是新 state,不会中间态。
+
+### 8.4 baseline 更新规则
+
+- `baseline.fail_count` 只允许**在人工显式调整时**更新。
+- 自动跑过的轮次失败数降低时,**不更新 baseline**,而是记入 `current_metrics` 等待人工 review 后再决定是否升 baseline。
+- 这避免"通过刷分让 baseline 变松"。
+
+---
+
+## 9. 落地路线
+
+### 9.1 第一轮（结合已知问题,优先级最高）
+
+| 序号 | 任务 | 来源 | 涉及门禁 |
+|---|---|---|---|
+| 1.1 | `risk_score.py` 接入 `db/schema.sql` 的 `confidence` 字段 | LH-1 + §3.2 | G4 |
+| 1.2 | 37 条规则全部加 `confidence:` 字段(初值 50),把 `risk_score` 公式改为 `risk × confidence / 100` | LH-2 | G5 |
+| 1.3 | `check_filter_sql` 加 `UNION` 黑名单(报错而非 silent pass) | LH-3 | G6 (新增) |
+| 1.4 | 删除过期 `docs/PROJECT_PLAN.md` 或改写为历史档 | LH-5 | G7 |
+
+### 9.2 第二轮候选
+
+| 序号 | 任务 | 来源 |
+|---|---|---|
+| 2.1 | 21 条依赖 `findings.title` 的规则改为"指纹匹配 + cross_evidence"双重门 | §3.2 |
+| 2.2 | 异常分类改为子类化(`RateLimitError / AuthError / NetworkError / ...`) | LH-4 |
+| 2.3 | 加 `cross_evidence` 因子(同资产被 ≥2 source 命中 → confidence × 1.5) | §3.2 |
+
+### 9.3 第三轮候选
+
+| 序号 | 任务 | 来源 |
+|---|---|---|
+| 3.1 | 加 `temporal_consistency` 因子(同资产 ≥3 轮稳定 → confidence × 1.3) | §3.2 |
+| 3.2 | 写 1 个最小的 HunterX 风格架构测试 | §3.1 |
+
+### 9.4 什么时候需要人工介入
+
+| 触发 | 介入内容 |
+|---|---|
+| `RETREAT_COUNT` 累加到 5 | 人工判断是否调整门禁阈值或协议本身 |
+| 同一 G 连续 4 轮失败 | 冻结该 G,人工决定是否废除 |
+| baseline 调整请求 | 人工 review 后才能 `baseline.fail_count -= 1` |
+| L1 铁律变更申请 | 边界情形,必须人工签字 |
+| 新 optional 依赖启用申请 | 同上 |
+
+---
+
+## 10. 反模式清单
+
+下列行为会破坏协议。任何发现即视为协议失效信号。
+
+| 反模式 | 为什么坏 | 如何识别 |
+|---|---|---|
+| 为**让门禁变绿**而改门禁本身 | 防线失效 | `git log` 看是否某轮专门改门禁代码但任务说明无变更 |
+| 往 backlog 塞永远做不完的大任务 | 让 L2、L3 永不触发,L1 也被稀释 | backlog 任务超过 3 轮未推进 |
+| 跳过 TEST 直接进 IMPROVE | 改 A 坏 B 的经典路径 | `state.json.round_history` 看某轮 phase 序列缺 TEST |
+| 修改 baseline 来掩盖回归 | 让 G2 永远绿 | `git diff state.json` 看是否仅 fail_count 变化 |
+| 引入 `from X import Y` 其中 X 在 stdlib 之外 | L1 失守 | G1 |
+| `git reset --hard` 来"快进" | 丢失 REVERT 历史 | `git reflog` 看是否有 reset |
+| 把 `state.json` 加进 `.gitignore` | 协议状态无法跨机器恢复 | 看 `.gitignore` |
+| 给门禁加 `if os.getenv("SKIP_GATE")` 绕过 | 防线失效 | grep `SKIP_GATE\|BYPASS_GATE` |
+| 把 pytest 标记为 `@pytest.mark.skip` 而不修 | 假装通过,实则漏判 | grep `pytest.mark.skip` 数量突增 |
+| 在 `prompt_injection_guard` 加 title 例外 | 安全防线回退 | G6 |
+
+---
+
+## 11. 附录
+
+### 11.1 术语表
+
+| 术语 | 含义 |
+|---|---|
+| **轮次（round）** | BUILD → TEST → IMPROVE → PLAN → 落盘 的完整序列 |
+| **阶段（phase）** | 一个轮次中的四个子阶段 |
+| **门禁（gate）** | 自动/半自动检查,违反即触发退路 |
+| **退路（retreat）** | 协议遇到失败时的回退机制,有 R0-R3 四级 |
+| **铁律（law）** | 不可议的项目设计约束,见 §2 |
+| **baseline** | 测试通过的基线快照,见 §8.2 |
+| **L1-L3 播种** | 见 §7.1,backlog 永不枯竭的三层来源 |
+| **死源** | 数据源请求失败但被报告如实标出的状态 |
+
+### 11.2 关键文件位置速查
+
+| 文件 | 作用 |
+|---|---|
+| `devloop/state.json` | 协议状态（每轮落盘） |
+| `devloop/backlog.md` | 人工维护的任务清单 |
+| `devloop/seed_long_horizon.json` | L3 长期演进项 |
+| `tools/devloop.py` | 协议入口 CLI（计划中,本轮不实现） |
+| `docs/devloop-protocol.md` | 本文档 |
+
+### 11.3 命令速查
+
+| 命令 | 作用 |
+|---|---|
+| `make test` | 跑全部 9 套测试 |
+| `python3 -m devloop status` | 打印当前轮次、阶段、门禁状态（计划中） |
+| `python3 -m devloop retreat` | 手动触发 R1 退路（计划中） |
+
+### 11.4 协议变更记录
+
+| 日期 | 变更 |
+|---|---|
+| 2026-10-02 | 初版,基于 AtlasX/ARL/SpiderFoot 源码直读 + 项目已知问题清单 |
+
+---
+
+> **最后一句**:
+> 协议的敌人不是缺陷,是**遗忘**。每跑完一轮,在 state.json 写一行;每季度读一次本文档,看哪些设计决策今天已经不适用了。能改即改。
