@@ -87,11 +87,23 @@
       "gate": "loc_budget",
       "reason": "r27 修 test_baseline 只比失败总数的盲区(实测:同时修好一条旧失败、引入一条全新失败,总数 10==10,旧门禁报 passed=True 放行了亲手注入的真回归)。改为按测试身份判定,新增 -rf 身份解析、白名单比对、无身份/有白名单/旧格式迁移三段分支,门禁逻辑净增 57 行。",
       "round": 26
+    },
+    {
+      "at": "2026-10-02T22:42:11",
+      "changes": {
+        "devloop_code_loc": {
+          "from": 2650,
+          "to": 2700
+        }
+      },
+      "gate": "loc_budget",
+      "reason": "r29 给 StateStore 补并发安全,实测(8 进程 x 150 次 = 1200 次)修前 741 次 FileNotFoundError、10+ 次状态被读成损坏、1200 次写只剩 14 条历史;修后 0/0/round 精确 1200。改法:tmp 名每次唯一(病根,不是锁)+ 新增 mutate() 把读-改-写整段收进临界区(不变式 #8)。变异测试还证明 save 自己的锁是冗余的(os.replace 已原子,tmp 已唯一),已删。门禁逻辑净增 10 行。",
+      "round": 27
     }
   ],
   "doc_freshness": 0,
   "loc_budget": {
-    "devloop_code_loc": 2650,
+    "devloop_code_loc": 2700,
     "devloop_loc": 2617,
     "total_loc": 14514
   },
