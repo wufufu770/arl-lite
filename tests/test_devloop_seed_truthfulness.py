@@ -46,9 +46,29 @@ RULES = REPO / "arl_lite" / "modules" / "analysis" / "rules"
 # 代码注释里的豁免,和没有豁免是一回事。
 # `test_signal_items_must_say_so` 守住"信号必须自报家门",防止它退化成
 # 伪装成信号的假活。
-_SIGNAL_IDS = {
+#
+# ## 为什么按「前缀」而不是精确 id 匹配
+#
+# 播种的兜底项会带轮次后缀(`no-due-maintenance-review-r1`)——
+# `_disambiguate` 撞上已占用的 id 就加后缀。于是精确 id 名单会漏掉
+# 每一份派生副本,而那些副本的 verify 同样是恒真的。
+#
+# r21 实测踩到:我关掉队首那条信号之后,下一轮又播种出一条 `-r1` 副本,
+# 反假活门禁立刻报「播种产出了假活」。门禁没白写 —— 它抓到的不是假活,
+# 是**豁免机制本身的缺陷**:按 id 开名单,就必然漏掉派生 id。
+#
+# 所以改成前缀匹配。代价是:任何以该前缀开头的条目都会被豁免。
+# 这个代价可控,因为前缀带了完整的语义标识,而 `test_signal_items_must_say_so`
+# 仍然逐条验它的三条硬要求(verify 恒真 / 标题自报家门 / detail 给指引)。
+_SIGNAL_PREFIXES = (
     "no-due-maintenance-review",
-}
+)
+
+
+def _is_signal(item_id: str) -> bool:
+    """是不是信号类条目(按前缀,含 `-rN` 派生副本)"""
+    return any(item_id == pfx or item_id.startswith(pfx + "-r")
+               for pfx in _SIGNAL_PREFIXES)
 
 
 def _run_verify(verify: str) -> tuple[bool, str]:
@@ -145,7 +165,7 @@ def test_no_auto_seeded_item_is_already_done():
     并且 `test_signal_items_must_say_so` 守住"信号必须自报家门"。
     """
     for item in _fallback_items() + _seeded_items():
-        if item.id in _SIGNAL_IDS:
+        if _is_signal(item.id):
             continue
         passed, out = _run_verify(item.verify)
         assert not passed, (
@@ -172,7 +192,7 @@ def test_signal_items_must_say_so():
     这三条任意一条不满足,信号就退化成了伪装成信号的假活。
     """
     for item in _fallback_items() + _seeded_items():
-        if item.id not in _SIGNAL_IDS:
+        if not _is_signal(item.id):
             continue
         assert _run_verify(item.verify)[0], (
             f"{item.id} 被列为信号,但它的 verify 并不恒真 —— "

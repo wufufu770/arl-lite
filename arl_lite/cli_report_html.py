@@ -49,6 +49,38 @@ def generate_html_report(storage: "Storage", workspace: str, title: str = "ARL-L
     risk = risk_summary(storage)
     top = top_risks(storage, limit=20)
     correlations = storage.query("correlations", limit=10000)
+    # ── 置信度分流(第 1 轮建的模型,到这一层才真正生效) ──
+    #
+    # 之前这里是 `correlations[:50]` 无条件截断 —— 插入顺序与置信度无关,
+    # 于是高价值命中可能正好被截掉,而 `discard` 判定的指纹误报和
+    # high confidence 的真问题在报告里长得一模一样。
+    # `confidence.py` 算出的 report/observe/discard 落进了库,但没有任何
+    # 消费者,整轮 r1 的承诺在用户看到的地方是空的。
+    #
+    # 排序键:discard 沉底,同档内按 confidence 降序,再按 risk 降序。
+    # 拿不到 confidence 的老数据(status 为空)按 observe 处理 —— 保守:
+    # 不因为字段缺失就把东西藏起来。
+    _STATUS_RANK = {"discard": 0, "observe": 1, "report": 2}
+
+    def _corr_key(c):
+        st = (c.get("confidence_status") or "observe").strip().lower()
+        if st not in _STATUS_RANK:
+            st = "observe"
+        try:
+            conf = int(c.get("confidence") or 0)
+        except (TypeError, ValueError):
+            conf = 0
+        try:
+            rk = int(c.get("risk") or 0)
+        except (TypeError, ValueError):
+            rk = 0
+        return (_STATUS_RANK[st], -conf, -rk)
+
+    correlations = sorted(correlations, key=_corr_key)
+    reported = [c for c in correlations
+                if (c.get("confidence_status") or "observe").strip().lower() != "discard"]
+    discarded = [c for c in correlations
+                 if (c.get("confidence_status") or "").strip().lower() == "discard"]
     host_samples = [h.get("host", "?") for h in hosts[:20] if h.get("host")]
     stats.setdefault("monitors", len(storage.query("monitors", limit=10000)))
 
@@ -229,9 +261,9 @@ def generate_html_report(storage: "Storage", workspace: str, title: str = "ARL-L
   <div class="card">
     <h2>🔍 关联分析(去重后)</h2>
     <table>
-      <tr><th>规则</th><th>目标</th><th>风险</th><th>概要</th></tr>
+      <tr><th>规则</th><th>目标</th><th>风险</th><th>置信度</th><th>概要</th></tr>
 """)
-        for c in correlations[:50]:
+        for c in reported[:50]:
             headline = c.get("headline", "")
             if len(headline) > 80:
                 headline = headline[:80] + "..."
@@ -239,17 +271,55 @@ def generate_html_report(storage: "Storage", workspace: str, title: str = "ARL-L
                 risk = int(c.get("risk") or 0)
             except (TypeError, ValueError):
                 risk = 0
+            try:
+                conf = int(c.get("confidence") or 0)
+            except (TypeError, ValueError):
+                conf = 0
+            cstat = (c.get("confidence_status") or "").strip().lower()
             level = "critical" if risk >= 9 else "high" if risk >= 7 else "medium" if risk >= 4 else "low"
+            # observe = 算出来但不足以直接报,标出来让人自己判断
+            badge = (' <span class="level level-medium">待观察</span>'
+                     if cstat == "observe" else "")
             parts.append(
                 f'      <tr><td>{html.escape(c.get("rule_name", "?"))}</td>'
                 f'<td><code>{html.escape(c.get("target", "?"))}</code></td>'
                 f'<td><span class="level level-{level}">{risk}</span></td>'
+                f'<td><span class="muted">{conf}</span>{badge}</td>'
                 f'<td>{html.escape(headline)}</td></tr>\n'
             )
         parts.append("    </table>\n")
-        if len(correlations) > 50:
+        if len(reported) > 50:
             total = stats.get("correlations", len(correlations))
-            parts.append(f'    <p class="muted">仅显示前 50 条,共 {total} 条</p>\n')
+            parts.append(f'    <p class="muted">仅显示前 50 条,共 {len(reported)} 条'
+                         f'(已排除 {len(discarded)} 条低置信度)</p>\n')
+        if discarded:
+            # 被 discard 的**不删掉,折叠起来**。理由:它们是模型的判断,
+            # 判断可能错;藏起来就没人能发现模型错了。而完全混进主表
+            # 又会让误报淹没真问题 —— 折叠是这两者之间唯一诚实的形态。
+            parts.append("""
+    <details>
+      <summary class="muted">已按低置信度排除 %d 条(点开可见 —— 模型可能判错,
+      值得抽查)</summary>
+      <table>
+""" % len(discarded))
+            for c in discarded[:20]:
+                headline = c.get("headline", "")
+                if len(headline) > 80:
+                    headline = headline[:80] + "..."
+                try:
+                    conf = int(c.get("confidence") or 0)
+                except (TypeError, ValueError):
+                    conf = 0
+                parts.append(
+                    f'        <tr><td>{html.escape(c.get("rule_name", "?"))}</td>'
+                    f'<td><code>{html.escape(c.get("target", "?"))}</code></td>'
+                    f'<td><span class="muted">{conf}</span></td>'
+                    f'<td>{html.escape(headline)}</td></tr>\n'
+                )
+            if len(discarded) > 20:
+                parts.append(f'        <tr><td colspan="4" class="muted">'
+                             f'共 {len(discarded)} 条,仅列前 20</td></tr>\n')
+            parts.append("      </table>\n    </details>\n")
         parts.append("  </div>\n")
     else:
         parts.append('  <div class="card"><h2>🔍 关联分析(去重后)</h2><p class="muted">暂无关联结果(未跑过 correlate 或 0 命中)</p></div>\n')

@@ -42,6 +42,10 @@ kind 取值：`change` / `test` / `doc` / `research` / `refactor`
 - [P3] change: 实现 DISAPPEARED 变更类型 | ✅ r8 完成 · 用 first_seen/last_seen 判断,不需要 snapshot 表 | python3 -m pytest tests/test_monitor_disappeared.py
 - [P3] research: 误报率实测 | ✅ r14 完成 · 离线受控样本(14 个),并借此修掉 4 个规则真 bug;产出 docs/FP_RATE.md,`arl-lite fp-bench` 可复跑 | python3 -m arl_lite fp-bench
 
+- [P0] change: 让 confidence_status 真正生效,报告按处置动作分流 | ✅ r21 完成 · discard 沉底折叠、observe 留在主表带「待观察」标记、排序按 status→confidence→risk;`tests/test_confidence_reporting.py` 6 条(含变异验证) | `arl-lite report --html` 产出的 HTML 里,confidence_status=discard 的关联不出现在主表(可 grep 断言);`tests/test_confidence_reporting.py` 加一条端到端断言:造一条 discard 命中的关联,跑报告,断言它没进主表
+- [P1] change: 关联命中按 confidence 排序,而不是按插入顺序 | ✅ r21 完成 · 排序键 `_corr_key`:discard 沉底 → confidence 降序 → risk 降序。踩了个坑:第一版测试是假绿的,因为 `storage.query` 是 `ORDER BY id DESC`,我以为「最后插入的会被截掉」其实它排第一 | 造 60 条关联,其中置信度最高的那条排在最后,断言它出现在报告里(改前会被截掉)
+- [P2] doc: 说明 confidence 三评分与 risk 的关系 | `core/risk_score.py:46` 按 `risk` 聚合,置信度**不参与**风险计算。用户会问「我看到 confidence=20 的命中,为什么风险还是 9」,文档没答案 | docs/ 里有一节说明 confidence 决定「是否展示/如何标注」,risk 决定「排序权重」,两者正交
+
 ## 候选（待细化）
 
 - 离线内嵌 RIPE/APNIC/ARIN delegated 数据做 IP→ASN 归属（约 16MB，公约免费）
