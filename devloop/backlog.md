@@ -44,7 +44,8 @@ kind 取值：`change` / `test` / `doc` / `research` / `refactor`
 
 - [P0] change: 让 confidence_status 真正生效,报告按处置动作分流 | ✅ r21 完成 · discard 沉底折叠、observe 留在主表带「待观察」标记、排序按 status→confidence→risk;`tests/test_confidence_reporting.py` 6 条(含变异验证) | `arl-lite report --html` 产出的 HTML 里,confidence_status=discard 的关联不出现在主表(可 grep 断言);`tests/test_confidence_reporting.py` 加一条端到端断言:造一条 discard 命中的关联,跑报告,断言它没进主表
 - [P1] change: 关联命中按 confidence 排序,而不是按插入顺序 | ✅ r21 完成 · 排序键 `_corr_key`:discard 沉底 → confidence 降序 → risk 降序。踩了个坑:第一版测试是假绿的,因为 `storage.query` 是 `ORDER BY id DESC`,我以为「最后插入的会被截掉」其实它排第一 | 造 60 条关联,其中置信度最高的那条排在最后,断言它出现在报告里(改前会被截掉)
-- [P2] doc: 说明 confidence 三评分与 risk 的关系 | `core/risk_score.py:46` 按 `risk` 聚合,置信度**不参与**风险计算。用户会问「我看到 confidence=20 的命中,为什么风险还是 9」,文档没答案 | docs/ 里有一节说明 confidence 决定「是否展示/如何标注」,risk 决定「排序权重」,两者正交
+- [P2] doc: 说明 confidence 三评分与 risk 的关系 | ✅ r22 完成(产出 commit 7c7cec3,`docs/CONFIDENCE_VS_RISK.md`,文档头写着「轮次:r22」)。r34 订正:该条曾在 r22 被误 unmark,理由写的是「我根本没做 —— note 为空是证据」,而空 note 只说明没人写说明,推不出活没做 | docs/ 里有一节说明 confidence 决定「是否展示/如何标注」,risk 决定「排序权重」,两者正交
+- [P1] change: 人写待办的 verify 必须可被机器核验 | `_seed_from_backlog` 把 verify 当命令跑(`Queue.verify_passes` 走 `bash -c`),散文型 verify 恒返回 False。已实测:`confidence-risk` 的散文 verify 跑出来是 False,换成命令才是 True。后果是人写待办的「做没做」机器判不了,假账只能靠人记性发现 | python3 -m pytest tests/test_backlog_verify_is_commandable.py
 
 ## 候选（待细化）
 

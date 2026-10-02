@@ -1937,6 +1937,102 @@ assert Queue.owner_pid(seen["owner"]) is not None
 > 我写这节的动机不是自我批评,是下一个人会翻到 r31 的提交信息,
 > 看到「修好了认领者探测」就会以为那件事做完了。
 
+r34 补了真实行为验证(不靠单测,直接探真实进程):`round-pid-<本进程pid>`
+探活成功 → 保留不复位;`round-pid-999999` → 探活失败 → 正确复位。
+r31 那句话现在才真的成立。
+
+---
+
+### 7.25 「note 为空」推不出「活没做」——以及它造出来的一条假账
+
+r33 收尾时队列播报耗尽,回头查 `confidence-risk` 为什么在队列里是 `done`
+却没在 `backlog.md` 里打完成标记。挖出来的 note 是 r22 写的:
+
+> unmarked from done: r22:引擎在无 build_fn 时「门禁绿就标 done」,把这条
+> 标成了 done,**但我根本没做 —— note 为空是证据。**
+
+推理链是:**note 为空 → 活没做**。
+
+第一环是真的。`Queue.finish()` 的成功路径一个字都不写,失败路径才有
+(`release` 传的是 `gates failed: ...`)。于是 `devloop round` 标出来的
+每一条 done,`note` 全是空串。
+
+**但结论是错的。** `docs/CONFIDENCE_VS_RISK.md` 是 **r22 就产出的**
+(commit `7c7cec3`,文档开头自己写着「轮次:r22」)。活做了,只是 note 没写。
+我拿「没写」当「没做」的证据,写了一条假账指控它,又按这条假账把它
+unmark 掉 —— 记录反而更脏了:r22 那条错 note 一直挂在一条其实做完了的
+条目上,直到 r34 才被发现。
+
+## 为什么会犯,而且不是偶然
+
+在一个 note 一律为空的表里,**「空」本来就承载不了任何信息**,我却拿它
+当信息用了。这不是记性差,是数据结构逼着人做过度推断:当"有没有留下
+说明"和"做没做"在字段上无法区分时,人一定会挑一个当证据。
+
+所以 r34 修的是机制,不是那一条记录 —— 把 `confidence-risk` 的 note 改对
+只能擦掉一处擦痕。改动是 `finish` 增了 `note` 参数,成功路径由引擎自己
+写 provenance,格式 `done r33 · source=operator`,两个字段都能拿去和
+`state.json` 的 `history` 交叉核对:
+
+- 轮次 —— 对上 `record.round`
+- 断言来源 —— 对上 `record.completion_source`(`build_fn` / `operator` /
+  `signal_ack`)
+
+`build_fn` 和 `operator` 必须写得**不一样**,否则"谁断言的完成"这个信息
+等于没记,那就正好退回 r22 断掉的那一环。`tests/test_done_record_provenance.py`
+里那条 `test_build_fn_completion_is_tagged_differently` 就是这个反证。
+
+## 顺带查实的一件事:人写待办的 verify 机器判不了
+
+`Queue.verify_passes()` 把 verify 当命令跑(`bash -c`)。而 `backlog.md`
+里人写的 verify 大多是**散文**,不是命令。实测:
+
+```
+散文 verify 'docs/ 里有一节说明 confidence 决定…'   -> False
+命令 verify 'python3 -m pytest tests/test_…py'    -> True
+```
+
+散文 verify 恒为 False,于是人写待办的"做没做"**机器无法证伪** ——
+这正是上面那条假账能存活 12 轮的原因。已作为待办记进 `backlog.md`
+(id `verify`),验收是写出强制 verify 可执行的测试。
+
+## 同一个病,源码里也有一份:r32 的加锁吞掉了 5 个 docstring
+
+查上面那 5 个函数的 `__doc__` 时发现它们全是 `None`。原因是形状:
+
+```python
+def unmark(self, ...):
+    with self._locked("unmark", timeout):
+        """把误标的 done/dropped 改回 pending……"""
+        ...
+```
+
+docstring 不是函数体的第一句,于是它只是个**被求值后丢弃的字符串
+字面量**。源码里明明"有注释",`help(Queue.unmark)` 里却一个字都没有。
+
+来源是 r32:那轮给 `add` / `seed_if_empty` / `repair_duplicates` / `drop` /
+`unmark` 五个方法加锁,把 `with` 提到了函数体开头。加锁本身是对的,
+但它顺手把这五个方法的"为什么"全变成了不可见的 —— 而这五个恰好是
+整套循环里**最需要解释**的几个(为什么加锁、为什么 drop 必须带理由、
+为什么 unmark 只认唯一命中、为什么播种要分两层)。
+
+跟 r22 那条假账是同一个病:**看着记了,其实没记。**
+r34 把 docstring 移回函数体首行,并加了两条测试:一条用 AST 保证
+"`def` 后第一句是 `with`/`try` 时不得吞掉 docstring"(用 AST 而不是文本
+匹配 —— 这几轮已经踩过四次),一条钉住那五个方法的 docstring 不是空壳。
+
+## 写下来的规矩
+
+1. **引擎写的凭据必须自带 provenance,人不用记得写。** 靠人自觉补的字段
+   迟早是空的,而空字段会被下一个人当成证据。
+2. **拿一个字段的"缺失"当证据之前,先问:这个字段的缺失能推出什么。**
+   推不出就别推 —— r22 那条假账整个建立在一次过度推断上。
+3. **改对一条错记录不够,要看它为什么能错这么久。** 假账活过 12 轮,
+   说明缺的是"让假账活不下去"的机制,不是擦痕。
+4. **加了壳(锁/装饰器/上下文)要复查里面的话还算不算数。** r32 的
+   `with` 让 5 段"为什么"当场失效,而且没有任何报错 —— 编译器不介意
+   你把说明写在错误的位置。
+
 ---
 
 ## 8. 状态落盘（state.json）

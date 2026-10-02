@@ -410,13 +410,32 @@ class Queue:
             self.save(items)
             return True
 
-    def finish(self, item_id: str, ok: bool, owner: str = "",
+    def finish(self, item_id: str, ok: bool, owner: str = "", note: str = "",
                round_no: int | None = None,
                timeout: float = _LOCK_TIMEOUT) -> bool:
         """收尾:ok=True 标 done,False 退回 pending。带 owner 校验。
 
         带 owner 校验是关键:两个 agent 领了同一条(不该发生,但万一),
         后收的那个会发现 owner 不对,拒绝覆盖别人的结果。
+
+        ## r34:done 路径必须留 provenance
+
+        原来 `note` 压根没有这个参数,成功路径一个字都不写。于是
+        `devloop round` 标出来的每一条 done,`note` 都是空串 ——
+        **跟人手编的假账长得一模一样**。
+
+        代价已经付过了(r33 查实):r22 那条 `confidence-risk` 的 done
+        记录 note 为空,我把"note 为空"当成了"这活没做"的证据,
+        写下一条"我根本没做"的 note 把它 unmark 掉。而
+        `docs/CONFIDENCE_VS_RISK.md` **r22 就产出了**(commit 7c7cec3,
+        文档头自己写着"轮次:r22")—— 活是真做了,我据以指控的证据
+        恰好证明不了任何事。
+
+        失败路径一直有 note(`release` 传的是"gates failed: ..."),
+        只有成功路径是空的。这个不对称就是缺陷本身:出问题时看得到
+        依据,一切正常时反而什么都没有。
+
+        所以这里补上,并由调用方(protocol)传入"谁断言的完成"。
         """
         with self._locked("finish", timeout):
             items = self.load()
@@ -437,6 +456,8 @@ class Queue:
             if ok:
                 target.status = "done"
                 target.done_round = round_no
+                if note:
+                    target.note = (target.note + " | " if target.note else "") + note
             else:
                 target.status = "pending"
             target.owner = ""
@@ -686,8 +707,8 @@ class Queue:
 
     # ── 添加 ─────────────────────────────────────────────────────────────
     def add(self, item: Item, timeout: float = _LOCK_TIMEOUT) -> None:
+        """追加一条 pending item(若 id 已存在则替换原条目状态为 pending)。"""
         with self._locked("add", timeout):
-            """追加一条 pending item(若 id 已存在则替换原条目状态为 pending)。"""
             items = self.load()
             for i, ex in enumerate(items):
                 if ex.id == item.id:
@@ -736,33 +757,33 @@ class Queue:
 
     # ── 播种(核心:队列永远非空) ──────────────────────────────────────────
     def seed_if_empty(self, timeout: float = _LOCK_TIMEOUT) -> int:
+        """空了就播种。返回新增条数。
+
+        两级策略(优先级递减):
+            1. 读 devloop/backlog.md(人工长期待办清单,跳过已完成的)
+            2. 保底 3 条长期演进项(只提已经到期的)
+
+        旋转规则:补进来的 id 若与**任何**已有条目重名,一律加 -r{round}
+        后缀,保证 id 全局唯一。
+
+        ## 这里曾经有个能把队列彻底废掉的 bug
+
+        原实现传给旋转逻辑的是 `active_ids`(只含 pending/in_progress)。
+        而 docstring 写的是"若已存在且处于 done/dropped 则加后缀"——
+        文档说一回事,代码做另一回事。后果是:
+
+        队列里所有条目都 done 时 `active_ids` 是空集 → 旋转不触发
+        → 补进来一批**和已有条目完全同 id** 的新条目。
+
+        而 `mark_in_progress` / `mark_done` / `round()` 全都靠
+        `next(i for i in items if i.id == ...)` 按 id 定位,永远命中
+        **第一条**。于是引擎反复翻转那条早已 done 的记录,新补的条目
+        永远卡在 pending —— 循环原地空转,永远走不到下一步。
+
+        实测:真实队列被搞成 8 个 id 各出现两次,8 条全"活跃"。
+        所以这里传的是**全部**已有 id,不是活跃的。
+        """
         with self._locked("seed", timeout):
-            """空了就播种。返回新增条数。
-
-            两级策略(优先级递减):
-                1. 读 devloop/backlog.md(人工长期待办清单,跳过已完成的)
-                2. 保底 3 条长期演进项(只提已经到期的)
-
-            旋转规则:补进来的 id 若与**任何**已有条目重名,一律加 -r{round}
-            后缀,保证 id 全局唯一。
-
-            ## 这里曾经有个能把队列彻底废掉的 bug
-
-            原实现传给旋转逻辑的是 `active_ids`(只含 pending/in_progress)。
-            而 docstring 写的是"若已存在且处于 done/dropped 则加后缀"——
-            文档说一回事,代码做另一回事。后果是:
-
-            队列里所有条目都 done 时 `active_ids` 是空集 → 旋转不触发
-            → 补进来一批**和已有条目完全同 id** 的新条目。
-
-            而 `mark_in_progress` / `mark_done` / `round()` 全都靠
-            `next(i for i in items if i.id == ...)` 按 id 定位,永远命中
-            **第一条**。于是引擎反复翻转那条早已 done 的记录,新补的条目
-            永远卡在 pending —— 循环原地空转,永远走不到下一步。
-
-            实测:真实队列被搞成 8 个 id 各出现两次,8 条全"活跃"。
-            所以这里传的是**全部**已有 id,不是活跃的。
-            """
             items = self.load()
             # 注意:必须是全部 id,不是只有活跃的。见上方 docstring。
             existing_ids = {i.id for i in items}
@@ -836,26 +857,26 @@ class Queue:
         return out
 
     def repair_duplicates(self, timeout: float = _LOCK_TIMEOUT) -> int:
+        """修复重复 id。返回被删除的条目数。
+
+        ## 为什么需要它
+
+        重复 id 会让引擎的所有按 id 定位(`mark_in_progress` / `mark_done` /
+        `round()` 取待办)全部命中第一条记录,导致循环原地空转。
+        历史上 `seed_if_empty` 真的造出过这种队列(见该方法 docstring),
+        修好播种逻辑只能保证**将来**不再产生,已经写坏的文件仍需要修。
+
+        ## 保留哪一条
+
+        同一个 id 保留**进度最靠前**的那条:
+            in_progress > pending > done > dropped
+        进度靠前的说明引擎已经认可它在干活;同状态下保留 attempts 最大的
+        (重试次数多 = 引擎已经为它付出过更多),再并列时保留 id 字典序最小的
+        以保证结果确定(同样的输入永远得到同样的队列)。
+
+        调用方拿到的是被删条目的 id 列表,便于人工确认。
+        """
         with self._locked("repair", timeout):
-            """修复重复 id。返回被删除的条目数。
-
-            ## 为什么需要它
-
-            重复 id 会让引擎的所有按 id 定位(`mark_in_progress` / `mark_done` /
-            `round()` 取待办)全部命中第一条记录,导致循环原地空转。
-            历史上 `seed_if_empty` 真的造出过这种队列(见该方法 docstring),
-            修好播种逻辑只能保证**将来**不再产生,已经写坏的文件仍需要修。
-
-            ## 保留哪一条
-
-            同一个 id 保留**进度最靠前**的那条:
-                in_progress > pending > done > dropped
-            进度靠前的说明引擎已经认可它在干活;同状态下保留 attempts 最大的
-            (重试次数多 = 引擎已经为它付出过更多),再并列时保留 id 字典序最小的
-            以保证结果确定(同样的输入永远得到同样的队列)。
-
-            调用方拿到的是被删条目的 id 列表,便于人工确认。
-            """
             items = self.load()
             if not items:
                 return 0
@@ -904,30 +925,30 @@ class Queue:
         return {k: v for k, v in counts.items() if v > 1}
 
     def drop(self, item_id: str, reason: str, timeout: float = _LOCK_TIMEOUT) -> tuple[bool, str]:
+        """把一条待办标成 dropped。返回 (成功, 说明)。
+
+        ## 为什么需要这个操作
+
+        `unmark` 是反方向的:把误标的 done 改回 pending。
+        但还有第三种情况它处理不了 —— **这条待办本身就是假的**。
+
+        实测抓到过三种假活:
+        - 判据是没人拥有的魔法数字(「规则数补到 40」)
+        - 它的 verify 此刻就已经通过(「对齐 PROJECT_PLAN.md」,而文件在)
+        - 判据是常驻不变式,不是「这次工作做没做」(「季度依赖审计」
+          验的是 `dependencies == []`,而它本来就成立)
+
+        对这类条目,改回 pending 是错的 —— 它会再次变成队列头,
+        再次被选中,再次做不出任何东西。必须让它**消失**,而且要
+        **带上原因**,否则三个月后没人记得当初为什么删。
+
+        为什么不能直接改 queue.json:那会让"为什么丢弃"这一条信息
+        绕过 review。而丢弃原因恰恰是这件事里最值钱的部分 ——
+        它记录的是"我们试过这条路,它不成立"。
+
+        dropped 的 id 也在 `done_ids` 里,所以人工 backlog 不会把它捡回来。
+        """
         with self._locked("drop", timeout):
-            """把一条待办标成 dropped。返回 (成功, 说明)。
-
-            ## 为什么需要这个操作
-
-            `unmark` 是反方向的:把误标的 done 改回 pending。
-            但还有第三种情况它处理不了 —— **这条待办本身就是假的**。
-
-            实测抓到过三种假活:
-            - 判据是没人拥有的魔法数字(「规则数补到 40」)
-            - 它的 verify 此刻就已经通过(「对齐 PROJECT_PLAN.md」,而文件在)
-            - 判据是常驻不变式,不是「这次工作做没做」(「季度依赖审计」
-              验的是 `dependencies == []`,而它本来就成立)
-
-            对这类条目,改回 pending 是错的 —— 它会再次变成队列头,
-            再次被选中,再次做不出任何东西。必须让它**消失**,而且要
-            **带上原因**,否则三个月后没人记得当初为什么删。
-
-            为什么不能直接改 queue.json:那会让"为什么丢弃"这一条信息
-            绕过 review。而丢弃原因恰恰是这件事里最值钱的部分 ——
-            它记录的是"我们试过这条路,它不成立"。
-
-            dropped 的 id 也在 `done_ids` 里,所以人工 backlog 不会把它捡回来。
-            """
             items = self.load()
             matches = [it for it in items if it.id == item_id]
             if not matches:
@@ -956,20 +977,20 @@ class Queue:
             return True, f"{item_id}: {old} -> dropped"
 
     def unmark(self, item_id: str, reason: str = "", timeout: float = _LOCK_TIMEOUT) -> tuple[bool, str]:
+        """把误标的 done/dropped 改回 pending。返回 (成功, 说明)。
+
+        ## 为什么需要这个操作
+
+        引擎在没有 build_fn 时无法知道执行者到底做了什么,
+        门禁一绿就把队首标成 done。于是"这一轮其实没做那件事"会被
+        记成已完成 —— 队列和现实对不上,后面每轮都建在假记录上。
+
+        有了它,纠正记录是一等操作,不用手改 queue.json。
+
+        只认 id **唯一命中**的那条。有重复 id 时直接拒绝并提示先 repair,
+        因为那时"改哪一条"是歧义的,猜错等于把记录改得更乱。
+        """
         with self._locked("unmark", timeout):
-            """把误标的 done/dropped 改回 pending。返回 (成功, 说明)。
-
-            ## 为什么需要这个操作
-
-            引擎在没有 build_fn 时无法知道执行者到底做了什么,
-            门禁一绿就把队首标成 done。于是"这一轮其实没做那件事"会被
-            记成已完成 —— 队列和现实对不上,后面每轮都建在假记录上。
-
-            有了它,纠正记录是一等操作,不用手改 queue.json。
-
-            只认 id **唯一命中**的那条。有重复 id 时直接拒绝并提示先 repair,
-            因为那时"改哪一条"是歧义的,猜错等于把记录改得更乱。
-            """
             items = self.load()
             matches = [it for it in items if it.id == item_id]
             if not matches:

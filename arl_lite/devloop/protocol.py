@@ -588,7 +588,13 @@ class Loop:
                 record.result = RESULT_DONE
                 # r31:带锁的收尾入口,顺带清掉 owner/claimed_at。
                 # 原来在裸 items 上 mark_done 完再 q.save(items) 整份写回。
-                q.finish(item.id, ok=True, round_no=state.round + 1)
+                # r34:把"谁断言的完成"也写进队列记录。state.json 里的
+                # completion_source 只覆盖最近几轮,队列里这条 done 却是
+                # 长期留存的审计凭据 —— 它空着,就分不出引擎写的和
+                # 人手编的假账(r33 在 confidence-risk 上栽的就是这个)。
+                q.finish(item.id, ok=True, round_no=state.round + 1,
+                         note=f"done r{state.round + 1} · "
+                              f"source={record.completion_source}")
                 done_delta = 1
             else:
                 # 门禁没过 = 失败,如实记录(不退回去假装没事)
