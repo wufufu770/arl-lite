@@ -186,14 +186,99 @@ confidence = base_prior × signal_factor × cross_evidence × temporal_consisten
 | 门禁 | 阈值 | 触发后默认动作 |
 |---|---|---|
 | G1 | 任意非空 import | 立即 REVERT 本轮全部改动（不动 BUILD）；记入 RETREAT 计数 |
-| G2 | fail_count 增加 ≥ 1 | REVERT + 重新写一个最小失败用例 |
+| G2 | fail_count 比 baseline 增加 ≥ 1 | REVERT + 重新写一个最小失败用例 |
 | G3 | 检测到环 | REVERT 该次重构 |
-| G4 | > 18,000 行 | 暂停 BUILD,先进 IMPROVE 阶段瘦身 |
+| G4 | `arl_lite/` 超过 baseline + 300 行 | 本轮记 `DONE_WITH_FAILURES`；见 5.5 的显式提升流程 |
 | G5 | 任意规则缺 advice | REVERT 该规则的提交 |
 | G6 | 任意 title 变量未 `_sanitize` | REVERT 该 prompt 修改 |
-| G7 | last_doc_audit_round 差 > 5 | 仅记告警,不阻断 |
+| G7 | 文档引用了实际未使用的依赖 | 仅记告警,不阻断 |
 
-> **为什么 loc_budget 是 18,000 而不是 20,000**:当前 13,466 行,留 4,500 行缓冲约等于 30% 增量。超过即触发瘦身而非继续放任。
+> **G4 为什么是「baseline + 容差」而不是一个绝对数字**:绝对行数(早期版本写的 18,000)
+> 会把「仓库整体大小」和「本轮增量」混为一谈。前者由项目成熟度决定,后者才是迭代纪律
+> 该管的东西。用 baseline 做地板、给固定容差,衡量的才是「这轮你到底写多了」。
+>
+> **协议自身也在这把尺子下**:`devloop/` 有独立红线 3,200 行(硬编码,不可提升)。
+> 它一旦比被它守护的代码涨得还快,就本末倒置了。
+
+### 5.5 Baseline 提升:门禁失败的第一类解法
+
+#### 死路是怎么形成的
+
+G4 这类门禁拿**版本库里的 baseline** 当参照。一旦某轮真的做完了实打实的新功能
+(实例:第 5 轮新增 TLS 证书采集,净增 540 行),G4 必红。此时操作者只有两条路,
+两条都不好:
+
+| 路径 | 问题 |
+|---|---|
+| 手改 `devloop/baselines.json` | 历史里看不见是谁、何时、因为什么放宽的。与「偷偷放宽」只有操作习惯上的区别,没有机制上的区别。 |
+| 硬拆模块把行数压回去 | 为了凑一个数字去扭曲代码结构,让门禁反过来支配设计。 |
+
+第一条直接违反协议自己的不变式(门禁失败必须可见),第二条让门禁变质。
+**两条都会让循环卡死或变质,而「永远有下一步」是本协议的第一目标。**
+
+#### 三条硬规则
+
+提升是一等操作,不是改配置文件:
+
+```bash
+arl-lite devloop accept <gate> --reason "为什么可以放宽"
+arl-lite devloop promotions          # 看提升历史
+```
+
+1. **门禁必须正在失败** —— 已经绿的门禁不接受提升。
+   这一条堵住「提前买预算」:否则操作者可以在每轮开始前先抬高阈值,门禁从此形同虚设。
+2. **必须给理由,最少 10 字符** —— 没有理由的放宽就是偷偷放宽。
+3. **只升不降,且只升 gate 自己点头的字段** —— 由 `Gate.promotable` /
+   `Gate.promotable_fields` 逐个 opt-in,默认 `False`。
+
+#### 哪些门禁可以被提升
+
+| 门禁 | promotable | 可提升字段 | 理由 |
+|---|---|---|---|
+| `loc_budget` | ✅ | `total_loc` | 代码量预算本就是「随功能增长显式上移」的闸门 |
+| `no_thirdparty_import` | ❌ | — | 恒为 0 的红线。把「当前有 5 处三方 import」写成新基准 = 把 bug 追认为正常 |
+| `no_import_cycle` | ❌ | — | 同上 |
+| `test_baseline` | ❌ | — | 抬高 allowed `failed` 数正是「偷偷放宽」的经典形态 |
+| 其余 | ❌ | — | 安全的默认值:新加门禁忘了写 `promotable`,默认就是不可提升 |
+
+`loc_budget` 的 `devloop_loc`(协议自身红线)**不在白名单里**,不能被
+`total_loc` 的提升顺带捎上。
+
+#### 留痕写进版本库,不是只落本地
+
+提升记录追加到 `baselines.json` 的 `_promotions` 列表:
+
+```json
+"_promotions": [
+  {
+    "at": "2026-10-02T12:26:18",
+    "changes": { "total_loc": { "from": 12246, "to": 12786 } },
+    "gate": "loc_budget",
+    "reason": "第5轮新增 TLS 证书采集(...),净增 540 行属实打实的新功能,不是膨胀",
+    "round": 5
+  }
+]
+```
+
+**为什么不写进 `state.json`**:那份文件每机一份、被 `.gitignore` 排除,
+那里的痕迹没有任何人 review 得到。写进 `baselines.json` 意味着每一条放宽
+都会出现在 `git diff` 和 code review 里。
+
+历史保留最近 50 条(只增不删)。只增不删是刻意的:能删掉旧记录的功能等于没有留痕。
+
+#### 反向验证
+
+`tests/test_devloop_accept.py` 的重点不是「accept 能用」,而是「该拒的全都拒了」。
+17 个用例里 8 条是证伪用例:无理由、理由太短、门禁已绿、门禁不可提升、
+字段不在白名单、数值变小、bool 冒充数字、`_promotions` 被误当门禁。
+
+外加一条**变异测试**:把 accept 源码里的理由校验块整段删掉生成变异体,
+断言变异体确实放行了无理由提升。
+
+> 变异测试第一次只删「reason is required」那一行时,变异体**没有**放行——
+> 因为紧跟着的「reason too short」把空串也拦了。这说明必填检查单独看是冗余的,
+> 真正兜底的是长度检查。两道都留着是因为报错信息不同(「没给理由」vs「理由太短」),
+> 但变异必须覆盖整个块,否则测的就不是约束本身。
 
 ---
 
@@ -421,25 +506,44 @@ def save_state(state: dict, path: str) -> None:
 
 | 文件 | 作用 |
 |---|---|
-| `devloop/state.json` | 协议状态（每轮落盘） |
+| `devloop/baselines.json` | 门禁基准 + `_promotions` 提升留痕(进版本库) |
 | `devloop/backlog.md` | 人工维护的任务清单 |
-| `devloop/seed_long_horizon.json` | L3 长期演进项 |
-| `tools/devloop.py` | 协议入口 CLI（计划中,本轮不实现） |
+| `devloop/queue.json` | 运行时队列(每机一份,已 gitignore) |
+| `arl_lite/devloop/` | 协议实现:state / protocol / gates / queue / accept / cli |
 | `docs/devloop-protocol.md` | 本文档 |
 
 ### 11.3 命令速查
 
+全部挂在主 CLI 下,`python3 -m arl_lite` 等价于安装后的 `arl-lite`:
+
 | 命令 | 作用 |
 |---|---|
-| `make test` | 跑全部 9 套测试 |
-| `python3 -m devloop status` | 打印当前轮次、阶段、门禁状态（计划中） |
-| `python3 -m devloop retreat` | 手动触发 R1 退路（计划中） |
+| `arl-lite devloop status` | 当前轮次/阶段/门禁累计/队列统计/队首待办 |
+| `arl-lite devloop test` | 只跑全部门禁,不记轮次(改完先验一下) |
+| `arl-lite devloop test --gates loc_budget,test_baseline` | 只跑指定门禁 |
+| `arl-lite devloop round` | 跑一整轮并落盘;门禁红则记 `DONE_WITH_FAILURES`,退出码 3 |
+| `arl-lite devloop plan` | 只做规划,看下一步 |
+| `arl-lite devloop history -n 10` | 最近 N 轮的通过/失败明细 |
+| `arl-lite devloop add <id> "标题" -p 2` | 手动加待办 |
+| `arl-lite devloop gate <name>` | 跑单个门禁并打印实测值 |
+| `arl-lite devloop accept <name> --reason "..."` | 门禁红了且确认可放宽时,显式提升 baseline(见 5.5) |
+| `arl-lite devloop promotions` | 看 baseline 提升历史(来自 `_promotions`) |
+
+门禁也可以脱离主 CLI 单独跑:
+
+```bash
+python3 -m arl_lite.devloop.gates               # 全跑
+python3 -m arl_lite.devloop.gates no_import_cycle   # 单跑
+```
 
 ### 11.4 协议变更记录
 
 | 日期 | 变更 |
 |---|---|
 | 2026-10-02 | 初版,基于 AtlasX/ARL/SpiderFoot 源码直读 + 项目已知问题清单 |
+| 2026-10-02 | 协议落地为 `arl_lite/devloop/`(state/protocol/gates/queue/cli),纯 stdlib |
+| 2026-10-02 | 修正 5.4:G4 阈值由「18,000 行绝对值」改为「baseline + 300 容差」——绝对值把仓库体量与单轮增量混为一谈 |
+| 2026-10-02 | 新增 5.5:baseline 提升流程(`devloop accept`),解决 G4 失败后的死路 |
 
 ---
 

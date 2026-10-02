@@ -9,6 +9,8 @@
     arl-lite devloop history         看最近几轮
     arl-lite devloop add <id> <title> 手动加待办
     arl-lite devloop gate <name>     跑单个门禁
+    arl-lite devloop accept <name> --reason "..."  显式提升 baseline
+    arl-lite devloop promotions      看 baseline 提升历史
 
 设计:所有子命令都不需要预先初始化,首次调用自动建目录和文件。
 循环必须自持——没有"先手动 setup 一步"这种事。
@@ -46,6 +48,10 @@ def cmd_devloop(args) -> int:
         return _cmd_add(args)
     if sub == "gate":
         return _cmd_gate(args)
+    if sub == "accept":
+        return _cmd_accept(args)
+    if sub == "promotions":
+        return _cmd_promotions(args)
     print("[!] unknown devloop subcommand; use --help", file=sys.stderr)
     return 2
 
@@ -136,6 +142,34 @@ def _cmd_gate(args) -> int:
     return 0 if r.passed else 1
 
 
+def _cmd_accept(args) -> int:
+    from . import accept as _accept
+    r = _accept.accept_baseline(
+        _repo_root(), args.gate_name, getattr(args, "reason", "") or ""
+    )
+    print(r.summary())
+    if r.ok:
+        # 立刻复跑,让人看到门禁真的绿了,而不是"我们说它绿了"
+        from . import gates
+        g = gates.get_gate(args.gate_name)
+        res = g.run(_repo_root())
+        mark = "OK" if res.passed else "FAIL"
+        print(f"  recheck  : {mark:4} {res.name}: {res.detail}")
+    return 0 if r.ok else 1
+
+
+def _cmd_promotions(args) -> int:
+    from . import accept as _accept
+    print(f"baseline promotions in {gates_path_str()}\n")
+    print(_accept.format_history(_repo_root()))
+    return 0
+
+
+def gates_path_str() -> str:
+    from . import gates
+    return str(gates.baseline_path(_repo_root()))
+
+
 def add_devloop_parser(sub) -> None:
     """注册 `arl-lite devloop ...` 子命令树"""
     p = sub.add_parser(
@@ -167,5 +201,19 @@ def add_devloop_parser(sub) -> None:
 
     pg = dsub.add_parser("gate", help="跑单个门禁")
     pg.add_argument("gate_name")
+
+    # accept 是唯一能让红门禁变绿的命令,签名跟 gate 对齐,
+    # 免得操作者记混
+    pa2 = dsub.add_parser(
+        "accept",
+        help="门禁红了且确认可以放宽时,显式提升 baseline(必须给理由)",
+    )
+    pa2.add_argument("gate_name")
+    pa2.add_argument(
+        "--reason", required=True,
+        help="为什么可以放宽。会写进 baselines.json,进版本库、进 code review。",
+    )
+
+    dsub.add_parser("promotions", help="看 baseline 提升历史")
 
     p.set_defaults(func=cmd_devloop)

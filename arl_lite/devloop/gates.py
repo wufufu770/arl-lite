@@ -75,6 +75,15 @@ class Gate(Protocol):
     name: str
     blocking: bool
 
+    # 是否允许用 `devloop accept` 提升它的 baseline。
+    # 默认 False——"能不能被显式放宽"必须由 gate 自己逐个点头,
+    # 不能默认全开。恒为 0 的红线(no_thirdparty_import / no_import_cycle)
+    # 永远不该被提升:把"当前有 5 处三方 import"写成新基准,
+    # 等于把 bug 追认为正常状态。
+    promotable: bool = False
+    # 允许被提升的字段名。dict 型 baseline 用;标量 gate 留空即可。
+    promotable_fields: tuple = ()
+
     def run(self, repo: Path) -> GateResult:
         """执行检查,返回 GateResult
 
@@ -542,6 +551,11 @@ class LocBudgetGate:
 
     name = "loc_budget"
     blocking = True
+    # 代码量预算本身就是"随功能增长而显式上移"的闸门,
+    # 提升它是协议设计内的动作(比如一轮做完了 TLS 采集这种实打实的新功能)。
+    # 只放开 total_loc;devloop_loc 是协议自身的红线,不接受提升。
+    promotable = True
+    promotable_fields = ("total_loc",)
 
     def run(self, repo: Path) -> GateResult:
         arl_root = repo / "arl_lite"
