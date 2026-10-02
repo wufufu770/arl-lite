@@ -195,6 +195,17 @@ def test_claimed_item_carries_owner_while_in_progress(tmp_path):
     )
     assert seen["claimed_at"] > 0, "claimed_at 没记,同样判断不了死活"
 
+    # r31 漏掉的那条(r33 补上):格式对了不等于认得出来。
+    # _OWNER_PID 是 (?:#|^pid-)(\d+)$ —— `^pid-` 锚在字符串开头,所以
+    # "round-pid-12345" **解析不出 pid**,recover_stale 照样只能按时间猜。
+    # r31 的测试只断言 owner 非空且以 round-pid- 开头,没验这条,于是
+    # "owner 记上了"被当成了"认领者探测得出来"。存在检查冒充行为检查。
+    from arl_lite.devloop.queue import Queue as _Q
+    assert _Q.owner_pid(seen["owner"]) is not None, (
+        f"owner 记成了 {seen['owner']!r},但 owner_pid() 解析不出 pid —— "
+        f"recover_stale 依然只能按认领时长猜,这跟 r31 修之前没区别"
+    )
+
 
 # =====================================================================
 # 并发:两个 round 不能领到同一条

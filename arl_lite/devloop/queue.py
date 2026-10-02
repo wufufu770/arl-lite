@@ -383,7 +383,7 @@ class Queue:
             if cand is None:
                 return None
             cand.status = "in_progress"
-            cand.owner = owner or f"pid-{os.getpid()}"
+            cand.owner = self._owner_with_pid(owner)
             cand.claimed_at = time.time()
             cand.attempts = int(cand.attempts or 0) + 1
             self.save(items)
@@ -423,7 +423,12 @@ class Queue:
             target = next((i for i in items if i.id == item_id), None)
             if target is None:
                 return False
-            if owner and target.owner and target.owner != owner:
+            # r33:claim 现在保证 owner 带 pid,而 claim/finish 两侧传的
+            # owner 可能只有名字("agent-x")。不规范化的话,claim 写的是
+            # "agent-x#123"、finish 校验的是 "agent-x",精确比较必然不等,
+            # 于是**每一次 finish 都会被自己的 owner 校验拒掉**。
+            norm_owner = self._owner_with_pid(owner) if owner else ""
+            if norm_owner and target.owner and target.owner != norm_owner:
                 log.warning(
                     "queue.finish: %s 的 owner 是 %r,与提交方 %r 不符,拒绝覆盖",
                     item_id, target.owner, owner,
@@ -467,8 +472,31 @@ class Queue:
     #   2. 认领了多久(软信号,兜底)
     # 详见 `is_stale_claim`。
 
-    # pid 出现在 owner 串末尾:CLI 默认名是 `agent#1234`,内部兜底是 `pid-1234`
-    _OWNER_PID = re.compile(r"(?:#|^pid-)(\d+)$")
+    # pid 出现在 owner 串末尾:CLI 默认名是 `agent#1234`,内部兜底是 `pid-1234`。
+    #
+    # r33:`-pid-` 这一支是给 `round-pid-1234` 用的。原来只有 `#` 和
+    # `^pid-`,而 `^` 锚在**字符串开头**,所以 r31 给 round 认领加的
+    # `round-pid-<pid>` 解析不出 pid —— owner 确实记上了,`owner_alive`
+    # 却照样返回 None,recover_stale 仍只能按认领时长猜。
+    # r31 的测试只断言 owner 非空且以 `round-pid-` 开头,没验这条,
+    # 于是"记上了"被当成了"探测得出来"(存在检查冒充行为检查)。
+    _OWNER_PID = re.compile(r"(?:#|^pid-|-pid-)(\d+)$")
+
+    @classmethod
+    def _owner_with_pid(cls, owner: str) -> str:
+        """保证 owner 里带 pid —— recover_stale 的整套机制全靠它
+
+        传了不含 pid 的标识(比如 `--owner r33-agent`)时补成
+        `r33-agent#<pid>`。不补的后果不是报错,而是**静默退化**:
+        owner_alive 返回 None,一条死掉的认领会一直占着 in_progress
+        直到 STALE_CLAIM_SEC 超时才被复位,而不是立刻。
+        """
+        owner = (owner or "").strip()
+        if not owner:
+            return f"pid-{os.getpid()}"
+        if cls.owner_pid(owner) is not None:
+            return owner
+        return f"{owner}#{os.getpid()}"
 
     @classmethod
     def owner_pid(cls, owner: str) -> int | None:

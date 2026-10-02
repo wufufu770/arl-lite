@@ -175,11 +175,15 @@ def test_claim_persists_the_owner(q):
     于是写进去能读到就没了 —— 认领记录等于没有。
     """
     got = q.claim(owner="agent-x")
-    assert got is not None and got.owner == "agent-x"
+    # r33:claim 会补 pid,所以 owner 是 "agent-x#<pid>"。断言要按
+    # 规范化后的值比,而不是字面量 —— 否则一改行为就红,红的原因
+    # 还会掩盖真正的问题。
+    want = Queue(q.path)._owner_with_pid("agent-x")
+    assert got is not None and got.owner == want
     reloaded = {i.id: i for i in q.load()}
     assert reloaded[got.id].status == "in_progress"
-    assert reloaded[got.id].owner == "agent-x", "owner 没落盘"
-    assert q.claimed_by() == {got.id: "agent-x"}
+    assert reloaded[got.id].owner == want, "owner 没落盘"
+    assert q.claimed_by() == {got.id: want}
 
 
 def test_claim_does_not_double_count_attempts(q):
@@ -212,7 +216,7 @@ def test_reclaiming_a_claimed_item_bumps_attempts(q):
     assert again.attempts == 2
     # owner 换成后一个 —— 认领可以被顶替,但次数不能丢
     reloaded = {i.id: i for i in q.load()}
-    assert reloaded[it.id].owner == "b"
+    assert reloaded[it.id].owner == Queue(q.path)._owner_with_pid("b")
     assert reloaded[it.id].attempts == 2
 
 
@@ -260,7 +264,7 @@ def test_finish_refuses_to_overwrite_another_owner(q):
     assert q.finish(it.id, ok=True, owner="agent-b") is False
     reloaded = {i.id: i for i in q.load()}
     assert reloaded[it.id].status == "in_progress", "被覆盖了"
-    assert reloaded[it.id].owner == "agent-a"
+    assert reloaded[it.id].owner == Queue(q.path)._owner_with_pid("agent-a")
 
 
 def test_release_returns_the_claim(q):
@@ -623,3 +627,51 @@ def _definitely_dead_pid() -> int:
     alive = Queue.owner_alive(f"x#{pid}")
     assert alive is False, f"pid {pid} 居然还活着,测不出死亡分支"
     return pid
+
+
+# =====================================================================
+# r33:owner 里必须带一个「认领者探测得出来」的 pid
+# =====================================================================
+
+
+def test_claim_always_stores_an_owner_with_a_parsable_pid(q):
+    """传不含 pid 的 owner 也要补上 —— 不补是**静默**退化
+
+    owner_alive 解析不出 pid 时返回 None,于是 recover_stale 只能靠
+    "认领多久了"猜:一条早就死掉的认领会一直占着 in_progress,直到
+    STALE_CLAIM_SEC 超时才复位,而不是立刻。
+    """
+    got = q.claim(owner="no-pid-here")
+    assert got is not None
+    assert Queue.owner_pid(got.owner) is not None, (
+        f"owner 记成了 {got.owner!r},解析不出 pid —— "
+        f"recover_stale 会退化成按认领时长猜,而这里不报错、不告警"
+    )
+    assert got.owner.startswith("no-pid-here"), "不该把用户写的标识改掉"
+
+
+def test_owner_pid_parses_every_format_claim_can_produce():
+    """`round-pid-<pid>` 是 r31 加的,当时解析不出来(r33 才修好)
+
+    原来正则是 (?:#|^pid-)(\\d+)$,`^` 锚在字符串开头,所以
+    `round-pid-12345` 解析不出 pid —— owner 确实记上了,recover_stale
+    照样只能猜。r31 的测试只断言"owner 非空且以 round-pid- 开头",
+    那是**存在检查**,不是行为检查。
+    """
+    import os
+    me = os.getpid()
+    for s in (f"round-pid-{me}", f"pid-{me}", f"agent#{me}", f"a-b-pid-{me}"):
+        assert Queue.owner_pid(s) == me, f"{s!r} 解析不出 pid"
+
+
+def test_finish_accepts_the_bare_name_when_the_stored_owner_has_a_pid(q):
+    """两侧都规范化 —— 否则 claim 写 "a#123"、finish 验 "a",必然被拒
+
+    这不是理论问题:r33 改完 claim 之后,`finish(owner="a")` 如果不做
+    规范化,会被**自己的 owner 校验**拒掉,于是每一轮收尾都失败。
+    """
+    it = q.claim(owner="a")
+    assert it is not None
+    assert q.finish(it.id, ok=True, owner="a", round_no=7) is True, (
+        "claim 存了带 pid 的 owner,finish 传裸名就被拒 —— 两侧没规范化"
+    )
