@@ -226,17 +226,21 @@ class Loop:
         )
 
     def phase_plan(self, state: LoopState) -> StepResult:
-        """PLAN:确保队列永远有下一步。"""
+        """PLAN:确保队列永远有下一步。
+
+        注意 in_progress 也算"有下一步"—— 当前正在处理的那条就是下一步。
+        (历史上这里只看 pending,导致 has_pending=True 但 nxt=None 的
+        自相矛盾,报出 "queue has no pending item")
+        """
         self.store.set_phase(state, PHASE_PLAN)
         q = self.queue_mod.Queue(self.dev_dir / "queue.json")
         items = q.load()
         # 用同一实例的 items 判断,避免 load/seed 之间的对象分裂
-        has_pending = any(i.status in ("pending", "in_progress") for i in items)
-        if not has_pending:
+        active = [i for i in items if i.status in ("pending", "in_progress")]
+        if not active:
             before = len(items)
-            q.seed_if_empty()
+            added = q.seed_if_empty()
             items = q.load()
-            added = len(items) - before
             if added <= 0:
                 return StepResult(
                     PHASE_PLAN, False,
@@ -246,11 +250,46 @@ class Loop:
             state.current_note = f"seeded {added} new item(s)"
             q.save(items)
             return StepResult(PHASE_PLAN, True, f"queue exhausted, seeded {added} new item(s)")
-        nxt = next((i for i in items if i.status == "pending"), None)
+        nxt = active[0]
         return StepResult(
-            PHASE_PLAN, nxt is not None,
-            f"next: {nxt.id} — {nxt.title}" if nxt else "queue has no pending item",
+            PHASE_PLAN, True,
+            f"next: {nxt.id} — {nxt.title} [{nxt.status}]",
         )
+
+    def ensure_next_step(self, state: LoopState) -> tuple[int, str]:
+        """整轮**结束后**再查一次:队列耗尽就立刻播种。
+
+        ## 为什么必须有这一步(而不是只靠 phase_plan)
+
+        `round()` 的阶段顺序是
+            取待办 → BUILD → TEST → IMPROVE → PLAN → 更新队列状态
+
+        PLAN 跑在"更新队列"**之前**。那一刻当前条目还是 in_progress,
+        于是 phase_plan 认为"还有活干"不播种;紧接着引擎把它标成 done,
+        队列就彻底空了 —— 而且**再没有任何代码路径会回来播种**。
+
+        第 9 轮真实撞上了这个:队列只剩一条,跑完变成 0 pending / 8 done,
+        循环没有下一步了。不变式 #4「队列耗尽自动播种,永远有下一步」被打破。
+
+        修法是让"永远有下一步"成为整轮的**后置条件**而不是轮中途的一次猜测:
+        不管中途发生了什么,轮次结束时队列必须非空。
+
+        Returns:
+            (新增条数, 描述)
+        """
+        q = self.queue_mod.Queue(self.dev_dir / "queue.json")
+        items = q.load()
+        if any(i.status in ("pending", "in_progress") for i in items):
+            return 0, ""
+        added = q.seed_if_empty()
+        if added <= 0:
+            return 0, (
+                "queue exhausted and seeding produced nothing — "
+                "the protocol has no next step; add items to devloop/backlog.md"
+            )
+        state.current_note = f"seeded {added} new item(s) after round"
+        self.store.save(state)
+        return added, f"seeded {added} new item(s) after round"
 
     def phase_retreat(self, state: LoopState) -> StepResult:
         """RETREAT:连续 barren 后的退路。
@@ -366,6 +405,14 @@ class Loop:
                     target.status = "pending"
                     target.note = f"gates failed: {', '.join(record.blocking_failures)}"
             q.save(items)
+
+        # 6.5 不变式 #4 的后置条件:轮次结束时队列必须还有下一步。
+        #     PLAN 跑在队列更新之前,只看它会漏掉"本轮刚好把最后一条做掉"
+        #     的情况(第 9 轮真实踩过)。
+        added, note = self.ensure_next_step(state)
+        if note:
+            messages.append(note)
+            record.note = (record.note + " | " if record.note else "") + note
 
         # 7. 落盘
         #    注意:这里要在 save 之后取,否则拿到的还是 save 前的快照

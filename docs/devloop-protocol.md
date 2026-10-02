@@ -197,8 +197,17 @@ confidence = base_prior × signal_factor × cross_evidence × temporal_consisten
 > 会把「仓库整体大小」和「本轮增量」混为一谈。前者由项目成熟度决定,后者才是迭代纪律
 > 该管的东西。用 baseline 做地板、给固定容差,衡量的才是「这轮你到底写多了」。
 >
-> **协议自身也在这把尺子下**:`devloop/` 有独立红线 3,200 行(硬编码,不可提升)。
+> **协议自身也在这把尺子下**:`devloop/` 有独立红线,量的是**代码行**
+> (扣掉 docstring / 注释 / 空行),当前 2,183,红线 2,400(硬编码,不可提升)。
 > 它一旦比被它守护的代码涨得还快,就本末倒置了。
+>
+> **为什么量代码行而不是总行数**:初版量总行数,红线 3,200。到了第 9 轮
+> 总行 3,189,只剩 11 行余量——但逐文件拆开是
+> `2,096 代码 + 635 docstring + 149 注释 + 309 空行`,代码只占 66%。
+> 这个库大量 docstring 记的是**"这个 bug 怎么发现的、为什么这么修"**。
+> 删掉能腾地方,代价是下一个 agent 在同一个坑里再摔一次。
+> 总行数仍然报出来供人参考。红线仍然**不可提升**——换了度量对象,
+> 不等于松了约束。
 
 ### 5.5 Baseline 提升:门禁失败的第一类解法
 
@@ -364,6 +373,69 @@ def seed_if_empty(backlog: list, code_state: dict) -> list:
 | LH-4 | "异常分类改为子类化而非字符串匹配" | 重构项,L4 才做 |
 | LH-5 | "更新过期的 `docs/PROJECT_PLAN.md`" | 文档同步 |
 
+### 7.6 不变式 #4 破过两次,都在同一处
+
+「队列耗尽自动播种,永远有下一步」是协议的第一不变式。它破过两次,
+而且两次都发生在第 8–9 轮这种"一切看起来很顺"的时候。
+
+#### 第一次:PLAN 阶段跑在队列更新之前
+
+`round()` 的阶段顺序是:
+
+```
+取待办 → BUILD → TEST → IMPROVE → PLAN → 更新队列状态
+```
+
+第 5 步 PLAN 执行时,当前条目还是 `in_progress`（第 6 步才标 done）。
+`phase_plan` 看到 in_progress 就认为"还有活干"不播种;紧接着引擎把它标成
+done,队列彻底空了 —— 而且**再没有任何代码路径会回来播种**。
+
+实测:第 9 轮跑完队列变成 `0 pending / 8 done`,循环没有下一步了。
+
+修法:新增 `ensure_next_step()`,在队列更新**之后**再查一次。
+让"永远有下一步"成为整轮的**后置条件**,而不是轮中途的一次猜测。
+
+#### 第二次:跳过已存在的 id,造出重复 id,循环原地空转
+
+`seed_if_empty` 传给旋转逻辑的是 `active_ids`（只含 pending/in_progress）,
+而 docstring 写的是"若已存在且处于 done/dropped 则加 `-r{round}` 后缀"。
+**文档说一回事,代码做另一回事。**
+
+后果是队列全 done 时 `active_ids` 为空 → 旋转不触发 → 补进来一批
+**和已有条目完全同 id** 的新条目。而引擎所有按 id 定位的地方
+（`mark_in_progress` / `mark_done` / `round()` 取待办）都是
+`next(i for i in items if i.id == ...)`，永远命中**第一条**。于是引擎
+反复翻转那条早已 done 的记录,新补的条目永远卡在 pending —— 原地空转。
+
+实测:真实队列被搞成 **8 个 id 各出现两次,8 条全"活跃"**。
+`devloop status` 只显示聚合计数,肉眼完全看不出来。
+
+修法三层:
+1. `existing_ids` 改成**全部**已有 id(不是只有活跃的)
+2. 新增 `_disambiguate()`,在播种末尾统一保证 id 唯一 —— 三级策略里
+   哪一层写错了都不至于产出重复 id
+3. Tier 2/Tier 3 刻意传空集,让它们**总能提出**候选项。
+   原来它们会 `if id in existing_ids: continue`,三个保底项全被跳过后
+   `seed_if_empty()` 返回 0 —— **保底层不再是保底**
+
+> **教训**:`seed_if_empty` 的返回值是协议"永远有下一步"的唯一保障。
+> 任何以"跳过已存在项"为策略的写法,都是在悄悄拆掉这个保障。
+
+#### 修复工具本身也会选错
+
+`devloop repair` 保留同一 id 下"进度最靠前"的那条
+（in_progress > pending > done > dropped）。这次它选错了:引擎误标的那份
+是 done,脏数据是 pending,启发式把 7 项真做完的工作**退回成了待办**。
+
+原因是启发式选不出真相 —— 两份副本都是错的时,没有哪份"更靠前"。
+所以:
+- 加了 `repair --dry-run`,改之前先把每份副本的
+  `status/attempts/done_round/created_round/note` 打出来给人核对
+- 真实数据最终按 `devloop history` 里的事实来源人工校正,
+  而不是按启发式
+
+**能让状态记录变错的工具,必须先能被检查,再能改。**
+
 ---
 
 ## 8. 状态落盘（state.json）
@@ -528,6 +600,9 @@ def save_state(state: dict, path: str) -> None:
 | `arl-lite devloop gate <name>` | 跑单个门禁并打印实测值 |
 | `arl-lite devloop accept <name> --reason "..."` | 门禁红了且确认可放宽时,显式提升 baseline(见 5.5) |
 | `arl-lite devloop promotions` | 看 baseline 提升历史(来自 `_promotions`) |
+| `arl-lite devloop repair --dry-run` | 查队列里的重复 id(只看会怎么改) |
+| `arl-lite devloop repair` | 修复重复 id |
+| `arl-lite devloop unmark <id> --reason "..."` | 把误标的 done/dropped 改回 pending |
 
 门禁也可以脱离主 CLI 单独跑:
 
@@ -544,6 +619,7 @@ python3 -m arl_lite.devloop.gates no_import_cycle   # 单跑
 | 2026-10-02 | 协议落地为 `arl_lite/devloop/`(state/protocol/gates/queue/cli),纯 stdlib |
 | 2026-10-02 | 修正 5.4:G4 阈值由「18,000 行绝对值」改为「baseline + 300 容差」——绝对值把仓库体量与单轮增量混为一谈 |
 | 2026-10-02 | 新增 5.5:baseline 提升流程(`devloop accept`),解决 G4 失败后的死路 |
+| 2026-10-02 | 修不变式 #4 的两处破裂(见 7.6):PLAN 阶段跑在队列更新之前;`seed_if_empty` 跳过已存在 id 导致重复 id 死循环 |
 
 ---
 

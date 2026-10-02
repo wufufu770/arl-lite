@@ -11,6 +11,8 @@
     arl-lite devloop gate <name>     跑单个门禁
     arl-lite devloop accept <name> --reason "..."  显式提升 baseline
     arl-lite devloop promotions      看 baseline 提升历史
+    arl-lite devloop repair          修复队列里的重复 id
+    arl-lite devloop unmark <id>     把误标的 done 改回 pending
 
 设计:所有子命令都不需要预先初始化,首次调用自动建目录和文件。
 循环必须自持——没有"先手动 setup 一步"这种事。
@@ -52,6 +54,10 @@ def cmd_devloop(args) -> int:
         return _cmd_accept(args)
     if sub == "promotions":
         return _cmd_promotions(args)
+    if sub == "repair":
+        return _cmd_repair(args)
+    if sub == "unmark":
+        return _cmd_unmark(args)
     print("[!] unknown devloop subcommand; use --help", file=sys.stderr)
     return 2
 
@@ -170,6 +176,64 @@ def gates_path_str() -> str:
     return str(gates.baseline_path(_repo_root()))
 
 
+def _cmd_repair(args) -> int:
+    """修复重复 id 的队列
+
+    重复 id 会让引擎所有按 id 定位的操作全部命中第一条记录,
+    循环会原地空转。历史上 seed_if_empty 真的造出过这种队列。
+
+    --dry-run 先看会怎么改再落盘。这不是多余的功能:修复靠的是
+    "保留进度最靠前的那条"这条启发式,而当两份副本**都是错的**时
+    启发式必然选错 —— 实测就遇到过(引擎误标 done,副本 pending 是脏数据,
+    启发式保留了 pending)。这种时候唯一的出路是拿 devloop history
+    里的事实来源人工校正,所以必须先看清楚它打算改什么。
+    """
+    from .queue import Queue
+    q = Queue(_loop().dev_dir / "queue.json")
+    dupes = q.find_duplicates()
+    if not dupes and not getattr(args, "force", False):
+        print("[i] no duplicate ids; nothing to repair")
+        return 0
+    if dupes:
+        print(f"[!] found {len(dupes)} duplicated id(s):")
+        for iid, n in sorted(dupes.items()):
+            print(f"    {iid} x{n}")
+    if getattr(args, "dry_run", False):
+        print("\n-- dry run: 以下判定需要人工核对 --")
+        for iid in sorted(dupes):
+            for it in q.load():
+                if it.id == iid:
+                    print(f"    {iid}: status={it.status} attempts={it.attempts} "
+                          f"done_round={it.done_round} created_round={it.created_round} "
+                          f"note={it.note!r}")
+        print("\n[i] dry run,未写入任何改动")
+        return 0
+    removed = q.repair_duplicates()
+    print(f"[+] removed {removed} duplicate record(s)")
+    left = q.find_duplicates()
+    print("[i] clean" if not left else f"[!] still duplicated: {left}")
+    print("[i] 提醒:核对留下的状态是否与 devloop history 一致 —— "
+          "重复副本本身可能是错的,启发式选不出真相")
+    return 0 if not left else 1
+
+
+def _cmd_unmark(args) -> int:
+    """把误标的 done/dropped 改回 pending
+
+    逻辑在 Queue.unmark 里,这里只做参数接线 —— 这样能在隔离目录里测,
+    不用去动真实仓库的状态。
+    """
+    from .queue import Queue
+    q = Queue(_loop().dev_dir / "queue.json")
+    ok, detail = q.unmark(args.item_id, getattr(args, "reason", "") or "")
+    if not ok:
+        print(f"[!] {detail}", file=sys.stderr)
+        return 2
+    print(f"[+] {detail}"
+          + (f"  (reason: {args.reason})" if getattr(args, "reason", "") else ""))
+    return 0
+
+
 def add_devloop_parser(sub) -> None:
     """注册 `arl-lite devloop ...` 子命令树"""
     p = sub.add_parser(
@@ -215,5 +279,22 @@ def add_devloop_parser(sub) -> None:
     )
 
     dsub.add_parser("promotions", help="看 baseline 提升历史")
+
+    pr2 = dsub.add_parser(
+        "repair",
+        help="修复队列里的重复 id(重复会让循环原地空转)",
+    )
+    pr2.add_argument("--force", action="store_true", help="没发现问题也走一遍修复流程")
+    pr2.add_argument(
+        "--dry-run", action="store_true",
+        help="只看会怎么改,不落盘(两份副本都可能是错的,改之前先核对)",
+    )
+
+    pu = dsub.add_parser(
+        "unmark",
+        help="把误标的 done/dropped 改回 pending",
+    )
+    pu.add_argument("item_id")
+    pu.add_argument("--reason", default="", help="为什么改回(记进 item.note)")
 
     p.set_defaults(func=cmd_devloop)
