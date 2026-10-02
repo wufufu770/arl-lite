@@ -50,6 +50,8 @@ kind 取值：`change` / `test` / `doc` / `research` / `refactor`
 - [P0] change: 刚播种的条目不得在同一轮里被完成 | ✅ r35 完成(提交 d59dcb1)· `round()` 轮初播种后不领该条目,走 RESULT_NOOP 空转;`tests/test_freshly_seeded_cannot_complete_same_round.py` 14 条 —— r34 实测:round 33 在本轮开头 `seed_if_empty` 播了 1 条,同一轮就把它领走并 finish 成 done,而它的验收命令实跑 exit!=0。引擎能自己造一条活、再自己宣布做完 —— 这是「假账」的结构性制造机。成因:PLAN 阶段播种早于本轮领取 | python3 -m pytest tests/test_freshly_seeded_cannot_complete_same_round.py
 - [P1] change: `created_round` 名不副实 —— 它是播种计数器,不是轮次 | ✅ r35 完成(提交 d59dcb1)· `seed_if_empty(round_no=)` 传真轮次,修完 created_round <= done_round;`tests/test_created_round_matches_real_round.py` —— r34 实测:round 33 播种的条目 `created_round=14`,因为 `seed_if_empty` 用 `max(created_round)+1` 算新值,和 `state.json` 的 `round` 早就脱节(差 19 轮)。而 `done_round` 是真轮次,于是同一条记录上出现「r14 创建、r33 完成」,读的人会以为它做了 19 轮。同一字段名在队列里被当 FIFO 排序键、在记账里又被当时间轴 | python3 -m pytest tests/test_created_round_matches_real_round.py
 
+- [P1] test: `verify="true"` 是恒真命令,却对**真活**也放行 | r36 实测:`Queue.verify_result("true")` 恒返回 `pass`,而 r35 的收尾闸门只在 `fail` 时拦 —— 于是任何 `verify="true"` 的条目都**必然**被标 done。信号条目(`no-due-maintenance-review*`)用它完全合法,它的完成判据本来就是「人确认过」;但 `is_signal_id()` 只在 `completion_source` 那一侧用来区分,没有任何检查阻止**一条真活**也用它。那就是一条自动完成的假活。更麻烦的是 r36 刚写的 `test_backlog_verify_is_commandable.py` **抓不到它** —— `true` 确实在白名单里、确实是合法命令、确实语法正确。判据恒真是第 16 轮「恒真测试」那篇的极端形式:这次连测试都绿着 | python3 -m pytest tests/test_constant_true_verify_is_signal_only.py
+
 ## 候选（待细化）
 
 - 离线内嵌 RIPE/APNIC/ARIN delegated 数据做 IP→ASN 归属（约 16MB，公约免费）
