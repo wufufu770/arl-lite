@@ -23,12 +23,24 @@
       "gate": "loc_budget",
       "reason": "第8轮实现 DISAPPEARED 变更检测:monitor.py 新增 detect_disappeared/filter_newly_disappeared/parse_ts 约 200 行,是 PROJECT_PLAN 里挂了很久的待实现项,不是膨胀",
       "round": 7
+    },
+    {
+      "at": "2026-10-02T14:11:59",
+      "changes": {
+        "total_loc": {
+          "from": 13112,
+          "to": 13820
+        }
+      },
+      "gate": "loc_budget",
+      "reason": "第14轮做误报率实测:新增 core/fp_bench.py(受控样本+统计+报告,约 500 行),并借此修掉 4 个规则真 bug。这是队列里挂了很久的误报率实测任务,不是膨胀",
+      "round": 13
     }
   ],
   "doc_freshness": 0,
   "loc_budget": {
     "devloop_loc": 2617,
-    "total_loc": 13112
+    "total_loc": 13820
   },
   "no_import_cycle": 0,
   "no_thirdparty_import": 0,
@@ -36,6 +48,6 @@
   "rules_have_advice": 37,
   "test_baseline": {
     "failed": 9,
-    "passed": 276
+    "passed": 293
   }
 }

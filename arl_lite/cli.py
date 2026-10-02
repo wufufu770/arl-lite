@@ -713,6 +713,36 @@ def cmd_tools_list(args) -> int:
     return 0
 
 
+def cmd_fp_bench(args) -> int:
+    """离线跑规则集误报率基准,产出 docs/FP_RATE.md
+
+    全程离线:样本是人工构造的受控数据,不需要真实目标、不需要网络。
+    """
+    from pathlib import Path as _P
+    from .core import fp_bench as fb
+
+    results = fb.run_bench()
+    rep = fb.analyze(results)
+
+    out = _P(args.out) if getattr(args, "out", "") else _P("docs/FP_RATE.md")
+    fb.write_report(out, rep)
+
+    print(f"[i] {len(results)} case(s) run, rules={len(rep.per_rule)}")
+    print(f"[i] 误报率 {rep.fp_rate:.1%} ({rep.total_fp}/{rep.total_opportunities})"
+          f"  召回 {rep.recall:.1%} ({rep.total_tp}/{rep.total_tp + rep.total_fn})")
+    for r in results:
+        if r.false_positives:
+            print(f"  FP {r.case.name}: {', '.join(sorted(r.false_positives))}")
+        if r.false_negatives:
+            print(f"  FN {r.case.name}: {', '.join(sorted(r.false_negatives))}")
+        if r.error:
+            print(f"  !! {r.case.name}: {r.error}")
+    print(f"[+] report written to {out}")
+    # 崩掉的样本必须让命令失败 —— 少跑几个样本却报 0% 误报率,
+    # 比误报本身更危险
+    return 1 if any(r.error for r in results) else 0
+
+
 def cmd_notify_test(args) -> int:
     """发测试通知"""
     from .notify import WebhookConfig, notify
@@ -1049,6 +1079,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="ntfy / slack / generic / local(默认 ntfy)",
     )
     pc.set_defaults(func=cmd_correlate)
+
+    # fp-bench(离线误报率基准)
+    pfb = sub.add_parser(
+        "fp-bench",
+        help="离线跑规则集误报率基准,产出 docs/FP_RATE.md",
+    )
+    pfb.add_argument("--out", default="", help="报告输出路径(默认 docs/FP_RATE.md)")
+    pfb.set_defaults(func=cmd_fp_bench)
 
     # monitor(资产监控)
     pm = sub.add_parser("monitor", help="资产监控管理")

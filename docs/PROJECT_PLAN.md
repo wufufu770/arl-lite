@@ -284,7 +284,7 @@ confidence = base_prior × cross_evidence × table_complexity × exclusion_bonus
 |---|---|---|---|
 | `high` | 0.90 | 端口级事实,或跨表验证 + 有 exclusion | `exposed_database` `database_with_public_web` |
 | `medium` | 0.70 | 精确标题匹配 | `redis_public` `grafana_public` |
-| `low` | 0.45 | 模糊匹配 / 聚合统计 / 同机多同类 | `istio_no_auth` `multiple_db_same_ip` |
+| `low` | 0.45 | 模糊匹配 / 聚合统计 / 同机多同类 | `istio_no_auth` `db_asset_diversity` |
 
 ```
 >= 0.70  report    进主告警
