@@ -613,8 +613,10 @@ class Queue:
     _TESTS_DIR = Path("tests")
     _PLAN_DOC = Path("docs/PROJECT_PLAN.md")
     _RULE_RISK = re.compile(r"^risk:\s*(\d+)\s*$", re.MULTILINE)
-    _RULE_TAGS = re.compile(r"^tags:\s*\[([^\]]*)\]\s*$", re.MULTILINE)
     _RULE_NAME = re.compile(r"^name:\s*(\S+)\s*$", re.MULTILINE)
+    # 置信度字段。第 1 轮把置信度从 `low-confidence` **标签**改成了
+    # `confidence:` **字段**(high/medium/low 三档)。
+    _RULE_CONFIDENCE = re.compile(r"^confidence:\s*(\S+)\s*$", re.MULTILINE)
 
     def _scan_repo_root(self) -> Path | None:
         """尽量推断 repo 根目录:从 queue.json 向上找 pyproject.toml。"""
@@ -630,12 +632,25 @@ class Queue:
     ) -> list[Item]:
         """扫项目状态,产生结构化待办。
 
-        推导规则:
-          - 规则 yml 中 risk >= 7 且没有 low-confidence 标签 → "加置信度标注"
+        推导规则(每一条都必须能对着仓库现状独立核实):
+          - 规则 yml 中 risk >= 7 且**没有 confidence 字段** → "加置信度标注"
           - 规则数 < 40 → "补充关联分析规则覆盖"
           - 集成源模块数 < 12 → "新增数据源"
           - 测试 phase 文件缺失 → "补测试"
           - docs/PROJECT_PLAN.md 与实现差距 → "对齐项目计划文档"
+
+        ## 这一层最容易出的错:拿旧事实推新待办
+
+        规则改过之后(比如置信度从 `low-confidence` 标签改成
+        `confidence:` 字段),这个推导不会跟着改,于是对每一条高风险
+        规则都报"缺标注"。第 13 轮实测:37 条规则全部有 confidence 字段,
+        标签 0 条,而推导照样挑出风险最高的 3 条报成新活。
+
+        **假活比队列空掉更坏** —— 队列空掉会报错,假活会让人真的去干
+        一遍已经做完的事,干完还会被标成 done。
+
+        所以改完规则模型之后要回来核对这一层。
+        `tests/test_devloop_seed_truthfulness.py` 把每条断言都独立验了一遍。
         """
         repo = self.scan_repo_root()
         if repo is None:
@@ -643,6 +658,16 @@ class Queue:
         out: list[Item] = []
 
         # (a) 高风险规则缺置信度标注
+        #
+        # 这里判的是 `confidence:` **字段**是否存在,不是找 `low-confidence` 标签。
+        # 第 1 轮把置信度从标签改成了字段,标签已经全部消失(0/37),
+        # 而这个检查还在找标签 —— 于是 25 条 risk≥7 的规则**全部**被误判成
+        # "缺置信度标注",取风险最高的 3 条报成新待办。
+        # 实测:`database_with_public_web` / `docker_api_exposed` /
+        # `elasticsearch_public` 三条明明都有 confidence 字段,却被要求补标注。
+        #
+        # 播种必须基于**当下**的事实。规则改过一轮之后,这个检查不跟着改,
+        # 产出的就是假活 —— 比队列空掉更坏:空队列会报错,假活会让人白干。
         rules_dir = repo / self._RULES_DIR
         if rules_dir.is_dir():
             high_risk_no_conf = []
@@ -655,15 +680,12 @@ class Queue:
                 except OSError:
                     continue
                 risk_m = self._RULE_RISK.search(txt)
-                tags_m = self._RULE_TAGS.search(txt)
                 name_m = self._RULE_NAME.search(txt)
                 if not risk_m or not name_m:
                     continue
                 risk = int(risk_m.group(1))
-                tags_raw = tags_m.group(1) if tags_m else ""
-                tags_list = [t.strip().strip("\"'") for t in tags_raw.split(",")]
-                tags_list = [t for t in tags_list if t]
-                if risk >= 7 and "low-confidence" not in tags_list:
+                conf_m = self._RULE_CONFIDENCE.search(txt)
+                if risk >= 7 and not conf_m:
                     high_risk_no_conf.append((name_m.group(1), risk))
             # 限 3 条,按风险降序
             high_risk_no_conf.sort(key=lambda x: (-x[1], x[0]))

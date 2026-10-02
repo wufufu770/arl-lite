@@ -495,6 +495,30 @@ disappeared-20-r3-r1                                   ← r8 已做
 > 于是测试测的是平行实现而不是真实路径,一路假绿。改成直接调
 > `_seed_from_backlog()` 走真实路径。
 
+#### 第五次:假活比队列空掉更坏
+
+第 13 轮播种提出 5 条,其中 3 条是假的:
+
+```
+add-confidence-database_with_public_web
+add-confidence-docker_api_exposed
+add-confidence-elasticsearch_public
+```
+
+这三条规则**都有** `confidence:` 字段。原因是 Tier 2 的检查还在找
+`low-confidence` **标签** —— 第 1 轮把置信度从标签改成了字段,
+标签全没了(0/37),于是 25 条 risk≥7 的规则全部被误判成「缺标注」,
+取风险最高的 3 条报上来。
+
+**假活比队列空掉更坏**:队列空掉会报错,假活会让人真的去干一遍
+已经做完的事,干完还会被标成 done。
+
+这一层的通病是**拿旧事实推新待办** —— 规则改过了,推导不会跟着改。
+所以加了 `tests/test_devloop_seed_truthfulness.py`:按现状推导出来的
+每一条,断言都必须能对着仓库独立核实为真(数据源数量、缺失阶段、
+规则数、confidence 字段)。并做过变异验证:把判断改回旧逻辑,
+两条测试立刻变红。
+
 #### 顺带:done 必须标明是谁断言的
 
 引擎的设计是「不自动改代码」。没有 `build_fn` 时它只看到
