@@ -185,10 +185,10 @@ class Storage:
             "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='correlations'"
         ).fetchall()
         idx_names = {r["name"] for r in idx}
-        if any("correlations_uniq" in n for n in idx_names):
-            return  # 已经有 unique index
+        has_unique = any("correlations_uniq" in n for n in idx_names)
 
-        # 1. 补缺列(从 v0.2 → v0.3)
+        # 列迁移无条件跑:即使 unique index 已存在,后加的置信度列
+        # 依然需要补上(否则新代码写不进去,旧库永远缺列)
         cur_cols = {row["name"] for row in conn.execute("PRAGMA table_info(correlations)").fetchall()}
         # 迁移列 → 字面量 SQL 映射(列名/类型是代码写死的常量,不走 f-string 拼接)
         needed = {
@@ -198,6 +198,11 @@ class Storage:
             "advice": "ALTER TABLE correlations ADD COLUMN advice TEXT",
             "tags": "ALTER TABLE correlations ADD COLUMN tags TEXT",
             "rule_description": "ALTER TABLE correlations ADD COLUMN rule_description TEXT",
+            # v0.7.9: 置信度三件套(见 core/confidence.py)
+            "confidence": "ALTER TABLE correlations ADD COLUMN confidence INTEGER DEFAULT 50",
+            "confidence_level": "ALTER TABLE correlations ADD COLUMN confidence_level TEXT",
+            "confidence_status": "ALTER TABLE correlations ADD COLUMN confidence_status TEXT",
+            "confidence_factors": "ALTER TABLE correlations ADD COLUMN confidence_factors TEXT",
         }
         for col, sql in needed.items():
             if col not in cur_cols:
@@ -206,6 +211,9 @@ class Storage:
                     log.info(f"migrated: correlations ADD COLUMN {col}")
                 except Exception as e:
                     log.warning(f"failed to add column {col}: {e}")
+
+        if has_unique:
+            return  # 列已补齐,unique 也在,无事可做
 
         # 1b. sites 表补 server 列(关联分析 istio_no_auth 规则需要)
         site_cols = {row["name"] for row in conn.execute("PRAGMA table_info(sites)").fetchall()}

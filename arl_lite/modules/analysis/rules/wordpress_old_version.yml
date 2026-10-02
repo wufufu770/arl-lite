@@ -1,6 +1,8 @@
 name: wordpress_old_version
 description: WordPress 未识别版本(可能未维护)
 risk: 3
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: low
 tags: [wordpress, version, maintenance]
 collect:
   - table: sites

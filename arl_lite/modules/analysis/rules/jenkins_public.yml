@@ -1,6 +1,8 @@
 name: jenkins_public
 description: Jenkins 暴露公网(常见 RCE 目标)
 risk: 9
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: medium
 tags: [jenkins, exposure, rce]
 collect:
   - table: findings

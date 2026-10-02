@@ -1,6 +1,8 @@
 name: phpmyadmin_public
 description: phpMyAdmin 暴露公网(数据库管理工具)
 risk: 7
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: medium
 tags: [phpmyadmin, exposure, database, brute_force]
 collect:
   - table: findings

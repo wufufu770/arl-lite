@@ -1,6 +1,8 @@
 name: multiple_db_same_ip
 description: 同一 IP 上多个数据库(数据集中暴露风险)
 risk: 8
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: low
 tags: [database, network, exposure, data_leak]
 collect:
   - table: findings

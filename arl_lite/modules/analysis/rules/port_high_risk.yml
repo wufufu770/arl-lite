@@ -1,6 +1,8 @@
 name: port_high_risk
 description: 高危端口列表(常被攻击)
 risk: 6
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: high
 tags: [network, port, exposure]
 collect:
   - table: ports

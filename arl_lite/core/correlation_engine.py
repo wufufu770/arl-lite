@@ -50,6 +50,11 @@ class Rule:
     exclusion: list[RuleAction] = field(default_factory=list)
     headline: str = ""
     advice: str = ""
+    # 证据强度档位: high(单表单条件) / medium(跨表或有明确产品特征)
+    # / low(模糊匹配、聚合统计、依赖指纹准确性)。
+    # 命中后由 confidence.assess() 换算成 0-1 分数, 决定 report/observe/discard。
+    # 不写则按 medium 处理(保守)。
+    confidence: str = "medium"
     # 聚合型规则:collect 命中总数 >= count_min 时,整个 workspace 报一条
     # (而不是每个目标各报一条)。None = 普通逐目标规则
     count_min: int | None = None
@@ -67,6 +72,12 @@ class CorrelationHit:
     description: str = ""  # 规则描述(save_correlations 用,免去重复加载规则)
     matched_count: int = 1  # 该 hit 覆盖的资产数(聚合规则 = 全部命中数)
     evidence_preview: str | None = None  # 聚合规则的证据摘要 JSON(可选)
+    # 置信度: base 档位 + 0-100 分 + report/observe/discard 处置
+    # 之前没有这一层, 命中即 risk:9, 指纹误报会被直接放大成高危告警
+    confidence: int = 50
+    confidence_level: str = "medium"   # high / medium / low
+    confidence_status: str = "report"  # report / observe / discard
+    confidence_factors: dict = field(default_factory=dict)
 
 
 # =========================
@@ -75,7 +86,10 @@ class CorrelationHit:
 
 # 缩进深度
 LIST_KEYS = {"collect", "cross_ref", "exclusion", "tags"}
-SCALAR_KEYS = {"name", "description", "risk", "headline", "advice", "count_min"}
+SCALAR_KEYS = {"name", "description", "risk", "headline", "advice", "count_min",
+               "confidence"}
+# confidence 的合法档位——写错必须告警,不能静默接受
+CONF_LEVELS = {"high", "medium", "low"}
 
 
 def _unquote(s: str) -> str:
@@ -124,6 +138,17 @@ def _parse_yaml(text: str) -> Rule:
                 rule.headline = v.strip()
             elif pending_key == "advice":
                 rule.advice = v
+            elif pending_key == "confidence":
+                # 证据强度档位: high / medium / low
+                # 非法值不静默接受——写错了会让置信度模型算错
+                lvl = v.strip().lower()
+                if lvl in ("high", "medium", "low"):
+                    rule.confidence = lvl
+                else:
+                    log.warning(
+                        f"rule '{rule.name}' confidence {v!r} invalid "
+                        f"(expect high|medium|low), fallback to medium"
+                    )
             pending_key = None
             pending_value = []
 
@@ -174,6 +199,16 @@ def _parse_yaml(text: str) -> Rule:
                             rule.count_min = int(unquoted)
                         except (ValueError, TypeError):
                             log.warning(f"rule count_min value {unquoted!r} not int, ignored")
+                    elif key == "confidence":
+                        lvl = unquoted.lower()
+                        if lvl in CONF_LEVELS:
+                            rule.confidence = lvl
+                        else:
+                            log.warning(
+                                f"rule '{rule.name}' confidence {unquoted!r} invalid "
+                                f"(expect {'|'.join(sorted(CONF_LEVELS))}), "
+                                f"fallback to medium"
+                            )
                     else:
                         setattr(rule, key, unquoted)
                 else:
@@ -352,6 +387,29 @@ def _exclusion_match(action: RuleAction, target: dict, storage) -> bool:
     return _cross_ref_match(action, target, storage)
 
 
+def _collect_table_count(rule: Rule) -> int:
+    """规则涉及的不同表数量——跨表越多,误报面越大
+
+    同机多服务是常态(反代 + 后端 + 数据库),跨表推断天然比
+    单表单条件更容易把"合理部署"误判成"风险组合"。
+    """
+    return len({a.table for a in rule.collect if a.table})
+
+
+def _assess_rule(rule: Rule, *, has_cross_ref: bool, cross_ref_satisfied: bool,
+                 matched_tables: int):
+    """对一条规则的命中做置信度评估(包一层是为了集中处理异常)"""
+    from .confidence import assess
+    return assess(
+        rule_name=rule.name,
+        base_confidence=rule.confidence,
+        has_cross_ref=has_cross_ref,
+        cross_ref_satisfied=cross_ref_satisfied,
+        has_exclusion=bool(rule.exclusion),
+        matched_table_count=max(1, matched_tables),
+    )
+
+
 def run_rule(rule: Rule, storage) -> list[CorrelationHit]:
     """跑单条规则,返回命中列表"""
     if not rule.name:
@@ -388,6 +446,12 @@ def run_rule(rule: Rule, storage) -> list[CorrelationHit]:
             headline = rule.headline.format(count=len(collect_targets))
         except Exception:
             headline = rule.headline
+        # 置信度:聚合规则只看规则自身档位——"总数 ≥ N" 这类统计
+        # 本身就不是逐资产证据,再用高置信度会误导
+        conf = _assess_rule(rule, has_cross_ref=False,
+                            cross_ref_satisfied=False,
+                            matched_tables=_collect_table_count(rule))
+
         hits.append(CorrelationHit(
             rule_name=rule.name,
             risk=rule.risk,
@@ -401,6 +465,10 @@ def run_rule(rule: Rule, storage) -> list[CorrelationHit]:
                 [{k: t.get(k) for k in ("id", "domain", "host", "ip", "url") if k in t}
                  for t in sample],
                 ensure_ascii=False),
+            confidence=round(conf.score * 100),
+            confidence_level=conf.base_confidence,
+            confidence_status=conf.status,
+            confidence_factors=conf.factors,
         ))
         return hits
 
@@ -429,6 +497,14 @@ def run_rule(rule: Rule, storage) -> list[CorrelationHit]:
         except Exception:
             headline = rule.headline
 
+        # 置信度:cross_ref 满足与否直接影响证据强度
+        conf = _assess_rule(
+            rule,
+            has_cross_ref=bool(rule.cross_ref),
+            cross_ref_satisfied=all_cross_ok,
+            matched_tables=_collect_table_count(rule),
+        )
+
         hits.append(CorrelationHit(
             rule_name=rule.name,
             risk=rule.risk,
@@ -437,6 +513,10 @@ def run_rule(rule: Rule, storage) -> list[CorrelationHit]:
             advice=rule.advice,
             tags=list(rule.tags),
             description=rule.description,
+            confidence=round(conf.score * 100),
+            confidence_level=conf.base_confidence,
+            confidence_status=conf.status,
+            confidence_factors=conf.factors,
         ))
 
     return hits
@@ -505,8 +585,9 @@ def save_correlations(storage, hits: list[CorrelationHit]) -> int:
                     """INSERT INTO correlations
                        (workspace_id, rule_name, rule_description, risk,
                         target, target_type, headline, advice, tags,
-                        matched_count, evidence, detected_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        matched_count, evidence, confidence, confidence_level,
+                        confidence_status, confidence_factors, detected_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                        ON CONFLICT(workspace_id, rule_name, target) DO UPDATE SET
                          rule_description = excluded.rule_description,
                          risk = excluded.risk,
@@ -515,11 +596,19 @@ def save_correlations(storage, hits: list[CorrelationHit]) -> int:
                          tags = excluded.tags,
                          matched_count = excluded.matched_count,
                          evidence = excluded.evidence,
+                         confidence = excluded.confidence,
+                         confidence_level = excluded.confidence_level,
+                         confidence_status = excluded.confidence_status,
+                         confidence_factors = excluded.confidence_factors,
                          detected_at = excluded.detected_at""",
                     (storage.workspace_id, hit.rule_name, hit.description, hit.risk,
                      str(target), target_type, hit.headline, hit.advice,
                      json.dumps(hit.tags, ensure_ascii=False),
-                     hit.matched_count, evidence, datetime.utcnow().isoformat())
+                     hit.matched_count, evidence,
+                     hit.confidence, hit.confidence_level,
+                     hit.confidence_status,
+                     json.dumps(hit.confidence_factors, ensure_ascii=False),
+                     datetime.utcnow().isoformat())
                 )
                 # 新行和被刷新的行 rowcount 都是 1,只有内容完全没变的行才是 0
                 count += cur.rowcount

@@ -1,6 +1,8 @@
 name: vnc_with_weak_auth
 description: VNC 暴露在公网且无强认证
 risk: 8
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: high
 tags: [vnc, exposure, brute_force, auth]
 collect:
   - table: findings

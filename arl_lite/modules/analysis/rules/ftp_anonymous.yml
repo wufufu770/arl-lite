@@ -1,6 +1,8 @@
 name: ftp_anonymous
 description: FTP 服务暴露(可能允许匿名登录)
 risk: 6
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: high
 tags: [exposure, ftp, network]
 collect:
   - table: ports

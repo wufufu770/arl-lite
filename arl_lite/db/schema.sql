@@ -327,6 +327,10 @@ CREATE TABLE IF NOT EXISTS correlations (
     matched_assets TEXT,               -- JSON,命中的资产
     matched_count INTEGER DEFAULT 0,
     evidence TEXT,                     -- JSON,执行引擎的中间结果
+    confidence INTEGER DEFAULT 50,     -- 0-100,证据强度(见 core/confidence.py)
+    confidence_level TEXT,             -- high/medium/low,规则声明的档位
+    confidence_status TEXT,            -- report/observe/discard,处置决定
+    confidence_factors TEXT,           -- JSON,各因子贡献(用于解释这个分怎么来的)
     detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(workspace_id, rule_name, target),
     FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE
