@@ -146,7 +146,19 @@ def _plan_changes(
     """
     changes: dict = {}
     if isinstance(current, dict) and isinstance(measured, dict):
-        for key in allowed_fields:
+        # r27:只提升**导致门禁转红**的那些字段。
+        #
+        # 以前这里是"遍历所有 promotable_fields,谁大提谁"。实测(r27):
+        # 为修 test_baseline 要给 devloop_code_loc 留痕提升,accept 顺手把
+        # total_loc 也从 14254 提到了 14514 —— 而 total_loc 当时**并没有红**
+        # (14514 < 上限 14554)。规则 1 挡的是"提前买预算",可一旦有别的字段
+        # 真的红了,闸门一过就顺带把没红的也买了,等于绕过了自己。
+        #
+        # 门禁在 measured["_over"] 里报出真正超标的字段名。没有这个键的
+        # 门禁保持旧行为(全提)—— 那不是放过,是不该由这里替它们做判断。
+        over = measured.get("_over")
+        fields = [k for k in allowed_fields if over is None or k in over]
+        for key in fields:
             old = current.get(key)
             new = measured.get(key)
             if old is None:

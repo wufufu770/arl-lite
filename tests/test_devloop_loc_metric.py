@@ -306,3 +306,87 @@ def test_arl_lite_total_still_uses_physical_lines():
     physical = gates._count_lines([p])
     code = gates._count_code_lines([p])
     assert physical > code
+
+
+# =====================================================================
+# r27:accept 只该提升真正超标的那一项
+# =====================================================================
+
+
+def _loc_tmp_repo(tmp_path, total_loc_base=15):
+    """一个只有 devloop 红线超标、arl_lite 总量"涨了但没涨过容差"的仓库
+
+    `total_loc_base=15` 是关键:实测约 21,**大于** baseline(所以 _plan_changes
+    看得见"可以提")但**远小于** baseline+300 的容差上限(所以它没红)。
+    这正是 r27 实测到 accept 越界的那副形状:14514 > 14254,可 14514 < 14554。
+
+    第一版这里把 baseline 设成 100(实测 21 < 100),于是那条字段
+    **本来就没大到能提**,测试自然过 —— 三个变异全靠它存活。
+    """
+    (tmp_path / "devloop").mkdir(parents=True)
+    (tmp_path / "devloop" / "backlog.md").write_text("# backlog\n", encoding="utf-8")
+    dv = tmp_path / "arl_lite" / "devloop"
+    dv.mkdir(parents=True)
+    (dv / "big.py").write_text("".join(f"x{i} = {i}\n" for i in range(20)), encoding="utf-8")
+    (tmp_path / "arl_lite" / "small.py").write_text("y = 1\n", encoding="utf-8")
+    # devloop_code_loc 给 5(实测 20 -> 该红);total_loc 见上面的说明
+    gates.update_baseline(tmp_path, "loc_budget",
+                          {"total_loc": total_loc_base, "devloop_code_loc": 5})
+    return tmp_path
+
+
+def test_accept_only_promotes_the_field_that_actually_failed(tmp_path):
+    """实测(r27):只修 devloop 红线,accept 却把 total_loc 也提了
+
+    当时 total_loc 是 14514,上限 14554 —— **它根本没红**,只是比 baseline
+    14254 大。规则 1 挡的是"提前买预算",可一旦别的字段真的红了,闸门一过
+    就顺带把没红的也买了,等于从侧门绕过了自己。
+    """
+    from arl_lite.devloop.accept import accept_baseline
+
+    repo = _loc_tmp_repo(tmp_path)
+    before = gates.load_baseline(repo)["loc_budget"]
+    assert before["total_loc"] == 15
+
+    out = accept_baseline(repo, "loc_budget", reason="这条理由够长了用于测试")
+    assert out.ok, f"该接受的没接受: {out.detail}"
+    assert "devloop_code_loc" in out.changes, f"真正超标的那项没提: {out.changes}"
+
+    after = gates.load_baseline(repo)["loc_budget"]
+    assert after["total_loc"] == 15, (
+        f"没红的 total_loc 被顺手提了 {before['total_loc']} -> {after['total_loc']}"
+    )
+    assert after["devloop_code_loc"] > 5
+
+
+def test_gate_reports_which_fields_are_over(tmp_path):
+    """门禁要能说清"是哪几项超标",否则 accept 无从只提那几项"""
+    repo = _loc_tmp_repo(tmp_path)
+    r = gates.LocBudgetGate().run(repo)
+    assert not r.passed
+    assert r.measured["_over"] == ["devloop_code_loc"], r.measured
+
+
+def test_both_fields_are_promoted_when_both_are_over(tmp_path):
+    """两项都超了就都提 —— 过滤不能变成漏网
+
+    对照组:上面那条只测了"只提红的",这条测"该提的都提"��
+    只写前者的话,把 `_over` 写成永远空列表也能全绿。
+    """
+    from arl_lite.devloop.accept import accept_baseline
+
+    repo = _loc_tmp_repo(tmp_path, total_loc_base=1)   # 上限 301,仍不红 total
+    gates.update_baseline(repo, "loc_budget",
+                          {"total_loc": 1, "devloop_code_loc": 5})
+    r = gates.LocBudgetGate().run(repo)
+    assert r.measured["_over"] == ["devloop_code_loc"]
+
+    # 真让 total 也红:baseline 调到一个比实测还小的值
+    gates.update_baseline(repo, "loc_budget",
+                          {"total_loc": -1000, "devloop_code_loc": 5})
+    r = gates.LocBudgetGate().run(repo)
+    assert set(r.measured["_over"]) == {"total_loc", "devloop_code_loc"}, r.measured
+
+    out = accept_baseline(repo, "loc_budget", reason="这条理由够长了用于测试")
+    assert out.ok
+    assert set(out.changes) == {"total_loc", "devloop_code_loc"}, out.changes

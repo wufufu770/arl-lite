@@ -827,10 +827,15 @@ class LocBudgetGate:
         prev = baseline.get(self.name, {})
 
         problems: list[str] = []
+        # r27:记下**哪些字段真的超标**。accept 靠它决定提哪几项 ——
+        # 以前它遍历所有 promotable_fields 谁大提谁,于是"门禁正在失败"
+        # 这道闸一过,就顺带把没红的字段也提了(见 accept._plan_changes)。
+        over: list[str] = []
 
         # devloop 红线。阈值来自 baseline(若被显式提升过)或源码常量。
         devloop_limit, limit_src = self._devloop_limit(repo, prev)
         if devloop_code_loc > devloop_limit:
+            over.append("devloop_code_loc")
             problems.append(
                 f"devloop/ has {devloop_code_loc} code lines "
                 f"(limit {devloop_limit}, 总行 {devloop_total_loc}; 阈值来源: {limit_src})"
@@ -841,6 +846,7 @@ class LocBudgetGate:
         if prev_total is not None:
             limit = prev_total + _DEFAULT_LOC_TOLERANCE
             if total_loc > limit:
+                over.append("total_loc")
                 problems.append(
                     f"arl_lite/ has {total_loc} lines "
                     f"(baseline {prev_total} + tolerance {_DEFAULT_LOC_TOLERANCE})"
@@ -855,6 +861,7 @@ class LocBudgetGate:
                     "total_loc": total_loc,
                     "devloop_code_loc": devloop_code_loc,
                     "devloop_total_loc": devloop_total_loc,
+                    "_over": over,
                 },
                 baseline=prev_total,
                 blocking=self.blocking,
