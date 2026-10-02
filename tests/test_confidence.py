@@ -157,8 +157,28 @@ class TestEndToEnd(unittest.TestCase):
 
     def setUp(self):
         from arl_lite.db.storage import Storage
-        ws = "conf_test_" + tempfile.mkdtemp().split("/")[-1][:8]
-        self.storage = Storage(workspace=ws)
+        # `(r23)` 原来这里写的是:
+        #     ws = "conf_test_" + tempfile.mkdtemp().split("/")[-1][:8]
+        #     self.storage = Storage(workspace=ws)
+        #
+        # `mkdtemp()` 只用来取一个唯一后缀,**临时目录本身从来没用过也没人清**,
+        # 而 `Storage(workspace=ws)` 没传 workspace_root —— 于是回落到
+        # `~/.arl-lite/workspaces/`,也就是**用户真实的数据目录**。
+        #
+        # 实测(r23):跑一次本文件就在真实 HOME 里新增 3 个工作区。
+        # 真实库里 298 个工作区,其中 285 个是 conf_test_ 开头的测试垃圾。
+        # 同一次运行还泄漏 3 个空临时目录到 /tmp。
+        #
+        # 守卫在 tests/test_no_real_home_writes.py —— 改回旧写法会红。
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.storage = Storage(
+            workspace="conf-e2e",
+            workspace_root=Path(self._tmp.name),
+        )
+        # 连接也得关:tmp 目录删了但连接还开着,在 Windows 上会直接
+        # 删不掉文件(和 r15 那次 os.kill 踩的是同一类平台差异)
+        self.addCleanup(self.storage.close)
 
     def test_confidence_reaches_db(self):
         r = self.storage.bulk_insert("findings", [

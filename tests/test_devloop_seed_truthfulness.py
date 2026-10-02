@@ -746,6 +746,19 @@ def test_real_queue_has_no_pending_item_whose_verify_already_passes():
 
     比单测更狠:它直接查**正在用的那份** queue.json。第 16 轮实测就
     抓到 `align-project-plan-doc` 一直挂在队头,而它的 verify 早通过。
+
+    ## `(r23 修)` 漏了信号豁免
+
+    这条**没有**调用同文件里的 `_is_signal()`,所以信号一挂到队头就红。
+
+    为什么之前一直没暴露:队头通常是 `confidence-risk` 这类真待办,
+    verify 是一条真命令,跑不过。而 `no-due-maintenance-review`
+    的 verify 是 `true`(它的完成判据是"人确认过",不是某条命令),
+    于是**必然**通过 —— 正是它该被豁免的那一类。
+
+    r21 把豁免从"精确 id 名单"改成"前缀匹配"(`_is_signal`)时,
+    改了同文件里其他几处,**漏了这一处**。它能潜伏这么久,是因为
+    「队头恰好不是信号」;一旦队列空到只剩信号,立刻炸。
     """
     qpath = REPO / "devloop" / "queue.json"
     if not qpath.exists():
@@ -754,6 +767,11 @@ def test_real_queue_has_no_pending_item_whose_verify_already_passes():
     offenders = []
     for raw in data.get("items", []):
         if raw.get("status") != "pending":
+            continue
+        if _is_signal(raw.get("id", "")):
+            # 信号不是工作,是「当前没有活」的显式声明。
+            # 它的 verify 恒真是设计,不是假活 —— 该验的是
+            # test_signal_items_must_say_so 那三条硬要求。
             continue
         verify = raw.get("verify") or ""
         if not verify:

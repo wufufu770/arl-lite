@@ -361,5 +361,56 @@ class TestNoImportCycle(unittest.TestCase):
         self.assertEqual(cycles, [], f"检测到循环依赖: {cycles}")
 
 
+class TestNoScriptMasqueradingAsTest(unittest.TestCase):
+    """`tests/` 里的每个文件都必须真的有测试
+
+    ## 真实事故(r23)
+
+    `tests/test_edge.py` 和 `tests/test_concurrency.py` 里
+    **一个 `test_` 函数都没有** —— 全是顶层 `print` 的手工脚本
+    (27 + 18 个)。但文件名匹配 `test_*.py`,所以:
+
+    - pytest 每次收集都会 `import` 它们,副作用每次都跑
+    - `test_edge.py` 会起一个 CLI 子进程且没传 `-w`,
+      于是在**用户真实 HOME** 里建出 `default` 工作区
+    - 而 pytest 从它们身上收集到 **0 条**测试
+
+    真正的危害不是"多跑了点东西",是它**看起来像测试覆盖**:
+    README 里写着 `test_edge.py 13/13 边界`、`test_concurrency.py 7/7`。
+    那两个数字是脚本自己 print 的,pytest 从来没验证过。
+
+    和第 21 轮"置信度模型算了 20 轮没人用"、第 22 轮"恒真测试"
+    是同一类病:**看起来有,和真的有,不是一回事。**
+
+    两份脚本已移到 `scripts/edge_check.py` 与
+    `scripts/concurrency_check.py`,本条防它们再漂回来。
+    """
+
+    def test_every_tests_file_defines_at_least_one_test(self):
+        offenders = []
+        for path in sorted((REPO / "tests").rglob("test_*.py")):
+            try:
+                tree = ast.parse(path.read_text(encoding="utf-8"))
+            except SyntaxError as e:
+                offenders.append((str(path.relative_to(REPO)), f"语法错误:{e}"))
+                continue
+            n = sum(
+                1 for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name.startswith("test")
+            )
+            if n == 0:
+                offenders.append(
+                    (str(path.relative_to(REPO)),
+                     "0 个 test_ 函数 —— 是手工脚本,不该放在 tests/;"
+                     "搬去 scripts/ 并改 README"))
+        self.assertEqual(
+            offenders, [],
+            f"这些 test_*.py 里没有真正的测试:{offenders}\n"
+            "它们会被 pytest 每次收集时 import(副作用每次都跑),"
+            "却贡献 0 条覆盖 —— 比没有测试更容易骗人。"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

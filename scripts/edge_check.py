@@ -161,11 +161,20 @@ with tempfile.TemporaryDirectory() as td:
 
 # 9. CLI:不存在的 module
 print("\n[J.9] CLI 错误处理")
-import subprocess, os
-r = subprocess.run(
-    ["python3", "-m", "arl_lite", "run", "-t", "x.com", "-m", "this-module-does-not-exist"],
-    cwd=str(Path(__file__).parent.parent), env={**os.environ, "PYTHONPATH": "."},
-    capture_output=True, text=True, timeout=30,
-)
+import subprocess, os, tempfile
+# `(r23)` 这条 CLI 调用没传 `-w`,于是 CLI 正常地在**用户真实 HOME** 里
+# 建了个 `default` 工作区。以前这个文件叫 tests/test_edge.py,pytest
+# 每次收集都会 import 它 —— 于是每跑一次测试就往用户数据目录里塞一个
+# 工作区,静默的。现在它是 scripts/ 下的手工脚本,但顺手把 HOME 隔离掉:
+# 测的是"模块不存在时报错",不需要用户的真实数据。
+_env = {**os.environ, "PYTHONPATH": "."}
+with tempfile.TemporaryDirectory() as _iso_home:
+    _env["HOME"] = _iso_home
+    _env["USERPROFILE"] = _iso_home          # Windows 上 Path.home() 走这个
+    r = subprocess.run(
+        ["python3", "-m", "arl_lite", "run", "-t", "x.com", "-m", "this-module-does-not-exist"],
+        cwd=str(Path(__file__).parent.parent), env=_env,
+        capture_output=True, text=True, timeout=30,
+    )
 print(f"  exit={r.returncode}  stderr={(r.stderr or '')[:100]}")
 print(f"  stdout={(r.stdout or '')[:200]}")
