@@ -25,6 +25,9 @@ from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime
 
+from .errors import DUPLICATE as _DUPLICATE
+from .errors import classify_integrity_error as _classify_integrity_error
+
 log = logging.getLogger("arl_lite.storage")
 
 # 本存储层自有 SQL 的默认执行预算(秒)。作用:挡住 WITH RECURSIVE 无限
@@ -767,9 +770,12 @@ class Storage:
                             )
                             inserted += 1
                         except sqlite3.IntegrityError as e:
-                            msg = str(e).lower()
-                            if "unique" in msg or "conflict" in msg:
-                                # UNIQUE 冲突 = 重复,跳过
+                            # 分类必须按错误码,不能按报文:
+                            # 报文里带列名/约束表达式,叫 unique_flag 的
+                            # NOT NULL 列会被 `"unique" in msg` 误判成
+                            # 重复,于是被静默 skip 掉——丢数据还不报错。
+                            # 详见 arl_lite/db/errors.py
+                            if _classify_integrity_error(e) == _DUPLICATE:
                                 skipped += 1
                             else:
                                 # 其他约束(NOT NULL / FK / CHECK) = 真错

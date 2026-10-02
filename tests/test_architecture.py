@@ -115,21 +115,92 @@ class TestPersistenceIsolation(unittest.TestCase):
     退化路径:有人为了少写一个参数直接在业务代码里 `import sqlite3`
     连库。后果是连接管理、事务、workspace 隔离全部绕开——
     本项目三态纪律和 workspace 概念都建立在这层封装上。
+
+    ## 约束的写法演进
+
+    初版是"除了 db/storage.py 谁都不许 import sqlite3"。它抓得住退化路径,
+    但**编码的是文件名巧合而不是真实不变式**:`db/errors.py` 读一下
+    `sqlite3.SQLITE_CONSTRAINT_UNIQUE` 常量做异常分类,既不开连接也不执行
+    SQL,却被判成违规。
+
+    于是把约束改成编码**意图**:除了 storage 以外,任何文件都不得
+    **执行 SQL**(connect/execute/cursor/...)。只读常量和异常属性是允许的。
+
+    这样约束不是被放宽了,而是变准了——见同文件的
+    `test_refined_rule_still_catches_real_bypass`,它验证新规则照样能抓住
+    一个真的绕过 Storage 的文件。
     """
 
-    def test_only_storage_touches_sqlite(self):
+    # 唯一合法执行 SQL 的文件
+    SQL_ACCESS_POINT = "db/storage.py"
+
+    # 判定"执行了 SQL"的调用特征。少一个就等于开了一个绕过 Storage 的口子。
+    _SQL_CALLS = (
+        r"\.connect\s*\(",
+        r"\.execute\s*\(",
+        r"\.executemany\s*\(",
+        r"\.executescript\s*\(",
+        r"\.cursor\s*\(",
+    )
+
+    def test_only_storage_executes_sql(self):
         offenders = []
         for py in PKG.rglob("*.py"):
             rel = py.relative_to(PKG)
-            # db/storage.py 是唯一的合法访问点。用 as_posix() 字符串比较——
+            # storage.py 是唯一合法访问点。用 as_posix() 字符串比较——
             # Path.__eq__ 在跨平台时对分隔符敏感
-            if rel.as_posix() == "db/storage.py":
+            if rel.as_posix() == self.SQL_ACCESS_POINT:
                 continue
             src = py.read_text(encoding="utf-8")
-            if re.search(r"^\s*import\s+sqlite3", src, re.M):
-                offenders.append(rel.as_posix())
+            if not re.search(r"^\s*import\s+sqlite3", src, re.M):
+                continue
+            # 读常量/看异常属性不算访问;执行 SQL 才算
+            for pat in self._SQL_CALLS:
+                if re.search(pat, src):
+                    offenders.append(f"{rel.as_posix()} ({pat})")
+                    break
         self.assertEqual(offenders, [],
-                         f"sqlite3 只能由 db/storage.py 访问: {offenders}")
+                         f"SQL 只能由 {self.SQL_ACCESS_POINT} 执行: {offenders}")
+
+    def test_refined_rule_still_catches_real_bypass(self):
+        """反向验证:新规则必须真的能抓住绕过 Storage 的文件
+
+        约束被"精化"过,所以必须证明精化没有让它变空。
+        拿两段真代码过一遍判定逻辑:一个只读常量(该放行),
+        一个真的开连接(该拦下)。
+        """
+        reads_constant = (
+            "import sqlite3\n"
+            "CODES = frozenset({sqlite3.SQLITE_CONSTRAINT_UNIQUE})\n"
+            "def classify(e):\n"
+            "    return getattr(e, 'sqlite_errorcode', None) in CODES\n"
+        )
+        opens_connection = (
+            "import sqlite3\n"
+            "def run():\n"
+            "    return sqlite3.connect('data.db').execute('SELECT 1')\n"
+        )
+
+        def flagged(src: str) -> bool:
+            return any(re.search(p, src) for p in self._SQL_CALLS)
+
+        # 只读常量:放行(db/errors.py 属于这一类)
+        self.assertFalse(flagged(reads_constant),
+                         "只读 sqlite3 常量不该被判成 SQL 访问")
+        # 真开连接:必须拦下
+        self.assertTrue(flagged(opens_connection),
+                        "新规则抓不住真绕过了,约束被精化空了")
+
+    def test_storage_is_still_the_exempt_access_point(self):
+        """豁免名单必须只有 storage 一个,且它自己真的在执行 SQL
+
+        防的是"有人往豁免名单里再塞一个文件"。名单硬编码在本类里,
+        改动会在这里留下痕迹。
+        """
+        self.assertEqual(self.SQL_ACCESS_POINT, "db/storage.py")
+        src = (PKG / self.SQL_ACCESS_POINT).read_text(encoding="utf-8")
+        self.assertRegex(src, r"\.connect\s*\(",
+                         "豁免文件自己却不碰连接,豁免名存实亡")
 
 
 class TestZeroDependencyIronLaw(unittest.TestCase):
