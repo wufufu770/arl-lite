@@ -858,3 +858,103 @@ def test_exhausted_is_false_while_anything_is_claimable(tmp_path):
     assert q.exhausted() is False
     q.save([Item(id="a", title="t", detail="", status="done")])
     assert q.exhausted() is True
+
+
+# =====================================================================
+# CLI 层的 lost update:r23 实测
+# =====================================================================
+
+
+def test_devloop_add_actually_persists(tmp_path, monkeypatch):
+    """`devloop add` 报成功就必须真的落盘
+
+    ## r23 抓到的真缺陷
+
+    `_cmd_add` 原来是这么写的:
+
+        items = q.load()      # 读旧快照
+        ...
+        q.add(item)           # ← add() 自己已经读-追加-原子存盘了
+        q.save(items)         # ← 拿旧快照再存一次,把刚写的覆盖掉
+
+    典型的 lost update。症状极其恶劣:
+
+        $ arl-lite devloop add foo "标题"
+        [+] queued [P1] foo — 标题      # 退出码 0,看着完全成功
+        $ ...回读 queue.json...
+        foo 不在里面
+
+    退出码 0、输出漂亮、条目却**根本没进队列**。
+    r23 实测:登记的 `test-writes-real-home` 凭空消失,
+    既不是 done 也不是 dropped,查不到任何痕迹。
+
+    **登记工作的工具在静默丢弃工作。** 这比"队列空掉"严重得多 ——
+    人以为活已经记下了,于是永远不会去做它。
+
+    ## 判据
+
+    走真实的 CLI 入口(不是直接调 `Queue.add`),因为丢更新发生在
+    CLI 那一层。只验 `Queue.add` 是绿的,恰恰是它当初能溜过去的原因。
+    """
+    from arl_lite.devloop import cli as devloop_cli
+
+    dev = tmp_path / "devloop"
+    dev.mkdir()
+    qpath = dev / "queue.json"
+    Queue(qpath).save([])          # 空队列,排除干扰
+
+    monkeypatch.setattr(devloop_cli, "_loop",
+                        lambda: type("L", (), {"dev_dir": dev})())
+
+    class A:
+        item_id = "cli-persist-probe"
+        title = "CLI 落盘探针"
+        detail = ""
+        priority = 1
+        kind = "change"
+        verify = "echo x"
+
+    rc = devloop_cli._cmd_add(A())
+    assert rc == 0, f"add 返回非 0:{rc}"
+
+    ids = [i.id for i in Queue(qpath).load()]
+    assert "cli-persist-probe" in ids, (
+        f"devloop add 报成功(退出码 0)但条目没落盘。当前队列:{ids}\n"
+        "CLI 在拿 add() 之前的旧快照覆盖回去 —— lost update。"
+        "登记工作的工具在静默丢弃工作。"
+    )
+
+
+def test_devloop_add_keeps_previously_queued_items(tmp_path, monkeypatch):
+    """连着 add 两次,两条都得在
+
+    上一条只验"新条目在不在"。这条验**没有连带把旧的弄丢** ——
+    丢更新最隐蔽的形态就是"新条目进去了,顺手挤掉了别的"。
+    """
+    from arl_lite.devloop import cli as devloop_cli
+
+    dev = tmp_path / "devloop"
+    dev.mkdir()
+    qpath = dev / "queue.json"
+    Queue(qpath).save([])
+    monkeypatch.setattr(devloop_cli, "_loop",
+                        lambda: type("L", (), {"dev_dir": dev})())
+
+    def add(iid):
+        class A:
+            item_id = iid
+            title = f"标题{iid}"
+            detail = ""
+            priority = 1
+            kind = "change"
+            verify = "echo x"
+        assert devloop_cli._cmd_add(A()) == 0
+
+    add("first")
+    add("second")
+    add("third")
+
+    ids = [i.id for i in Queue(qpath).load()]
+    assert ids == ["first", "second", "third"], (
+        f"连着 add 三次只剩 {ids} —— 每次 add 都在覆盖前一次的结果"
+    )

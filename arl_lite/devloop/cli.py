@@ -232,7 +232,6 @@ def _cmd_add(args) -> int:
     from .queue import Item, Queue
     lp = _loop()
     q = Queue(lp.dev_dir / "queue.json")
-    items = q.load()
     prio = getattr(args, "priority", 1)
     item = Item(
         id=args.item_id,
@@ -242,8 +241,26 @@ def _cmd_add(args) -> int:
         kind=getattr(args, "kind", "change"),
         verify=getattr(args, "verify", "") or "",
     )
+    # `(r23 修)` 原来这里还有 `items = q.load()` 在前、`q.save(items)` 在后。
+    # 而 `Queue.add()` **自己已经读-追加-原子存盘了**,所以后面那句
+    # `q.save(items)` 拿的是 add 之前读到的**旧快照**,一存就把刚写进去的
+    # 条目覆盖掉了 —— 典型的 lost update。
+    #
+    # 症状极其恶劣:`devloop add` 打印 "[+] queued ...",退出码 0,
+    # 看起来完全成功,而条目**根本没进队列**。
+    # r23 实测抓到:登记的 `test-writes-real-home` 凭空消失,
+    # 既不是 done 也不是 dropped。
+    #
+    # **登记工作的工具在静默丢弃工作。** 这比"队列空掉"严重得多。
+    # 不变式 #8(读-改-写整段进临界区)本来管的就是这类事,
+    # 只是这次发生在 CLI 层而不是引擎层。
     q.add(item)
-    q.save(items)
+    # 回读一次确认真的落盘了 —— 报告成功之前先验证,
+    # 这正是本项目反复吃过亏的地方(r21 的无消费者、r22 的谎报文档)
+    persisted = any(i.id == item.id for i in q.load())
+    if not persisted:
+        print(f"[!] add 失败:{item.id} 没能落盘到 {q.path}", file=sys.stderr)
+        return 1
     print(f"[+] queued [{['P0','P1','P2','P3'][prio] if prio < 4 else prio}] {item.id} — {item.title}")
     return 0
 
