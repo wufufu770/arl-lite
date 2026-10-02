@@ -16,6 +16,7 @@ BUILD → TEST → IMPROVE → PLAN → STATE 的状态机。
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -284,8 +285,12 @@ class Loop:
                     "queue exhausted and seeding produced nothing — "
                     "the protocol has no next step; add items manually",
                 )
-            state.current_note = f"seeded {added} new item(s)"
-            q.save(items)
+            # r31:这行原来写的是 q.save(items) —— 改的是 state.current_note,
+            # 保存的却是**原封不动**的队列。一次无锁、无意义、但确实写盘的
+            # save,像是早期把 self.store.save 写错了对象留下的。删掉。
+            note_text = f"seeded {added} new item(s)"
+            self.store.mutate(lambda st: setattr(st, "current_note", note_text))
+            state.current_note = note_text
             return StepResult(PHASE_PLAN, True, f"queue exhausted, seeded {added} new item(s)")
         nxt = active[0]
         return StepResult(
@@ -407,15 +412,18 @@ class Loop:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _pick_item(q, items, item_id, record):
-        """取本轮要做的待办,并把"谁定的"记进 record(r28)
+    def _check_explicit_item(q, item_id, record):
+        """显式指定的待办必须**当前可做**,否则直接拒绝(r28)
 
-        显式指定优先。显式指的那条必须**当前可做**(pending / in_progress),
-        否则直接抛错:对一条已经 done 的条目记"本轮完成了它",是本协议
-        见过最恶劣的一类假账(7.17 / 7.18 各记了一例同族症状)。
+        只做校验和记账,不负责认领 —— 认领由带锁的 `Queue.claim()` 完成
+        (r31)。这两件事必须分开:校验是"要不要做这一条"的判断,
+        认领是"把它从 pending 变成 in_progress"的动作,后者必须原子。
+
+        对一条已经 done 的条目记"本轮完成了它",是本协议见过最恶劣的
+        一类假账(7.17 / 7.18 各记了一例同族症状)。
         """
         if item_id:
-            found = next((i for i in items if i.id == item_id), None)
+            found = next((i for i in q.load() if i.id == item_id), None)
             if found is None:
                 raise LookupError(f"no such item in queue: {item_id!r}")
             if found.status not in ("pending", "in_progress"):
@@ -424,9 +432,17 @@ class Loop:
                     f"refusing to record a round against it"
                 )
             record.item_selection = "explicit"
-            return found
-        record.item_selection = "auto"
-        return q.next(items)
+        else:
+            record.item_selection = "auto"
+
+    @staticmethod
+    def _owner() -> str:
+        """本轮的认领者标识。
+
+        r31 之前 round 认领**不记 owner**,于是 `recover_stale_in_progress`
+        只能报「认领者无法探测」,退路判断被迫靠"认领多久了"这种猜测。
+        """
+        return f"round-pid-{os.getpid()}"
 
     def round(
         self,
@@ -495,12 +511,18 @@ class Loop:
             if seeded > 0:
                 messages.append(f"queue was empty, seeded {seeded} item(s)")
 
-        item = self._pick_item(q, items, item_id, record)
+        # r31:走带锁的 `q.claim()`,不再自己 load→改→save。
+        # claim 在一把锁里完成 load→挑→标 in_progress→save,所以两个并发
+        # round 拿到的一定是**不同的条目**;而裸 load→save 时它们可能同时
+        # 挑中同一条,然后互相把对方的 status 改回去。
+        self._check_explicit_item(q, item_id, record)
+        item = q.claim(owner=self._owner(), item_id=item_id)
+        if item is None and item_id:
+            raise LookupError(
+                f"item {item_id!r} 校验之后变得不可认领了"
+                f"(可能被别的 agent 领走或完成);拒绝拿别的条目记账"
+            )
         if item is not None:
-            q.mark_in_progress(item)
-            # 必须保存**同一个 list**——重新 load() 会拿到新对象,
-            # 原地改的 status/attempts 就丢了
-            q.save(items)
             record.item_id = item.id
             record.item_title = item.title
 
@@ -562,21 +584,19 @@ class Loop:
             record.result = RESULT_NOOP
             record.note = "no pending item"
         else:
-            target = next((i for i in items if i.id == item.id), None)
             if t.ok:
                 record.result = RESULT_DONE
-                if target is not None:
-                    q.mark_done(target, state.round + 1)
+                # r31:带锁的收尾入口,顺带清掉 owner/claimed_at。
+                # 原来在裸 items 上 mark_done 完再 q.save(items) 整份写回。
+                q.finish(item.id, ok=True, round_no=state.round + 1)
                 done_delta = 1
             else:
                 # 门禁没过 = 失败,如实记录(不退回去假装没事)
                 record.result = RESULT_DONE_WITH_FAILURES
-                if target is not None:
-                    # 退回 pending。attempts 已在 mark_in_progress 时 +1,
-                    # 连续失败会被这里累加,识别反复卡住的待办
-                    target.status = "pending"
-                    target.note = f"gates failed: {', '.join(record.blocking_failures)}"
-            q.save(items)
+                # 退回 pending + 记下是哪几道门没过。attempts 已在 claim
+                # 时 +1,连续失败会被累加,识别反复卡住的待办。
+                q.release(item.id, note=f"gates failed: "
+                                        f"{', '.join(record.blocking_failures)}")
 
         # 6.5 不变式 #4 的后置条件:轮次结束时队列必须还有下一步。
         #     PLAN 跑在队列更新之前,只看它会漏掉"本轮刚好把最后一条做掉"

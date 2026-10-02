@@ -1764,6 +1764,62 @@ AST 检查立刻抓到了**真漏网的一处**:`phase_build` 里还有一句
 
 ---
 
+### 7.22 同一个病,队列那一侧还没修
+
+7.21 把**状态**落盘全改成"只提交增量"了。队列这一侧是同一个病:
+
+`queue.py` 的 `claim` / `release` / `finish` / `recover_stale` 才是带
+`file_lock` 的正确入口 —— 不变式 #8 原话就是「它们是唯一正确入口」。
+而 `round()` 一处都没用,全是裸的:
+
+    481  items = q.load()
+    500  q.mark_in_progress(item)     <- 原地改
+    503  q.save(items)                <- 整份写回,无锁
+    579  q.save(items)                <- 同上
+
+两个并发 round 会同时挑中同一条(都是优先级最高的 pending),然后一个把
+它标 done、另一个的旧快照把它写回 pending。
+`test_two_concurrent_rounds_claim_different_items` 钉的就是这一条:
+4 个真进程并发跑 round,领到的条目必须互不相同。
+
+### 顺带修掉一处更隐蔽的
+
+`phase_plan` 里:
+
+```python
+state.current_note = f"seeded {added} new item(s)"
+q.save(items)          # <- 改的是 state,保存的却是原封不动的队列
+```
+
+改的是 `state`、存的是队列,而队列一个字都没变。一次**无锁、无意义、
+但确实写盘**的 save —— 像是早期把 `self.store.save` 写错对象留下的。
+删掉,改成 `store.mutate` 只推 `current_note`。
+
+### 顺带修好的一个功能
+
+round 认领以前**不记 owner**,所以 `recover_stale_in_progress` 只能报
+「认领者无法探测」,判断一条 `in_progress` 是死是活只能靠"认领多久了"
+猜。r30 那次 round 的日志原文:
+
+```
+recover_stale_in_progress: 1 条 in_progress 有人认领,保留:
+  [('queue-bookkeeping-truthfulness', '认领者无法探测,但认领才 480s,当它是活的')]
+```
+
+改用 `q.claim(owner=...)` 之后 owner 真的记上了(`round-pid-<pid>`)。
+
+### 断言写成"非空"是抓不住的
+
+验 owner 那条第一版只断言 `owner` 非空,变异把 `owner=self._owner()`
+删掉之后**照样全绿** —— 因为 `Queue.claim` 的默认 owner 是
+`f"pid-{os.getpid()}"`,忘了传也非空。改成断言具体前缀 `round-pid-`
+才杀掉。
+
+> 能被默认值兜底的断言,等于没写。断言要问的是"是不是**它**",
+> 不是"有没有"。
+
+---
+
 ## 8. 状态落盘（state.json）
 
 ### 8.1 文件路径与写时机
