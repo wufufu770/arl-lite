@@ -439,21 +439,34 @@ _PYTEST_SUMMARY_RE = re.compile(
     r"(?:[^,\n]*?,\s*(?P<passed>\d+)\s+passed)?"  # 可选 ", M passed"
 )
 
+# 失败测试的完整身份("FAILED tests/x.py::test_y"),要 pytest 的 -rf 才会打。
+#
+# r27:门禁原本只比 failed 总数。总数持平 ≠ 没回归——同时修好一条旧失败、
+# 又引入一条全新失败,总数一模一样,而新回归会被基线悄悄吸收(实测:门禁
+# 报 passed=True,放行了一条亲手注入的真回归)。所以按身份判定。
+_FAILED_ID_RE = re.compile(r"^FAILED\s+(\S+)", re.M)
+
 
 class TestBaselineGate:
     """防的退化:已有测试悄悄退步,CI 没拦住。
 
-    跑 pytest,对比 failed 数;只许降不许升(降了是改进,可 update_baseline)。
+    跑 pytest,对比失败;**按测试身份判定,不看总数**。
+
+    r27 实测的失效形态:基线记的是 failed 总数。同时修好一条既有失败、
+    又引入一条全新失败,总数持平,旧门禁直接放行——它守的是「数字没涨」,
+    不是「原来绿的还是绿的」。
     """
 
     name = "test_baseline"
     blocking = True
 
     def run(self, repo: Path) -> GateResult:
-        baseline = load_baseline(repo)
-        prev_failed = baseline.get(self.name, {}).get("failed", 0)
+        base = load_baseline(repo).get(self.name, {})
+        prev_failed = base.get("failed", 0)
+        known = set(base.get("allowed_failures") or ())
 
-        cmd = [sys.executable, "-m", "pytest", "tests/", "-q"]
+        # -rf 把失败身份打进 summary;--tb=no 是门禁不需要 traceback,省时间
+        cmd = [sys.executable, "-m", "pytest", "tests/", "-q", "--tb=no", "-rf"]
         if _has_pytest_timeout():
             cmd.append("--timeout=300")
 
@@ -500,33 +513,96 @@ class TestBaselineGate:
 
         failed = int(m.group("failed"))
         passed = int(m.group("passed") or 0)
+        failed_ids = set(_FAILED_ID_RE.findall(output))
+        measured: dict = {"failed": failed, "passed": passed}
 
-        # failed 比 baseline 多就是回归
+        if not failed_ids:
+            # 没拿到身份(例如 -rf 输出没解析出来):退回按总数判。
+            # 保守方向是红,所以总数涨了必须报。
+            if failed > prev_failed:
+                return GateResult(
+                    name=self.name,
+                    passed=False,
+                    detail=(
+                        f"regression! baseline failed={prev_failed}, "
+                        f"now failed={failed} (+{failed - prev_failed}); "
+                        f"passed={passed} (no per-test identities parsed)"
+                    ),
+                    measured=measured,
+                    baseline=prev_failed,
+                    blocking=self.blocking,
+                )
+            return GateResult(
+                name=self.name,
+                passed=True,
+                detail=f"failed={failed} (baseline={prev_failed}), passed={passed}",
+                measured=measured,
+                baseline=prev_failed,
+                blocking=self.blocking,
+            )
+
+        if known:
+            # 身份模式——r27 修的就是这一支。
+            # 门禁绝不自己改白名单:少失败只提示,收紧得由人来(否则门禁可以
+            # 通过「把新失败写进基线」让自己变绿)。
+            measured["allowed_failures"] = sorted(known)
+            newcomers = sorted(failed_ids - known)
+            if newcomers:
+                return GateResult(
+                    name=self.name,
+                    passed=False,
+                    detail=(
+                        f"regression! {len(newcomers)} failure(s) outside the "
+                        f"{len(known)} known baseline failures: "
+                        f"{'; '.join(newcomers)}"
+                    ),
+                    measured=measured,
+                    baseline=prev_failed,
+                    blocking=self.blocking,
+                )
+            healed = sorted(known - failed_ids)
+            detail = (
+                f"all {failed} failure(s) are known baseline ones; passed={passed}"
+            )
+            if healed:
+                detail += (
+                    f"; {len(healed)} now pass, shrink allowed_failures: "
+                    f"{'; '.join(healed)}"
+                )
+            return GateResult(
+                name=self.name,
+                passed=True,
+                detail=detail,
+                measured=measured,
+                baseline=prev_failed,
+                blocking=self.blocking,
+            )
+
+        # 旧格式基线(只记总数):这一轮把身份建起来,之后按身份判。
+        # 记的是现状,不代表替现状背书——所以总数若在涨,这一轮照样报红,
+        # 免得「升级基线」变成掩盖新回归的后门。
+        measured["allowed_failures"] = sorted(failed_ids)
         if failed > prev_failed:
             return GateResult(
                 name=self.name,
                 passed=False,
                 detail=(
-                    f"regression! baseline failed={prev_failed}, "
-                    f"now failed={failed} (+{failed - prev_failed}); "
-                    f"passed={passed}"
+                    f"regression! baseline failed={prev_failed}, now failed={failed} "
+                    f"(+{failed - prev_failed}); identities recorded but count rose: "
+                    f"{'; '.join(sorted(failed_ids))}"
                 ),
-                measured={"failed": failed, "passed": passed},
+                measured=measured,
                 baseline=prev_failed,
                 blocking=self.blocking,
             )
-
-        # 通过(持平或改善)
-        detail = (
-            f"failed={failed} (baseline={prev_failed}), passed={passed}"
-            if prev_failed > 0
-            else f"first run: failed={failed}, passed={passed} (baseline established)"
-        )
         return GateResult(
             name=self.name,
             passed=True,
-            detail=detail,
-            measured={"failed": failed, "passed": passed},
+            detail=(
+                f"baseline upgraded from count to identity: {failed} failure(s) "
+                f"recorded: {'; '.join(sorted(failed_ids))}"
+            ),
+            measured=measured,
             baseline=prev_failed,
             blocking=self.blocking,
         )

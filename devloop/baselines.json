@@ -71,20 +71,47 @@
       "gate": "loc_budget",
       "reason": "r20:红线纳入 devloop accept 留痕机制后的首次正式提升。补余量到 50 的倍数,避免提到实测值等于零余量、下一行代码又红",
       "round": 19
+    },
+    {
+      "at": "2026-10-02T21:57:53",
+      "changes": {
+        "devloop_code_loc": {
+          "from": 2550,
+          "to": 2650
+        },
+        "total_loc": {
+          "from": 14254,
+          "to": 14514
+        }
+      },
+      "gate": "loc_budget",
+      "reason": "r27 修 test_baseline 只比失败总数的盲区(实测:同时修好一条旧失败、引入一条全新失败,总数 10==10,旧门禁报 passed=True 放行了亲手注入的真回归)。改为按测试身份判定,新增 -rf 身份解析、白名单比对、无身份/有白名单/旧格式迁移三段分支,门禁逻辑净增 57 行。",
+      "round": 26
     }
   ],
   "doc_freshness": 0,
   "loc_budget": {
-    "devloop_code_loc": 2550,
+    "devloop_code_loc": 2650,
     "devloop_loc": 2617,
-    "total_loc": 14254
+    "total_loc": 14514
   },
   "no_import_cycle": 0,
   "no_thirdparty_import": 0,
   "prompt_injection_guard": 1,
   "rules_have_advice": 37,
   "test_baseline": {
+    "allowed_failures": [
+      "tests/test_phase1.py::test_3state_discipline",
+      "tests/test_phase1.py::test_base_module_3state",
+      "tests/test_phase1.py::test_crtsh_module_mock",
+      "tests/test_phase2.py::test_9_sources_integration",
+      "tests/test_phase2.py::test_concurrent_isolation",
+      "tests/test_phase2.py::test_e2e_chain",
+      "tests/test_phase2.py::test_httpx_probe_integration",
+      "tests/test_phase2.py::test_portscan_integration",
+      "tests/test_phase3.py::test_e2e_full"
+    ],
     "failed": 9,
-    "passed": 293
+    "passed": 433
   }
 }

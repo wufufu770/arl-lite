@@ -7,7 +7,18 @@
 4. 队列耗尽自动播种(永远有下一步)
 5. item 追踪正确(多 Queue 实例不互相覆盖)
 
-这些测试刻意用快的门禁子集(test_baseline 要跑 35 秒,不适合单测)。
+## 不变式 2 已经搬走了(r27)
+
+这里曾经有一条 `test_gate_failure_is_recorded_not_swallowed`,
+名字写着「门禁失败必须写进状态」,实际跑的是一道**绿**门禁并断言
+`RESULT_DONE` —— 验的恰好是这条不变式的反面;它那句想逼出失败的
+monkeypatch 因为只跑了别的门禁,从未生效。见 docs/devloop-protocol.md 7.18。
+
+真正的覆盖在 `tests/test_gate_failure_recorded.py`:伪造红门禁,
+断言状态降级成 `DONE_WITH_FAILURES`、待办退回 pending、失败门禁名被记下。
+5 个变异全被杀。
+
+这些测试刻意用快的门禁子集(test_baseline 要跑 2 分钟,不适合单测)。
 """
 from __future__ import annotations
 
@@ -21,7 +32,7 @@ from arl_lite.devloop.protocol import Loop, RETREAT_THRESHOLD
 from arl_lite.devloop.queue import Queue, Item
 from arl_lite.devloop.state import (
     StateStore, RoundRecord, LoopState,
-    RESULT_DONE, RESULT_DONE_WITH_FAILURES, RESULT_NOOP, RESULT_RETREATED,
+    RESULT_DONE, RESULT_NOOP, RESULT_RETREATED,
 )
 
 def _find_repo_root() -> Path:
@@ -211,20 +222,6 @@ class TestLoopRound(unittest.TestCase):
             self.assertNotIn(out.record.item_id, seen, "同一待办被重复完成")
             seen.add(out.record.item_id)
         self.assertEqual(self.lp.status().items_done, 3)
-
-    def test_gate_failure_is_recorded_not_swallowed(self):
-        """门禁失败必须写进状态,不能被'处理掉'"""
-        from arl_lite.devloop import gates
-        orig = gates.load_baseline
-        # 把 baseline 改成 0,让 9 个既有失败被误判为回归
-        gates.load_baseline = lambda repo: {"test_baseline": {"failed": 0, "passed": 45}}
-        try:
-            # 只跑一个必然失败的逻辑:注入 baseline 后 test_baseline 必挂
-            out = self.lp.round(only_gates=["no_import_cycle"])
-            # no_import_cycle 实际是过的,这里只验证"通过时记 DONE"
-            self.assertEqual(out.record.result, RESULT_DONE)
-        finally:
-            gates.load_baseline = orig
 
     def test_status_never_raises(self):
         text = self.lp.status_text()

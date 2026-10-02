@@ -62,22 +62,34 @@ def test_no_case_crashed(report):
 # =====================================================================
 
 
-def _bench_with_patched_rule(yaml_name: str, transform) -> dict:
-    """把某条规则临时改掉,跑一遍基准,再还原"""
-    f = RULES / yaml_name
-    original = f.read_text(encoding="utf-8")
-    try:
-        f.write_text(transform(original), encoding="utf-8")
-        rep = fb.analyze(fb.run_bench())
-        return {
-            "total_fp": rep.total_fp,
-            "fp": {n for r in rep.results for n in r.false_positives},
-        }
-    finally:
-        f.write_text(original, encoding="utf-8")
+def _bench_with_patched_rule(yaml_name: str, transform, tmp_path: Path) -> dict:
+    """把规则改在**副本**上跑基准,不碰仓库源码。
+
+    r27 实测撞见过:原实现直接改写
+    `arl_lite/modules/analysis/rules/jenkins_public.yml` 再靠 finally 还原。
+    那是拿真实源码当沙箱,坏在三处——
+
+    1. 改写的窗口期内,任何并行测试(本仓库有多 agent 真进程用例)读到的
+       就是被改坏的规则;
+    2. 进程被杀/崩溃时 finally 不执行,规则**永久**留在改坏状态;
+    3. 平时完全看不见。实测时 `git status` 只在恰好那几秒显示 M,之后又
+       干净,差点被误判成我自己改的。
+
+    `run_bench` 本来就有 `rules_dir` 参数,这里用它把改写关进 tmp 目录。
+    """
+    patched = tmp_path / "rules"
+    shutil.copytree(RULES, patched)
+    target = patched / yaml_name
+    target.write_text(
+        transform(target.read_text(encoding="utf-8")), encoding="utf-8")
+    rep = fb.analyze(fb.run_bench(rules_dir=patched))
+    return {
+        "total_fp": rep.total_fp,
+        "fp": {n for r in rep.results for n in r.false_positives},
+    }
 
 
-def test_benchmark_catches_missing_state_open_check():
+def test_benchmark_catches_missing_state_open_check(tmp_path):
     """把 exposed_database 的 state='open' 去掉,基准必须报出误报
 
     这就是实测抓到的那个 bug:state='closed' 的 6379 端口也报
@@ -86,13 +98,13 @@ def test_benchmark_catches_missing_state_open_check():
     def strip_state(src: str) -> str:
         return src.replace(" AND state = 'open'", "")
 
-    out = _bench_with_patched_rule("exposed_database.yml", strip_state)
+    out = _bench_with_patched_rule("exposed_database.yml", strip_state, tmp_path)
     assert "exposed_database" in out["fp"], (
         f"去掉 state='open' 后基准没报出误报,基准测不出这个回归: {out}"
     )
 
 
-def test_benchmark_catches_missing_aggregation():
+def test_benchmark_catches_missing_aggregation(tmp_path):
     """去掉 db_asset_diversity 的 count_min,基准必须报出误报
 
     单个 Redis 指纹就触发「workspace 内 2 个数据库」——名字和逻辑对不上。
@@ -100,13 +112,13 @@ def test_benchmark_catches_missing_aggregation():
     def strip_count(src: str) -> str:
         return re.sub(r"^count_min:\s*\d+\s*$", "", src, flags=re.M)
 
-    out = _bench_with_patched_rule("db_asset_diversity.yml", strip_count)
+    out = _bench_with_patched_rule("db_asset_diversity.yml", strip_count, tmp_path)
     assert "db_asset_diversity" in out["fp"], (
         f"去掉 count_min 后基准没报出误报: {out}"
     )
 
 
-def test_benchmark_catches_missing_exclusion():
+def test_benchmark_catches_missing_exclusion(tmp_path):
     """去掉 phpmyadmin_public 的认证层 exclusion,基准必须报出误报
 
     面板架在 Keycloak 后面照样报「暴露公网」。
@@ -116,13 +128,13 @@ def test_benchmark_catches_missing_exclusion():
             r"exclusion:\n(?:  - table:.*\n(?:    .*\n)+)+", "", src, flags=re.M,
         )
 
-    out = _bench_with_patched_rule("phpmyadmin_public.yml", strip_exclusion)
+    out = _bench_with_patched_rule("phpmyadmin_public.yml", strip_exclusion, tmp_path)
     assert "phpmyadmin_public" in out["fp"], (
         f"去掉 exclusion 后基准没报出误报: {out}"
     )
 
 
-def test_benchmark_detects_a_broadly_broken_rule():
+def test_benchmark_detects_a_broadly_broken_rule(tmp_path):
     """把任意一条规则改成"什么都命中",基准必须抓得住
 
     兜底:证明基准不是只对上面三个特定 bug 敏感。
@@ -130,7 +142,7 @@ def test_benchmark_detects_a_broadly_broken_rule():
     def match_everything(src: str) -> str:
         return re.sub(r'where:\s*".*?"', 'where: "1=1"', src, count=1)
 
-    out = _bench_with_patched_rule("jenkins_public.yml", match_everything)
+    out = _bench_with_patched_rule("jenkins_public.yml", match_everything, tmp_path)
     assert out["total_fp"] > 0, f"规则改成 1=1 都没报出误报: {out}"
 
 
