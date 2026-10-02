@@ -233,6 +233,54 @@ def test_failed_finish_does_not_write_a_done_provenance(tmp_path):
     )
 
 
+def test_cli_done_item_also_writes_provenance(tmp_path):
+    """`devloop done-item` 这扇门以前也漏了 note —— r36 补上
+
+    r34 只把 provenance 接在了 `round()` 上,`arl-lite devloop done-item`
+    这条路直接调 `q.finish(...)` 而**不传 note**,于是手工交上来的活一样是
+    空凭据。r36 补记 r35 那两条从未进过队列的记录时,一眼看见 note 全空。
+
+    手工交活正是最需要凭据的场景:agent 独立干活,交活发生在两次 round
+    之间,没有 `round()` 替它写任何东西。
+
+    判据是「是不是**空**」而不是「内容长什么样」—— 这条守的是
+    「这扇门有没有漏」,格式改动不该让它红。
+    """
+    from arl_lite.devloop import cli as climod
+
+    d = tmp_path
+    (d / "devloop").mkdir()
+    q = Queue(d / "devloop" / "queue.json")
+    q.add(Item(id="hand-done", title="手工交上来的活", priority=1, kind="change",
+               verify="true", detail="", tags=[]))
+    q.claim(owner="agent-x", item_id="hand-done")
+
+    class _Args:
+        item_id = "hand-done"
+        owner = "agent-x"
+        fail = False
+
+    real_loop = climod._loop
+    try:
+        class _FakeLoop:
+            dev_dir = d / "devloop"
+
+            def status(self):
+                return type("S", (), {"round": 12})()
+        climod._loop = lambda: _FakeLoop()
+        climod._cmd_finish_item(_Args())
+    finally:
+        climod._loop = real_loop
+
+    after = next(i for i in Queue(d / "devloop" / "queue.json").load()
+                 if i.id == "hand-done")
+    assert after.status == "done"
+    assert after.note.strip(), (
+        "devloop done-item 交出来的活没有凭据 —— 和引擎写的 done "
+        "长得一样,分不出真假"
+    )
+
+
 # --- 同一类病:docstring 看着写了,其实没写成 ---
 
 def test_public_queue_methods_keep_their_docstrings():

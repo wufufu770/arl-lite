@@ -31,7 +31,7 @@ import pytest
 from arl_lite.devloop import gates
 from arl_lite.devloop.gates import GateResult
 from arl_lite.devloop.protocol import Loop
-from arl_lite.devloop.queue import Item, Queue
+from arl_lite.devloop.queue import Item, Queue, _slugify_id
 
 REPO = Path(__file__).parents[1]
 
@@ -316,24 +316,44 @@ def test_real_backlog_titles_still_map_to_their_done_records(loop):
     它从来没验到过自己想验的东西。
 
     现在改成:逐条看 detail 里有没有 ✅,有就必须 done/dropped。
+
+    ## r36:不能再用 `_seed_from_backlog` 来"读"这个文件
+
+    这条测试原来用播种函数读 backlog("走真实解析路径,不重新实现")。
+    r36 让 `_seed_from_backlog` 真的跳过 `detail` 开头的 ✅ 行(那个标记
+    原来对播种毫无作用,见 docs 7.27),于是这个读法**恰好读不到自己要
+    验的那批行** —— `marked_done` 恒为空,前置条件断言直接红。
+
+    改用 `Queue._BACKLOG_LINE` 直接读。**不是重新实现解析器** —— 那就是
+    引擎自己的正则,只是绕开了播种的过滤。播种是"该做什么",这里要的是
+    "文件里写了什么",两件事。
+
+    这也记一笔:拿一个**会过滤**的函数当数据源用,迟早出事。
     """
     dev = REPO / "devloop"
     q = Queue(dev / "queue.json")
-    # 走真实解析路径,不重新实现
-    items = q._seed_from_backlog(set(), 1)
-    assert items, "真实 backlog.md 解析不出条目"
+    # 用引擎自己的正则读**全部**条目(含已完成行),不走播种的过滤
+    entries = []
+    for line in (dev / "backlog.md").read_text(encoding="utf-8").splitlines():
+        m = Queue._BACKLOG_LINE.match(line)
+        if m:
+            entries.append({
+                "id": _slugify_id(m.group(3).strip(), 0),
+                "detail": m.group(4).strip(),
+            })
+    assert entries, "真实 backlog.md 解析不出条目"
 
     known = {i.id: i.status for i in q.load()}
-    marked_done = [i for i in items if "✅" in i.detail]
+    marked_done = [e for e in entries if "✅" in e["detail"]]
     assert marked_done, (
         "backlog.md 里一条 ✅ 都没有 —— 前置条件不成立,"
         "这条测试现在什么都验不到"
     )
 
     lost = sorted(
-        f"{i.id}(队列里是 {known.get(i.id, '无记录')})"
-        for i in marked_done
-        if known.get(i.id) not in ("done", "dropped")
+        f"{e['id']}(队列里是 {known.get(e['id'], '无记录')})"
+        for e in marked_done
+        if known.get(e["id"]) not in ("done", "dropped")
     )
     assert not lost, (
         f"backlog.md 里标了 ✅ 却不是 done/dropped:{lost}\n"

@@ -28,6 +28,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -148,10 +149,20 @@ def _cmd_finish_item(args) -> int:
     # (agent 独立干活),写 None 等于丢掉"这件事是第几轮完成的",
     # 后面 history 里出现 done_round=null 就没法归因了。
     round_no = None if failed else loop.status().round
+    # r36:这条路径以前也不写 note,于是 `devloop done-item` 交出来的活
+    # 一样是"空凭据"。r34 只把 provenance 接在了 `round()` 上,漏了这扇门
+    # —— 实测补记 r35 那两条记录时才发现它们 note 全空。
+    # 空 note 的危害不是"少个字段":r22 就是拿空 note 当"活没做"的证据,
+    # 写出一条假指控。完成的凭据必须自己说明白是谁、哪一轮交上来的。
+    note = ""
+    if not failed:
+        who = getattr(args, "owner", "") or os.environ.get("ARL_AGENT", "") or "operator"
+        note = f"done r{round_no} · source=operator · via=done-item · by={who}"
     ok = q.finish(
         args.item_id,
         ok=not failed,
         owner=getattr(args, "owner", "") or "",
+        note=note,
         round_no=round_no,
     )
     if not ok:

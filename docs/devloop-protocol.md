@@ -2207,6 +2207,160 @@ r34 全部门禁 6/0/0、487 条测试全过,却把一条
 
 ---
 
+### 7.27 散文 verify:让人写待办,但不许拿散文当验收
+
+r35 给 `Queue.verify_result()` 定了三态,散文一律 `unknown`、**不构成结论**。
+那是兜底。这一轮做的是让散文**根本进不了 `backlog.md`**。
+
+## 三条改写,信息一条没丢
+
+| 条目 | 原 verify(散文) | 改成 |
+|---|---|---|
+| `confidence-status` | 「HTML 里 discard 的不出现在主表(可 grep 断言)…」 | `python3 -m pytest tests/test_confidence_reporting.py -q` |
+| `confidence` | 「造 60 条关联,置信度最高的那条排在最后…」 | 同上 |
+| `confidence-risk` | 「docs/ 里有一节说明…两者正交」 | `test -f docs/… && grep -q 正交 docs/…` |
+
+散文原话**整段搬进 `detail` 段**。这不是丢信息,是**分开两件事**:
+
+> `detail` 回答「该怎么做」,`verify` 回答「做完没有」。
+
+散文能表达前者,表达不了后者。而 `backlog.md` 的表头本来就写着
+`title | detail | verify` 三段格式 —— 只是从来没人真的按这个分工用过。
+
+## 一个自指的坑:检查"别人能不能跑"的测试,把自己也拿去跑了
+
+第一版的 `test_every_backlog_verify_is_a_runnable_command` 调
+`Queue.verify_result()`,而它是**真的执行**命令的。后果:
+
+```
+跑本文件 → 跑每条 verify → 其中一条是
+            python3 -m pytest tests/test_backlog_verify_is_commandable.py
+          → 也就是再跑一次本文件 → …
+```
+
+本文件耗时 43 秒,超过 `verify_result` 的 30 秒超时。于是它**自己的**
+verify 被判成 `unknown`,测试红了 —— 而且是自指地红:一个检查"别人
+能不能跑"的测试,把自己也拿去跑了。
+
+改法是判据只**看形状不执行**:第一个词在白名单里(`python3`/`test`/`true`),
+且 `bash -n` 判语法合法。耗时 43 秒 → **0.23 秒**。
+
+"真的能跑通"是**收尾闸门**的职责(它跑 verify 并在 fail 时拦),测试
+不重复门禁的工作。
+
+## 三条测试,三条不同的守
+
+1. `test_every_backlog_verify_is_a_runnable_command` —— 形状。
+2. `test_is_commandable_helper_itself` —— **判据本身**。上一条以它为前提;
+   前提坏掉时上一条不会红(检查不到不存在的东西),所以前提要单独测。
+   这条是变异测试逼出来的:把 `bash -n` 短路掉,18 条测试原本全绿 ——
+   因为眼下没有 verify 语法坏。但它是真会发生的:
+   `python3 -m pytest tests/foo(1).py` 能过白名单,到运行时才炸。
+3. `test_detector_whitelist_is_not_widened_silently` —— 白名单只能**显式**
+   增长,让"悄悄放宽"变成看得见的一行 AST 改动。
+
+> 第 2、3 条都是"检查检查者"的测试。这类测试平时最不起眼,但删掉判据
+> 的那一天,只有它们会红。
+
+## 第五处:`✅` 标记对播种毫无作用
+
+`backlog.md` 的表头写着:
+
+> 播种按 id 跳过已完成的条目,所以下面这些"已完成"的行不会再被捡回来。
+
+实测不成立。同样两行,一行 `detail` 打 `✅`、一行不打,**都照样被播出来**。
+
+跳过的真实判据是**队列里的 `done` 记录**(`done_ids`),而 `✅` 只是
+给人看的。之所以一直没暴露:所有条目都恰好在队列里留了 `done` 记录。
+
+但有一类条目走不到队列 —— r35 那两条是 r34 写进 `backlog.md`、r35 直接
+实现并提交的(`d59dcb1`),**从未被播种进队列**。人这边的 `✅` 记着
+"做完了",引擎这边完全不知道,会把它们当两件**新活**重排。
+
+而"已完成的工作被无限重排"正是第 12 轮清过的那场灾难(队列里 8 条
+待办全是已完成工作的重推导,队列非空但没有一件真活可干)。r36 让
+`✅` 真正生效。
+
+## 我自己在这轮犯的两个错,都记在这儿
+
+**一、先标 done,后验验收。** 把 `verify` 标成 done 之后才去跑它的验收
+命令 —— 顺序反了。正确顺序是先验再标,否则"闸门会拦住我"就变成了一句
+自我安慰。这一轮它确实拦住了(见 r35),但那是因为我先 unmark 过。
+
+**二、在 `detail` 段里插了 `|`。** `backlog.md` 的格式是
+`title | detail | verify`,`|` 是字段分隔符,而 `detail` 段**不能含 `|`**。
+我给三条补 `✅` 时顺手写了 `✅ … | python3 -m pytest …`,于是字段整体错位,
+三条的 verify 变成了别人的 detail。
+
+**是我自己新写的那个测试当场抓到的** —— 报出来首词是 `r34` / `_seed_from_backlog`,
+不在白名单里。那一刻才算明白这个测试不是装饰。
+
+> 判别力先于完备性。一条能在你自己手滑时报警的测试,比十条描述完备
+> 的测试有用。
+
+## 顺带查实:一条守卫用了十万倍宽的信号
+
+`test_no_real_home_writes.py::test_running_a_subset_leaves_no_stray_tmp_dirs`
+快照整个 `/tmp` 的目录名集合,跑子进程 pytest 前后各取一次,断言没多出
+任何目录。r36 实测:同时在别处 `mkdir /tmp/unrelated-probe-aaa`(与本项目
+毫无关系),它立刻红:
+
+```
+AssertionError: 跑完测试后 /tmp 里多出 1 个目录:['unrelated-probe-aaa']
+```
+
+它守的是「devloop 的临时目录不泄漏」,用的判据却是「系统上任何目录都不许
+新增」。**信号范围比它要守的事宽了十万倍。**
+
+后果不是假绿而是**假红**:全量跑测试时只要有别的进程碰一下 `/tmp`,它就
+飘红 —— 而 `test_baseline` 门禁飘红会被当成真回归。已记为待办。
+
+> 守卫的判据要比它守的东西**窄**。宽了不会更安全,只会更吵,而更吵的
+> 守卫最终是被关掉的那一个。
+
+## 补记:两条 r35 干过的活,机器侧根本没有记录
+
+让 `✅` 生效之后,门禁立刻红了:
+
+```
+FAIL test_baseline  regression! tests/test_devloop_queue_invariant.py::
+     test_real_backlog_titles_still_map_to_their_done_records
+  backlog.md 里标了 ✅ 却不是 done/dropped:
+  ['created-round(队列里是 无记录)', 'item-d546f8(队列里是 无记录)']
+```
+
+这是**真的**。r35 把这两件事实现并提交了(`d59dcb1`),但它们是 r34
+直接写进 `backlog.md` 的,从没被播种进队列 —— 于是人这边打 ✅,机器那边
+连记录都没有。验收都重跑过(14 passed / 6 passed),补了记录。
+
+顺带修了这条测试**自己的读法**:它原来用 `_seed_from_backlog` 去"读"
+backlog,而 r36 让那个函数合法地过滤掉已完成行 —— 于是它**恰好读不到
+自己要验的那批行**,前置条件断言恒空。改用 `Queue._BACKLOG_LINE` 直接读。
+不是重新实现解析器,那就是引擎自己的正则,只是绕开了播种的过滤。
+
+> 拿一个**会过滤**的函数当数据源用,迟早出事。播种回答"该做什么",
+> 这里要的是"文件里写了什么",两件事。
+
+## 补记:`devloop done-item` 这扇门也漏了 provenance
+
+补记那两条时一眼看见 note 全空 —— r34 只把 provenance 接在了 `round()` 上,
+`arl-lite devloop done-item` 直接调 `q.finish(...)` 而**不传 note**。
+
+而手工交活正是最需要凭据的场景:agent 独立干活,交活发生在两次 `round`
+之间,没有 `round()` 替它写任何东西。空 note 的危害不是"少个字段" ——
+r22 就是拿空 note 当"活没做"的证据,写出一条假指控。
+
+现在写的是:
+
+```
+done r34 · source=operator · via=done-item · by=r36-probe
+```
+
+`test_cli_done_item_also_writes_provenance` 的判据是「是不是**空**」而不是
+「内容长什么样」—— 它守的是「这扇门有没有漏」,格式改动不该让它红。
+
+---
+
 ## 8. 状态落盘（state.json）
 
 ### 8.1 文件路径与写时机
