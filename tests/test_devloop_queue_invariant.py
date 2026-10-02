@@ -296,34 +296,49 @@ def test_seeding_never_resurrects_completed_backlog_work(loop):
 
 
 def test_real_backlog_titles_still_map_to_their_done_records(loop):
-    """真实 backlog.md 里的"已完成"行不能因为改过标题就变成新待办
+    """backlog.md 里标了 ✅ 的行,必须在队列里是 done/dropped
 
     id 是从**标题**派生的。我一度用 `~~删除线~~` 标完成,结果每条都换了
     新 id,`done_ids` 完全拦不住,一次就多造出 7 条鬼影。
 
-    这条测试直接把真实文件拿来验:每个 backlog 条目解析出的 id,
-    要么在队列里是 done/dropped,要么是真的还没做(pending)——
-    不该出现"队列里根本没有对应记录"的条目。
-    """
-    real_loop_dev = REPO / "devloop"
-    text = (real_loop_dev / "backlog.md").read_text(encoding="utf-8")
-    # 同样走真实解析路径,不重新实现
-    ids = {i.id for i in Queue(real_loop_dev / "queue.json")._seed_from_backlog(set(), 1)}
-    assert ids, "真实 backlog.md 解析不出条目"
+    所以真正要守的不变式是:**"标了完成的条目"不能因为改标题而失去它的
+    done 记录**。改标题 → id 变 → 队列里那条 done 认不出来 → 变成新待办。
 
-    known = {i.id: i.status for i in Queue(real_loop_dev / "queue.json").load()}
-    unknown = sorted(ids - set(known))
-    assert not unknown, (
-        f"backlog.md 里有 {len(unknown)} 条在队列里找不到对应记录,会被当新活播种: "
-        f"{unknown}\n"
-        f"  多半是改过标题导致 id 变了 —— id 是从标题派生的"
+    ## 早先这条测试还断言了什么,以及为什么删掉
+
+    早先它还断言「backlog.md 里每一条在队列里都找得到对应记录」。那是
+    **瞬时状态**,不是不变式:人往 backlog.md 加一行新待办,它本来就
+    该还没有队列记录 —— 那正是它该被播种成新活的时刻。r18 往 backlog.md
+    加了一条待人工裁决的 P0,这条断言就红了,而那完全正常。
+
+    早先还有第二个 bug:`"✅" not in text` 查的是**整个文件**而不是那一条
+    条目。文件里只要有**任何**一处 ✅,这个检查对所有条目都通过 ——
+    它从来没验到过自己想验的东西。
+
+    现在改成:逐条看 detail 里有没有 ✅,有就必须 done/dropped。
+    """
+    dev = REPO / "devloop"
+    q = Queue(dev / "queue.json")
+    # 走真实解析路径,不重新实现
+    items = q._seed_from_backlog(set(), 1)
+    assert items, "真实 backlog.md 解析不出条目"
+
+    known = {i.id: i.status for i in q.load()}
+    marked_done = [i for i in items if "✅" in i.detail]
+    assert marked_done, (
+        "backlog.md 里一条 ✅ 都没有 —— 前置条件不成立,"
+        "这条测试现在什么都验不到"
     )
-    done_but_still_pending = sorted(
-        i for i in ids
-        if known.get(i) == "pending" and "✅" not in text
+
+    lost = sorted(
+        f"{i.id}(队列里是 {known.get(i.id, '无记录')})"
+        for i in marked_done
+        if known.get(i.id) not in ("done", "dropped")
     )
-    assert not done_but_still_pending, (
-        f"标记为已完成却仍是 pending: {done_but_still_pending}"
+    assert not lost, (
+        f"backlog.md 里标了 ✅ 却不是 done/dropped:{lost}\n"
+        f"  多半是改过标题导致 id 变了 —— id 是从标题派生的。"
+        f"改标题前先确认队列里那条 done 记录的 id。"
     )
 
 

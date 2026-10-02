@@ -12,20 +12,32 @@ license = {text = "MIT"}
 authors = [{name = "arl-lite contributors"}]
 keywords = ["security", "reconnaissance", "asset-discovery", "osint", "cli"]
 
-# 核心依赖:全部标准库,零外部 pip 依赖
-# 增强依赖(可选):检测到则启用,否则降级
+# 依赖面:零。
+#
+# 这不是口号,是受门禁强制的结构事实:`arl_lite/**.py` 里没有任何
+# 第三方 import(`no_thirdparty_import` 门禁每轮扫描 84 个文件)。
+# 实测 2026-10:原先这里列的 7 个 `full` 可选依赖(typer/rich/httpx/
+# pyyaml/apscheduler/textual/openpyxl)import 次数**全是 0** ——
+# 没有任何代码会因它们的存在而走不同分支。它们是死元数据,已删除。
+#
+# 原因不只是"没用":留着会让 Dependabot / pip-audit 对 7 个与本项目
+# 无关的包报 CVE,把真正该看的告警淹掉。详见 docs/DEP_AUDIT.md。
+#
+# ## 如果将来要加可选依赖
+#
+# 必须同时给出三样东西,缺一不可:
+#   1. 启用分支(检测到就用)
+#   2. 缺失时的降级行为(明确到"降级后少做什么")
+#   3. 对应测试(验缺失时真的能降级,而不是启动就崩)
+#
+# 只声明不实现,比不声明更糟:它承诺了一个项目没有的能力。
 dependencies = []
 
 [project.optional-dependencies]
-full = [
-    "typer>=0.9",      # CLI 增强
-    "rich>=13",        # 终端美化
-    "httpx>=0.25",     # 异步 HTTP
-    "pyyaml>=6",       # 配置文件
-    "apscheduler>=3.10", # 周期任务
-    "textual>=0.50",   # TUI
-    "openpyxl>=3.1",   # Excel 导出
-]
+# 刻意为空。外部工具(subfinder/nmap/nuclei 等)**不是** pip 依赖 ——
+# 它们是外部二进制,通过 shutil.which 探测 + subprocess 调用,缺失时
+# 对应模块返回 success=False 并提示安装命令,不阻塞其他模块。
+# 那是另一个类别的依赖,声明在这里会造成误导。
 dev = [
     "pytest>=7",
     "pytest-asyncio>=0.21",

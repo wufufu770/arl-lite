@@ -85,11 +85,23 @@
 
 ### 外部工具(可选,subprocess 调用)
 
-存在就用,不存在就跳过——`integrations/tool_checker.py` 负责探测:
+存在就用,不存在就跳过。探测入口是 `arl-lite tools check`
+(实现见 `arl_lite/cli.py` 的 `tools` 子命令),它会同时列出每个模块
+声明的 `required_tools`:
 
 ```
 nmap  masscan  subfinder  httpx  nuclei  katana  dirsearch  dig  whois
 ```
+
+> **2026-10 更正**:这一段原先写的是「`integrations/tool_checker.py`
+> 负责探测」。那个文件提供 `check_tools()`,但**全仓库没有任何地方
+> 调用它** —— 唯一实现 `pre_check` 的模块 `subfinder.py` 是自己用
+> `is_available()` 判断的。那个文件已在依赖审计中作为死代码删除。
+>
+> 机制是真的,只是文档指错了地方。删掉死文件而不是把它接上,是因为
+> 只有 `subfinder` 一个模块需要外部工具,抽象还没有第二个用户 ——
+> 等第二个出现时再抽,那时候才知道该抽成什么形状。
+> 详见 `docs/DEP_AUDIT.md` 第 3 节。
 
 **外部工具是可选增强,不是依赖。** 缺任何一个源仍能跑(`ok=False` + `error_type="missing"`),
 这条属于第 6 条死规矩的实践。
