@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -444,6 +445,52 @@ class Loop:
         """
         return f"round-pid-{os.getpid()}"
 
+    def audit_prev_round_commits(self, now: float | None = None) -> str | None:
+        """回看上一轮:它报完成之后,仓库里真的有过提交吗?
+
+        返回问题描述;没问题返回 `None`。
+
+        ## 窗口是「上一轮 started_at → 现在」,不是轮内
+
+        r38 实测 34 个报完成的轮次:提交落在**轮内**的只有 4 个,
+        落在**轮结束之后 1 小时内**的有 29 个 —— 工作流本来就是
+        「先跑 round 验门禁,再提交」。所以轮内窗口会把 29/34 个
+        完全合法的轮次判成没干活。那版闸门已撤回(见 docs 7.29)。
+
+        ## 它只报告,不拦
+
+        上一轮的账不该由这一轮来拒 —— 拒了就是拿上一轮的问题去污染
+        本轮的记录。所以这里只产出一句描述,由调用方记进 messages。
+        真正要拦的是**本轮**的记账,那些闸门(r35/r37)都在收尾处。
+
+        拿不到 git 仓库时返回 `None`(判断不了,不是"没提交")。
+        """
+        hist = self.store.load().history
+        if not hist:
+            return None
+        # `store.load()` 给的是 RoundRecord 对象,不是 dict —— 上一版
+        # 按 dict 写 `.get(...)`,一进 round 就 AttributeError。
+        prev = hist[-1]
+        prev = prev.to_dict() if hasattr(prev, "to_dict") else dict(prev)
+        start = prev.get("started_at")
+        if (prev.get("result") not in ("DONE", "DONE_WITH_FAILURES")
+                or not start):
+            return None
+        end = time.time() if now is None else now
+        try:
+            r = subprocess.run(
+                ["git", "log", "--since", str(int(start)), "--until", str(int(end)),
+                 "--pretty=%H"],
+                cwd=self.repo, capture_output=True, text=True, timeout=5,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        # returncode 非 0 = 判断不了(非 git 仓库);有输出 = 有提交,没问题
+        if r.returncode != 0 or r.stdout.strip():
+            return None
+        return (f"第 {prev['round']} 轮报 {prev['result']},但从它开始"
+                f"({int(start)})到现在仓库没有任何提交")
+
     def round(
         self,
         only_gates: list[str] | None = None,
@@ -479,6 +526,11 @@ class Loop:
             state.started_at = time.time()
         record = RoundRecord(round=state.round + 1, started_at=time.time())
         messages: list[str] = []
+
+        # r39:回看上一轮的账。只报告,不拦 —— 上一轮的问题不该由这一轮
+        # 来拒(拒了就是把上一轮的账混进本轮的记录)。
+        if audit := self.audit_prev_round_commits():
+            messages.append(f"[audit] {audit}")
 
         # 退路优先:已经 barren 到底了,这轮不干活先摊牌
         if state.barren_rounds >= RETREAT_THRESHOLD:
