@@ -196,6 +196,49 @@ def test_round_records_the_seeding_in_state(loop):
 
 
 # =====================================================================
+# 软死局:只剩别人处理不了的 in_progress
+# =====================================================================
+
+
+def test_stale_in_progress_is_recovered_not_left_to_block(loop):
+    """上一轮遗留的 in_progress 不能把后续轮次卡成 NOOP
+
+    软死局的形状:队列**非空**(所以不播种),但 `next()` 只认 pending,
+    选不出待办 → 整轮 NOOP,而且会一直 NOOP 下去。
+    实测第 11 轮就是这样空转的。
+    """
+    q = Queue(loop.dev_dir / "queue.json")
+    q.save([Item(id="stuck", title="卡住的", detail="d",
+                 priority=1, kind="change", status="in_progress")])
+
+    outcome = loop.round()
+
+    assert any("recover" in m.lower() for m in outcome.messages), (
+        f"没有记录恢复动作,本轮多半是空转: {outcome.messages}"
+    )
+    assert outcome.record.result != "NOOP", "仍空转,软死局没解"
+    after = {i.id: i.status for i in q.load()}
+    assert after.get("stuck") in ("pending", "done"), after
+
+
+def test_recovery_only_touches_previous_rounds_items(loop):
+    """本轮刚标的 in_progress 不能被自己复位掉"""
+    q = Queue(loop.dev_dir / "queue.json")
+    q.save([Item(id="a", title="甲", detail="d", priority=1, kind="change")])
+    loop.round()
+    # 正常跑完不该有 in_progress 残留
+    assert not [i.id for i in q.load() if i.status == "in_progress"]
+
+
+def test_recover_stale_is_idempotent(loop):
+    Queue(loop.dev_dir / "queue.json").save(
+        [Item(id="x", title="x", detail="d", status="in_progress")]
+    )
+    assert loop.recover_stale_in_progress() == 1
+    assert loop.recover_stale_in_progress() == 0
+
+
+# =====================================================================
 # id 唯一性:重复 id 会让循环原地空转
 # =====================================================================
 #

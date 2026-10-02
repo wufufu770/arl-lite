@@ -15,10 +15,13 @@ BUILD → TEST → IMPROVE → PLAN → STATE 的状态机。
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
+
+log = logging.getLogger("arl_lite.devloop.protocol")
 
 from . import state as st
 from .state import (
@@ -307,6 +310,43 @@ class Loop:
             f"Review history, then continue or adjust the queue.",
         )
 
+    def recover_stale_in_progress(self) -> int:
+        """把上一轮遗留的 in_progress 复位成 pending。返回复位条数。
+
+        ## 为什么需要
+
+        `round()` 是同步的:一个轮次开始时把队首标成 in_progress,
+        跑到 TEST 阶段才落回 done 或 pending。**只要一轮正常跑完,
+        队列里就不该残留 in_progress**。
+
+        一旦残留了(进程被 kill、手工改过状态、上一个实现有 bug),
+        后果是软死局:
+        - 队列非空(有 in_progress)→ `ensure_next_step` 认为没耗尽, 不播种
+        - 但 `next()` 只认 pending → 选不出待办 → 整轮 NOOP
+
+        实测第 11 轮就是这样空转的。所以每轮开头把上一轮的残留复位,
+        让"有人在处理"这个状态**不跨轮存活**。
+
+        ## 边界
+
+        本轮自己刚标的那条不在复位范围内 —— 调用点在"取待办"之前,
+        此时队列里所有的 in_progress 都是上一轮遗留的。
+        """
+        q = self.queue_mod.Queue(self.dev_dir / "queue.json")
+        items = q.load()
+        stale = [i for i in items if i.status == "in_progress"]
+        for it in stale:
+            it.status = "pending"
+            it.note = (it.note + " | " if it.note else "") + \
+                "recovered from a previous round"
+        if stale:
+            q.save(items)
+            log.warning(
+                "recover_stale_in_progress: 复位 %d 条上轮遗留的 in_progress: %s",
+                len(stale), [i.id for i in stale],
+            )
+        return len(stale)
+
     # ------------------------------------------------------------------
     # 整轮
     # ------------------------------------------------------------------
@@ -337,6 +377,14 @@ class Loop:
         #    队列空时先播种——首轮就得有活干,不能让循环空转一轮
         q = self.queue_mod.Queue(self.dev_dir / "queue.json")
         items = q.load()
+
+        # 1.5 先把上一轮遗留的 in_progress 复位。轮次是同步的,
+        #     正常跑完不该有残留;有残留就会让整轮 NOOP(见该方法 docstring)
+        stale = self.recover_stale_in_progress()
+        if stale:
+            items = q.load()
+            messages.append(f"recovered {stale} stale in_progress item(s) from a previous round")
+
         if not any(i.status in ("pending", "in_progress") for i in items):
             before = len(items)
             q.seed_if_empty()
