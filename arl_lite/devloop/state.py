@@ -274,28 +274,81 @@ class StateStore:
     # ---- 阶段迁移 ----
 
     def set_phase(self, state: LoopState, phase: str) -> None:
+        """切阶段。**只把 phase 这一个字段落盘**(r30)。
+
+        原来是把调用方手上的整份 state 写回去。`round()` 一轮要切四次
+        阶段(BUILD/TEST/IMPROVE/PLAN),每一次都是一次"用旧快照覆盖
+        整个文件" —— 两个 agent 并发跑 round 时,后进入阶段的那个会把
+        先进入的 round 号、history、计数全部盖掉。
+
+        语义因此变成:调用方手里的 `state` 是**本轮的工作区**,
+        落盘由 `commit_round` 统一提交;`set_phase` 只负责把一个字段
+        同步到盘上,并顺手更新调用方那份,免得两边显示不一致。
+        """
         if phase not in VALID_PHASES:
             raise ValueError(f"invalid phase: {phase!r} (valid: {sorted(VALID_PHASES)})")
+
+        def _apply(st: LoopState) -> None:
+            st.phase = phase
+
+        self.mutate(_apply)
         state.phase = phase
-        self.save(state)
 
-    def commit_round(self, state: LoopState, record: RoundRecord) -> LoopState:
-        """结束一轮:累加指标、记历史、判退路。"""
+    def commit_round(self, state: LoopState, record: RoundRecord,
+                     done_delta: int = 0, log_mark: int = 0,
+                     retreat_delta: int = 0) -> LoopState:
+        """结束一轮:累加指标、记历史、判退路。
+
+        ## r30:在**刚读到的**状态上重放,而不是写回调用方那份旧快照
+
+        原来最后一句是 `self.save(state)` —— 把调用方在轮次开始时
+        `load()` 到的快照整个写回。两个 agent 并发跑 round 时,两边读到
+        的是同一个 round 号,后写的把先写的 round 计数、history、累计
+        门禁数全盖掉。那不是"重复记录",是纯粹的丢失。
+
+        这里的操作全是加法/追加,在最新状态上重放是安全的:
+        计数 `+=`、history `append`、barren 判定只依赖本轮 record。
+        `state.round` 也改成锁内 `+= 1`,所以两个并发 round 拿到的是
+        连续的两个号,不会撞。
+
+        ## 为什么要显式传这些增量
+
+        `phase_retreat` 里的 `state.retreats += 1` 以前是靠本方法最后那句
+        `save(state)` **顺带**落盘的。改成在锁内只重放已知字段之后,
+        那一笔就没人提交了 —— 所以必须显式传进来,不能指望"反正都会存"。
+
+        Args:
+            done_delta: 本轮新增的"完成"条数(0 或 1)。原来是在调用方那边
+                `state.items_done += 1`,那是绝对值写回,并发下必丢。
+            log_mark: 调用方 `load()` 之后 `state.gate_log` 的长度。
+                `state.gate_log[log_mark:]` 才是**本轮**新增的日志 ——
+                不划这一刀的话,连历史日志都会再追加一遍。
+            retreat_delta: 本轮退路次数(0 或 1),同上。
+        """
         record.finished_at = time.time()
-        state.round += 1
-        record.round = state.round
-        state.result = record.result
-        state.total_gates_passed += record.gates_passed
-        state.total_gates_failed += record.gates_failed
-        state.history.append(record)
+        pending_log = list(state.gate_log[log_mark:])
 
-        # 退路判定:连续 barren 轮次达阈值就退
-        # barren = 门禁全过但没做任何事(NOOP),或做了事但净指标没改善
-        if record.result in (RESULT_NOOP,):
-            state.barren_rounds += 1
-        else:
-            state.barren_rounds = 0
+        def _apply(st: LoopState) -> None:
+            st.round += 1
+            record.round = st.round
+            st.result = record.result
+            st.total_gates_passed += record.gates_passed
+            st.total_gates_failed += record.gates_failed
+            st.items_done += done_delta
+            st.retreats += retreat_delta
+            st.history.append(record)
+            # 退路(RETREATED)不是 NOOP,这一行同时把 barren 归零,
+            # 正是 phase_retreat 原来手工做的 state.barren_rounds = 0
+            st.barren_rounds = (
+                st.barren_rounds + 1 if record.result == RESULT_NOOP else 0
+            )
+            st.phase = PHASE_IDLE
+            st.gate_log = (st.gate_log + pending_log)[-MAX_GATE_LOG:]
 
-        state.phase = PHASE_IDLE
-        self.save(state)
-        return state
+        st = self.mutate(_apply)
+        # 保住旧契约:commit_round 一直会就地更新调用方传进来的那个对象。
+        # 把它变成"只返回一个新对象"是一次静默的行为变更 —— 有测试
+        # (也确实有代码)直接 commit_round(s, rec) 然后就读 s.xxx。
+        for fname in LoopState.__dataclass_fields__:
+            setattr(state, fname, getattr(st, fname))
+        return st

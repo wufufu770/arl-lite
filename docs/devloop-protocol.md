@@ -1694,6 +1694,71 @@ tmp = self.path.with_suffix(self.path.suffix + ".tmp")   # 永远是 state.json.
 改成 spy 住 `os.replace` 收下每次用的 tmp 名,断言它们互不相同 ——
 **测性质,不测运气**。多进程压测保留,但降级成防回归,不再当判据。
 
+---
+
+### 7.21 做好了的能力,没有任何生产代码在用
+
+7.20 把 `StateStore.mutate()` 做出来了,探针证明 1200 次自增零丢失。
+然后回头看 `protocol.py`:
+
+```
+grep store.save
+  186:  self.store.save(state)      ← phase_build
+  322:  self.store.save(state)      ← ensure_next_step
+  末尾:  commit_round → self.save(state)
+```
+
+外加 `set_phase`,一轮要切四次阶段,每次都 `save(state)`。
+
+**每一处都是"把轮次开始时 load 到的快照整个写回去"。** 两个 agent 并发跑
+round 时,后进入阶段的那个会把先进入的 round 号、history、累计门禁数全
+盖掉。那不是"重复记录",是纯粹的丢失 —— r29 修好了 `save` 的原子性,
+可 lost update 发生在**整份快照**这一层,原子性救不了。
+
+所以 r30 的原则只有一句:
+
+> **落盘只提交增量,绝不写回整份旧快照。**
+
+调用方手里的 `state` 是**本轮的工作区**(只在本进程内),落盘由
+`commit_round` 统一提交;`set_phase` / `phase_build` / `ensure_next_step`
+各自只把**自己那一个字段**用 `mutate` 推上去。
+
+### 顺带暴露的两件事
+
+**一、有些落盘是"顺带"发生的,不是有意写的。**
+
+`phase_retreat` 里是 `state.retreats += 1` 然后 `return`,它自己不落盘 ——
+真正把它写进文件的是 `commit_round` 末尾那句 `save(state)` 顺手带上的。
+改成锁内只重放已知字段之后,这一笔**就没人提交了**,测试立刻报
+`retreats` 丢 1。
+
+这类"靠别人顺带落盘"的字段最危险:代码读起来完全正常,直到有人把那句
+`save` 换成更精确的实现,它才消失。所以改成显式传 `retreat_delta`,
+不再指望"反正都会存"。
+
+**二、`commit_round` 一直会就地更新调用方传进来的那个对象。**
+
+第一版 r30 改成返回一个新对象、不碰调用方那份,`test_barren_accumulates`
+立刻挂 —— 它 `commit_round(s, rec)` 之后直接读 `s.barren_rounds`。
+这是旧契约,不是测试写错了,所以补了同步回去。
+
+### 为什么结构检查用 AST 而不是文本
+
+`protocol.py` 里现在有三处注释写着 `self.store.save(state)`(解释它为什么
+被去掉)。文本子串匹配分不清「在用」和「在解释为什么废弃」—— 这正是
+r25 在 `rules_have_advice` 上踩过的。
+
+AST 检查立刻抓到了**真漏网的一处**:`phase_build` 里还有一句
+`self.store.save(state)`,它是改到后面才暴露的,文本匹配会放过它。
+
+### 测试自己栽的一跤
+
+`test_log_mark_slices_only_this_rounds_entries` 第一版忘了先把 `s` 存盘,
+于是 `mutate` 内部读到的是空 `gate_log`,断言「本轮只该加 1 条」拿到 1 条
+却期望 3 条。**是测试的前置条件漏了,不是实现错** —— 但错的方向恰好是
+"实现看起来更差",如果当时顺手把断言改成 1,真 bug 就被这次失误盖住了。
+
+
 
 
 

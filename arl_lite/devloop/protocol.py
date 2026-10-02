@@ -181,9 +181,15 @@ class Loop:
         if item is None:
             return StepResult(PHASE_BUILD, True, "no item (queue will be seeded)")
 
+        # r30:只提交这两个字段。原来是 `self.store.save(state)` —— 整份
+        # 旧快照写回,会把并发的另一个 round 盖掉。
+        def _apply(st) -> None:
+            st.current_item = item.id
+            st.current_note = item.title
+
+        self.store.mutate(_apply)
         state.current_item = item.id
         state.current_note = item.title
-        self.store.save(state)
 
         if self._build_fn is None:
             return StepResult(
@@ -318,9 +324,12 @@ class Loop:
                 "queue exhausted and seeding produced nothing — "
                 "the protocol has no next step; add items to devloop/backlog.md"
             )
-        state.current_note = f"seeded {added} new item(s) after round"
-        self.store.save(state)
-        return added, f"seeded {added} new item(s) after round"
+        # r30:只把 current_note 这一个字段落盘。原来是 `self.store.save(state)`
+        # —— 整份旧快照写回,会把并发的另一个 round 盖掉。
+        note_text = f"seeded {added} new item(s) after round"
+        self.store.mutate(lambda st: setattr(st, "current_note", note_text))
+        state.current_note = note_text
+        return added, note_text
 
     def phase_retreat(self, state: LoopState) -> StepResult:
         """RETREAT:连续 barren 后的退路。
@@ -446,6 +455,10 @@ class Loop:
         记一笔"完成了它"的假账,比拒绝更坏。
         """
         state = self.store.load()
+        # r30:本轮新增日志从这条水位线开始划。commit_round 靠它把
+        # `state.gate_log[log_mark:]` 重放到最新状态上 —— 不划这一刀,
+        # 连历史日志都会再追加一遍。
+        log_mark = len(state.gate_log)
         if not state.started_at:
             state.started_at = time.time()
         record = RoundRecord(round=state.round + 1, started_at=time.time())
@@ -458,7 +471,8 @@ class Loop:
             record.blocking_failures.append("barren_threshold")
             record.note = r.detail
             messages.append(r.detail)
-            self.store.commit_round(state, record)
+            self.store.commit_round(state, record, done_delta=0, log_mark=log_mark,
+                                    retreat_delta=1)
             return RoundOutcome(record, retreated=True, messages=messages)
 
         # 1. 取待办
@@ -539,6 +553,11 @@ class Loop:
         # 6. 判定本轮结果 + 更新队列
         #     全程复用同一个 q 和 items —— 多个 Queue 实例操作同一文件会
         #     互相覆盖(load 拿回新对象,原地改的字段就丢了)
+        #
+        #     r30:`items_done` 不在这里 += 1。调用方手里的 state 是轮次开始
+        #     时的旧快照,把它写回去就是 lost update。改成传**增量**给
+        #     commit_round,由它在锁内基于刚读到的状态累加。
+        done_delta = 0
         if item is None:
             record.result = RESULT_NOOP
             record.note = "no pending item"
@@ -548,7 +567,7 @@ class Loop:
                 record.result = RESULT_DONE
                 if target is not None:
                     q.mark_done(target, state.round + 1)
-                state.items_done += 1
+                done_delta = 1
             else:
                 # 门禁没过 = 失败,如实记录(不退回去假装没事)
                 record.result = RESULT_DONE_WITH_FAILURES
@@ -571,7 +590,9 @@ class Loop:
         #    注意:这里要在 save 之后取,否则拿到的还是 save 前的快照
         q2 = self.queue_mod.Queue(self.dev_dir / "queue.json")
         nxt = q2.next()
-        self.store.commit_round(state, record)
+        # 拿回锁内重放后的最新状态,否则 round 结束时 state.round 仍是
+        # 旧值(commit_round 现在是在最新状态上 +1,不再回写调用方那份)
+        state = self.store.commit_round(state, record, done_delta, log_mark)
 
         return RoundOutcome(
             record,
