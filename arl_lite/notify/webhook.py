@@ -248,18 +248,41 @@ def notify_correlation(
     correlation: dict,
     target: str = "",
 ) -> bool:
-    """关联分析命中通知"""
+    """关联分析命中通知
+
+    ## 规则自己的 tags 必须带出去
+
+    `correlations` 表里存了每条规则的 `tags`(rce / unauth / data_leak /
+    database ...),`CorrelationHit` 也带着它们一路传过来 —— 但这里原来
+    只按 risk 派生出 `link` / `fire` / `warning`,**把规则自己的标签全丢了**。
+
+    丢掉的后果是通知只剩"这条有风险",看不出是什么风险。ntfy 的
+    `Tags` header 既是 emoji 来源也是订阅过滤键,带上语义标签才能
+    按 `rce` 之类的关键词订阅。
+
+    ## 顺序:风险标记在前
+
+    ntfy 只取前 5 个 tag(`tags[:5]`)。风险标记是视觉信号(🔥/⚠️),
+    语义标签是过滤用的,所以标记优先占位,标签填剩余槽位。
+    """
     severity = correlation.get("severity", "info")
     rule_name = correlation.get("rule_name", "?")
     risk = correlation.get("risk", 0)
     headline = correlation.get("headline", "")
     target = target or correlation.get("target", "")
 
+    # 1) 风险标记优先 —— ntfy 按顺序取前 5 个,emoji 挤掉的是最靠后的标签
     tags = ["link"]
     if risk >= 9:
         tags.append("fire")
     elif risk >= 7:
         tags.append("warning")
+
+    # 2) 再补规则自己的标签。存进 correlations 表时是 JSON 字符串,
+    #    这里两种形态都收 —— 调用方可能直接传 list(内存里的 hit),
+    #    也可能传 dict(从库里读出来的行)。
+    tags += _correlation_tags(correlation.get("tags"))
+
     return notify(
         config,
         title=f"[ARL] Correlation: {rule_name} (risk {risk})",
@@ -268,6 +291,41 @@ def notify_correlation(
         tags=tags,
         extra={"correlation": correlation},
     )
+
+
+def _correlation_tags(raw) -> list[str]:
+    """从 correlation 的 tags 字段里取出干净、去重、保序的标签列表
+
+    raw 可能是:
+    - list[str]              —— 内存里的 CorrelationHit
+    - JSON 字符串 '["a","b"]' —— save_correlations 存进 DB 的形态
+    - None / 其他            —— 一律当作没有
+
+    去重是必须的:规则里写了 `tags: [rce, rce]` 或和风险标记同名时,
+    不去重会把同一个 tag 塞两遍,白占 ntfy 的 5 个槽位。
+    """
+    items: list = []
+    if isinstance(raw, str):
+        try:
+            items = json.loads(raw) if raw.strip() else []
+        except (json.JSONDecodeError, ValueError):
+            log.debug("_correlation_tags: 解析失败 %r", raw[:80])
+            return []
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        return []
+
+    out: list[str] = []
+    for t in items:
+        if not isinstance(t, str):
+            continue
+        s = t.strip()
+        # 逗号会破坏 ntfy 的 Tags 头(逗号是分隔符),换成分号
+        s = s.replace(",", ";").replace("\n", " ").replace("\r", " ")
+        if s and s not in out:
+            out.append(s)
+    return out
 
 
 def notify_task_done(

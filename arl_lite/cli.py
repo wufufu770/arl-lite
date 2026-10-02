@@ -494,7 +494,62 @@ def cmd_correlate(args) -> int:
             print(f"{color}{line}\033[0m")
         else:
             print(line)
+
+    # 通知。notify_correlation 此前是死代码 —— 有定义、有导出、只有测试在调,
+    # 关联命中永远不外发。规则自己的 tags(rce/unauth/data_leak...)也一直被
+    # 丢掉,通知里只剩一个风险等级。
+    notified = _notify_correlations(args, hits)
+    if notified is not None:
+        print()
+        print(notified)
     return 0
+
+
+def _notify_correlations(args, hits) -> str | None:
+    """把关联命中推给 webhook;返回给人看的汇总行,没配置则返回 None
+
+    配置沿用项目既有约定:**由调用方注入**(Watcher 也是
+    `Watcher(storage, webhook_config=...)`),不在这里凭空造一个。
+    """
+    if not getattr(args, "notify", False):
+        return None
+    cfg = getattr(args, "webhook", None)
+    if cfg is None:
+        # CLI 入口:从 --webhook-url 现场构造。Watcher 那边仍然是注入的,
+        # 这里只是 CLI 参数的落点,不该让它去读全局配置文件。
+        url = getattr(args, "webhook_url", "") or ""
+        if not url:
+            return "[!] --notify given but no --webhook-url provided"
+        try:
+            from .notify import WebhookConfig
+            cfg = WebhookConfig(
+                url=url,
+                provider=getattr(args, "webhook_provider", "ntfy") or "ntfy",
+            )
+        except Exception as e:
+            return f"[!] invalid webhook config: {e}"
+    if not getattr(cfg, "url", ""):
+        return "[!] --notify given but no webhook url"
+
+    from .notify import notify_correlation
+
+    ok = 0
+    failed = 0
+    for h in hits:
+        payload = h.to_dict() if hasattr(h, "to_dict") else dict(h.__dict__)
+        try:
+            if notify_correlation(cfg, payload):
+                ok += 1
+            else:
+                failed += 1
+        except Exception as e:  # 单条失败不该中断整批
+            log.warning("notify_correlation(%s) failed: %s",
+                        getattr(h, "rule_name", "?"), e)
+            failed += 1
+    line = f"[i] notified {ok}/{len(hits)} correlation(s)"
+    if failed:
+        line += f" ({failed} failed)"
+    return line
 
 
 def cmd_monitor_add(args) -> int:
@@ -982,6 +1037,17 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("-w", "--workspace", help="工作空间名", default="default")
     pc.add_argument("-l", "--limit", type=int, default=50, help="最多显示多少条(>0)")
     pc.add_argument("--min-risk", type=int, default=0, help="最小风险等级(0-10)")
+    pc.add_argument(
+        "--notify", action="store_true",
+        help="把命中推给 webhook(需要 --webhook-url)",
+    )
+    pc.add_argument(
+        "--webhook-url", default="", help="webhook 地址(配合 --notify 使用)",
+    )
+    pc.add_argument(
+        "--webhook-provider", default="ntfy",
+        help="ntfy / slack / generic / local(默认 ntfy)",
+    )
     pc.set_defaults(func=cmd_correlate)
 
     # monitor(资产监控)
