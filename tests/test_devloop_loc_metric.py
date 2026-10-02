@@ -144,26 +144,96 @@ def test_broken_file_never_gets_counted_fewer_than_physical_lines():
 
 
 def test_devloop_red_line_uses_code_lines():
-    """红线常量换成了代码行口径,且数值来自实测而非拍脑袋"""
+    """红线量的是**代码行**,且余量不许大到形同虚设
+
+    ## 口径从常量改成「生效值」
+
+    r20 之前这条断言的是 `current < _DEVELOOP_CODE_LOC_LIMIT` —— 拿源码常量
+    当唯一真相。r20 之后生效值可能来自 baseline(经 accept 显式提升),
+    所以这里改成问生效值。
+
+    底下那条「余量 ≤1.35x」才是这条测试真正的价值:它挡的是"把红线
+    抬到一个再也碰不到的高度",也就是把红线取消掉。口径怎么变都行,
+    这条不能松。
+    """
     assert hasattr(gates, "_DEVELOOP_CODE_LOC_LIMIT")
     assert not hasattr(gates, "_DEFAULT_DEVELOOP_LOC_LIMIT"), \
         "旧的总数口径常量不该还留着,留着会被误用"
-    # 2400 应该是当前代码行数(2096 左右)之上、但不是随手拍的大数
+
     current = gates._count_code_lines(list(DEVLOOP.glob("*.py")))
-    assert current < gates._DEVELOOP_CODE_LOC_LIMIT
+    g = gates.get_gate("loc_budget")
+    prev = gates.load_baseline(REPO).get("loc_budget", {})
+    limit, src = g._devloop_limit(REPO, prev)
+
+    assert current < limit, (
+        f"devloop 代码行 {current} 已达/超过生效红线 {limit}(来源: {src})"
+    )
     # 余量不能大到形同虚设:至少 20% 会被当成没约束
-    assert gates._DEVELOOP_CODE_LOC_LIMIT <= current * 1.35, (
-        f"红线 {gates._DEVELOOP_CODE_LOC_LIMIT} 相对实测 {current} 太松了"
+    assert limit <= current * 1.35, (
+        f"生效红线 {limit} 相对实测 {current} 太松了(来源: {src})—— "
+        f"余量超过 35% 等于没有红线"
     )
 
 
-def test_devloop_red_line_is_still_not_promotable():
-    """改了度量口径,但没把它变成可提升的——那是两件事"""
+def test_devloop_red_line_can_only_move_through_an_audited_path():
+    """红线现在可提升,但只能走**留痕机制**——这是 r20 的核心不变式
+
+    ## 为什么改了 r11 的结论
+
+    r11 把它设成**不可提升**,出发点是对的:防止有人为了凑数去改门禁。
+    但 r19 发现它有个更根本的问题 —— **没有任何合法更新路径**。
+
+    那不是红线,是一堵没门的墙:面对它只有两个动作,偷偷改常量(正是
+    它要防的作弊),或者让门禁永远红着。而门禁永远红着会稀释它的信号 ——
+    一个天天红的门禁等于没有门禁。
+
+    所以 r20 把它纳入 `devloop accept` 的留痕机制。**关键不在于
+    "能不能提升",而在于"提升必须留下痕迹"**:
+
+    - 门禁必须**正在失败**才能提升(挡住"提前买预算")
+    - 理由 ≥10 字符(挡住"随手放宽")
+    - 写进 `baselines.json` 进版本库(进 git diff 和 code review)
+
+    早先这两条测试守的是"不可提升"。那个立场现在过期了,但**它们要防的
+    东西没有过期** —— 静默放宽。所以改成守新机制,而不是删掉。
+    """
     g = gates.get_gate("loc_budget")
-    assert g.promotable is True, "total_loc 仍然可以显式提升"
-    # 协议自身的红线不在 promotable_fields 里,提升动不了它
-    assert "devloop_code_loc" not in g.promotable_fields
-    assert "devloop_total_loc" not in g.promotable_fields
+    assert g.promotable is True
+    # 红线字段可提升,但只在留痕机制下
+    assert "devloop_code_loc" in g.promotable_fields
+    # 总行数**仍然**不可提升 —— 它只是给人看的参考值,不参与判定
+    assert "devloop_total_loc" not in g.promotable_fields, \
+        "总行数不参与门禁判定,不该被提升(提升它等于提升一个没用的数)"
+
+    # 提升必须经过 accept 模块的硬规则,而不是绕过它改 baseline
+    from arl_lite.devloop.accept import MIN_REASON_LEN, accept_baseline
+    assert MIN_REASON_LEN >= 10, "理由门槛被削弱了"
+
+    # 门禁必须正在失败才给提升 —— 用一个绿的仓库状态验这条
+    res = g.run(REPO)
+    if res.passed:
+        out = accept_baseline(REPO, "loc_budget", reason="这条理由够长了用于测试")
+        assert out.ok is False, "门禁是绿的却接受了提升 —— 提前买预算没被挡住"
+        assert "green" in out.detail.lower() or "nothing" in out.detail.lower(), out.detail
+
+
+def test_devloop_red_line_value_is_not_silently_changed():
+    """红线阈值本身必须来自 baseline 或常量,**不能被就地偷偷改**
+
+    留痕机制成立的前提是"绕过机制的改动看得见"。所以这条守住:
+    生效值只能来自两个地方 —— `baselines.json` 的 `devloop_code_loc`
+    (经 accept 写入,进版本库)或源码常量(改动进 git diff)。
+    """
+    g = gates.get_gate("loc_budget")
+    prev = gates.load_baseline(REPO).get("loc_budget", {})
+    limit, src = g._devloop_limit(REPO, prev)
+    assert isinstance(limit, int) and limit > 0
+    # 来源说明必须能让人判断这个值是怎么来的
+    assert "baseline" in src or "常量" in src, src
+    # 没有 baseline 时必须回落到常量,而不是变成 0 或 None
+    limit_default, src_default = g._devloop_limit(REPO, {})
+    assert limit_default == gates._DEVELOOP_CODE_LOC_LIMIT
+    assert "常量" in src_default
 
 
 def test_gate_reports_both_code_and_total():

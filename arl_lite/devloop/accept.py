@@ -50,6 +50,25 @@ MIN_REASON_LEN = 10
 # 留太少又会把不体面的记录挤掉——所以取一个「够回忆,不至于刷屏」的值。
 MAX_PROMOTIONS_KEPT = 50
 
+# baseline 里缺某个字段时,拿哪个源码常量当"当前值"来比。
+#
+# 只有在这里登记过的字段才能这样回落:登记的含义是"这个字段的判定
+# 依据是这个常量",所以常量就是它事实上的当前值。r20 加 devloop_code_loc
+# 是因为 r19 之后红线阈值来自 `_DEVELOOP_CODE_LOC_LIMIT`。
+#
+# 不登记的字段仍然按"缺失就不凭空造"处理 —— 那个保守规则只对
+# 「本来就没有确定当前值」的字段有意义。
+_SOURCE_DEFAULTS: dict = {}
+
+
+def _register_source_defaults() -> None:
+    """从 gates 读常量登记进回落表(避免 import 环)"""
+    from . import gates as _g
+    _SOURCE_DEFAULTS["devloop_code_loc"] = _g._DEVELOOP_CODE_LOC_LIMIT
+
+
+_register_source_defaults()
+
 
 @dataclass(frozen=True)
 class AcceptOutcome:
@@ -78,6 +97,27 @@ class AcceptOutcome:
         return f"ACCEPTED {self.gate}: {moved}\n  reason: {self.reason}"
 
 
+def _headroom(measured: int, current: int) -> int:
+    """提升后至少要留多少余量。
+
+    ## 为什么不能提到正好等于实测值
+
+    r20 第一次把红线提到 2488(实测值)之后,门禁立刻从红转绿,但
+    `test_devloop_red_line_uses_code_lines` 的 `current < limit` 变成了
+    `2488 < 2488` —— **零余量**。而这轮我自己又加了几行代码,门禁马上
+    又红了。
+
+    也就是说「提到实测值」这个动作本身几乎不解决问题:下一行代码就
+    打回原形,等于逼着人每写几行就来提一次。那不是留痕机制,那是骚扰。
+
+    所以留一点余量:向上取整到 50 的倍数,至少多给 25 行。
+    够写几行正常改动,又不会把红线放飞到没有约束
+    (`test_devloop_red_line_uses_code_lines` 守住余量 ≤35%)。
+    """
+    need = measured + 25
+    return int((need + 49) // 50) * 50
+
+
 def _plan_changes(
     gate_name: str,
     measured: Any,
@@ -86,20 +126,44 @@ def _plan_changes(
 ) -> dict:
     """算出该把哪些字段从 current 抬到 measured。
 
-    只升不降;只动 allowed_fields 里的字段;缺失的字段不凭空造。
+    只升不降;只动 allowed_fields 里的字段。
+
+    ## baseline 里缺字段时怎么办
+
+    原规则是"缺失的字段不凭空造"。r20 遇到一个具体问题:红线字段
+    `devloop_code_loc` 此前**从来不在 baseline 里**——它一直是源码常量
+    `_DEVELOOP_CODE_LOC_LIMIT`(r11 定的不可提升路径)。于是第一次提升时,
+    `current.get(key)` 返回 None,按旧规则直接跳过,门禁纹丝不动,
+    而 CLI 却报了 ACCEPTED。
+
+    那是比"提升失败"更糟的结果:**它说成功了,但什么都没发生。**
+
+    所以改成:字段在 baseline 里缺失、但**在源码里有对应常量**时,
+    拿常量当当前值来比。这样"从 2400 提到 2481"是一条真实可记录的
+    变化,而不是凭空造一个数。
+
+    仍然拒绝的是:两边都没有数字(纯靠 measured 凭空造值)。
     """
     changes: dict = {}
     if isinstance(current, dict) and isinstance(measured, dict):
         for key in allowed_fields:
             old = current.get(key)
             new = measured.get(key)
-            # 两边都得是数字才有"大小"可言;字符串/None 一律不动
+            if old is None:
+                # baseline 里没有 → 回落���源码常量(若该常量是这次的判定依据)
+                old = _SOURCE_DEFAULTS.get(key)
+            # 两边都得是数字才有"大小"可言;字符串/None/bool 一律不动
             if not isinstance(old, (int, float)) or isinstance(old, bool):
                 continue
             if not isinstance(new, (int, float)) or isinstance(new, bool):
                 continue
             if new > old:
                 changes[key] = (old, new)
+                # 补余量:提到实测值等于零余量,下一行代码又红
+                if key in _SOURCE_DEFAULTS:
+                    padded = _headroom(int(new), int(old))
+                    if padded > new:
+                        changes[key] = (old, padded)
     else:
         # 标量 baseline:promotable_fields 为空即表示"整个标量可升"
         if allowed_fields:

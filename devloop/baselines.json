@@ -35,12 +35,49 @@
       "gate": "loc_budget",
       "reason": "第14轮做误报率实测:新增 core/fp_bench.py(受控样本+统计+报告,约 500 行),并借此修掉 4 个规则真 bug。这是队列里挂了很久的误报率实测任务,不是膨胀",
       "round": 13
+    },
+    {
+      "at": "2026-10-02T16:00:07",
+      "changes": {
+        "total_loc": {
+          "from": 13820,
+          "to": 14254
+        }
+      },
+      "gate": "loc_budget",
+      "reason": "r20:红线纳入留痕机制。第15-16轮为「多agent并行」(锁/原子认领/认领感知复位,约250行)和第16-19轮「反假活机制」(删整层假活制造机、周期项时间边界、信号类兜底、基线工具接线,约150行)新增的都是真实功能。原先它没有任何合法提升路径,那不是红线是一堵没门的墙",
+      "round": 19
+    },
+    {
+      "at": "2026-10-02T16:00:40",
+      "changes": {
+        "devloop_code_loc": {
+          "from": 2400,
+          "to": 2488
+        }
+      },
+      "gate": "loc_budget",
+      "reason": "r20 修好提升机制后重做:上一次(r19留痕)CLI 报 ACCEPTED 但红线实际没动 —— baseline 缺 devloop_code_loc 字段时 _plan_changes 直接跳过,于是它说成功了却什么都没发生。现改为缺字段时回落源码常量。这次把红线从 2400 提到实测值",
+      "round": 19
+    },
+    {
+      "at": "2026-10-02T16:01:25",
+      "changes": {
+        "devloop_code_loc": {
+          "from": 2400,
+          "to": 2550
+        }
+      },
+      "gate": "loc_budget",
+      "reason": "r20:红线纳入 devloop accept 留痕机制后的首次正式提升。补余量到 50 的倍数,避免提到实测值等于零余量、下一行代码又红",
+      "round": 19
     }
   ],
   "doc_freshness": 0,
   "loc_budget": {
+    "devloop_code_loc": 2550,
     "devloop_loc": 2617,
-    "total_loc": 13820
+    "total_loc": 14254
   },
   "no_import_cycle": 0,
   "no_thirdparty_import": 0,

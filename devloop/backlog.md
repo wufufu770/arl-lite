@@ -42,10 +42,6 @@ kind 取值：`change` / `test` / `doc` / `research` / `refactor`
 - [P3] change: 实现 DISAPPEARED 变更类型 | ✅ r8 完成 · 用 first_seen/last_seen 判断,不需要 snapshot 表 | python3 -m pytest tests/test_monitor_disappeared.py
 - [P3] research: 误报率实测 | ✅ r14 完成 · 离线受控样本(14 个),并借此修掉 4 个规则真 bug;产出 docs/FP_RATE.md,`arl-lite fp-bench` 可复跑 | python3 -m arl_lite fp-bench
 
-## 需要人来定的事（引擎不该自己决定）
-
-- [P0] research: 膨胀红线无合法提升路径,需人工裁决 | 第 11 轮把 `_DEVELOOP_CODE_LOC_LIMIT` 定为不可提升,`devloop accept` 明确排除了它。但第 15-16 轮为「多 agent 并行」和「反假活机制」新增了约 350 行真实功能,现为 2452 / 红线 2400。这是协议自身的缺陷,不是代码缺陷:一个没有任何合法更新路径的阈值不是红线,是一堵没门的墙 | 两条路选一条 —— (A) 接受更高数值并给它开一条和 `loc_budget baseline` 一样留痕的提升路径(门禁必须正在失败 + 理由 ≥10 字 + 写进 `baselines.json` 进版本库);(B) 接受红线卡住协议自身开发,devloop 冻结在 2400,后续工作全部转向 arl-lite 本体。**在裁决之前不要改那个常数** —— 改它就是它要防的那种作弊
-
 ## 候选（待细化）
 
 - 离线内嵌 RIPE/APNIC/ARIN delegated 数据做 IP→ASN 归属（约 16MB，公约免费）

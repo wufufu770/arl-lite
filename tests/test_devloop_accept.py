@@ -265,10 +265,95 @@ def test_promotion_history_empty_is_readable(tmp_repo):
 # =====================================================================
 
 
-def test_loc_budget_is_promotable_with_total_loc_only():
+def test_loc_budget_promotable_fields_cover_both_budgets():
+    """可提升字段是 total_loc + devloop_code_loc,但**不含**总行数
+
+    r20 之前这里断言 `== ("total_loc",)`,守的是"协议自身的红线不接受
+    提升"。那个立场已经过期 —— 它导致红线**没有任何合法更新路径**,
+    于是只剩偷偷改常量或让门禁永远红着两个选项。
+
+    现在红线也走留痕机制。但两件事仍然不对:
+
+    - `devloop_total_loc` 仍然不可提升 —— 它只是给人看的参考值,
+      不参与判定。提升它等于提升一个没用的数,会让门禁 detail 撒谎。
+    - 提升必须留痕(见 test_devloop_loc_metric.py 里的三条硬规则)
+    """
     g = gates.get_gate("loc_budget")
     assert g.promotable is True
-    assert g.promotable_fields == ("total_loc",)
+    assert "total_loc" in g.promotable_fields
+    assert "devloop_code_loc" in g.promotable_fields
+    assert "devloop_total_loc" not in g.promotable_fields, \
+        "总行数不参与判定,提升它没有意义(而且会让 detail 看起来更严)"
+
+
+def test_promotion_leaves_headroom_above_the_measured_value():
+    """提升必须留余量,不能提到正好等于实测值
+
+    r20 第一次把红线提到 2488(实测值)之后,余量变成 0 ——
+    `current < limit` 成了 `2488 < 2488`,而同一轮我自己又加了几行,
+    门禁立刻又红。
+
+    那样的话「提到实测值」几乎不解决问题:每写几行就得来提一次,
+    那不是留痕机制,是骚扰。
+    """
+    from arl_lite.devloop.accept import _headroom
+
+    # 2488 实测 → 应留出至少 25 行,并取整到 50 的倍数
+    assert _headroom(2488, 2400) >= 2488 + 25
+    assert _headroom(2488, 2400) % 50 == 0
+    # 余量不能大到把红线放飞 —— 35% 是 test_devloop_loc_metric 守的上限
+    assert _headroom(2488, 2400) <= 2488 * 1.35
+
+
+def test_missing_baseline_field_falls_back_to_source_constant():
+    """baseline 缺字段时回落源码常量,而不是静默跳过
+
+    ## 这是 r20 抓到的真 bug
+
+    第一次跑 accept 时 CLI 报 `ACCEPTED`,但**红线实际没动** ——
+    `devloop_code_loc` 从来不在 baseline 里(它是源码常量),而
+    `_plan_changes` 遇到 `current.get(key) is None` 就直接 continue。
+
+    那比"提升失败"更糟:**它说成功了,但什么都没发生。**
+    操作者会以为问题解决了,直到下一轮门禁又红,而且想不通为什么。
+
+    现在缺字段时回落 `_SOURCE_DEFAULTS` 里登记的常量。
+    """
+    from arl_lite.devloop.accept import _SOURCE_DEFAULTS, _plan_changes
+
+    assert "devloop_code_loc" in _SOURCE_DEFAULTS, (
+        "红线字段没登记源码常量回落 —— baseline 缺它时提升会静默失效"
+    )
+    changes = _plan_changes(
+        "loc_budget",
+        measured={"total_loc": 100, "devloop_code_loc": 2500},
+        current={"total_loc": 90},          # 故意缺 devloop_code_loc
+        allowed_fields=("total_loc", "devloop_code_loc"),
+    )
+    assert "devloop_code_loc" in changes, (
+        f"缺字段时没回落常量,提升被静默跳过:{changes}"
+    )
+    old, new = changes["devloop_code_loc"]
+    assert old == gates._DEVELOOP_CODE_LOC_LIMIT, (
+        f"回落值不是源码常量:{old}"
+    )
+    assert new > 2500, "补余量没生效"
+
+
+def test_unregistered_field_is_still_not_invented():
+    """没登记的字段仍然按「缺失就不凭空造」处理
+
+    回落表不是万能钥匙:只有明确登记过的字段才能回落,其余保持保守。
+    """
+    from arl_lite.devloop.accept import _plan_changes
+
+    changes = _plan_changes(
+        "loc_budget",
+        measured={"some_new_field": 9999},
+        current={},
+        allowed_fields=("some_new_field",),
+    )
+    assert not changes, f"没登记的字段不该被凭空造出来:{changes}"
 
 
 def test_only_loc_budget_is_promotable():

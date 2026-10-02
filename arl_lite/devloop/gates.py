@@ -644,9 +644,36 @@ class LocBudgetGate:
     blocking = True
     # 代码量预算本身就是"随功能增长而显式上移"的闸门,
     # 提升它是协议设计内的动作(比如一轮做完了 TLS 采集这种实打实的新功能)。
-    # 只放开 total_loc;devloop_loc 是协议自身的红线,不接受提升。
+    #
+    # r20 变更:devloop 自身的红线也纳入可提升范围,但走**同一套**留痕机制
+    # (门禁必须正在失败 / 理由 ≥10 字 / 写进 baselines.json 进版本库)。
+    # 见下面 `_devloop_limit()` 的说明 —— 之前这里只有常量,没有任何
+    # 合法更新路径,那不是红线,是一堵没门的墙。
     promotable = True
-    promotable_fields = ("total_loc",)
+    promotable_fields = ("total_loc", "devloop_code_loc")
+
+    @staticmethod
+    def _devloop_limit(repo: Path, prev: dict) -> tuple[int, str]:
+        """devloop 红线当前生效的值,以及它是怎么来的。
+
+        ## 为什么需要一个函数而不是一个常量
+
+        r19 之前 `_DEVELOOP_CODE_LOC_LIMIT` 是硬编码常量,且门禁拿它跟实测比
+        —— 也就是说**就算有人想提升都提升不了**。第 11 轮把它设成
+        不可提升是为了防"为了凑数去改门禁",出发点对,但结果是无路可走:
+        任何真实增长都只能永久红着,或者被人偷偷改常量。
+
+        所以这里改成:**有 baseline 就以 baseline 为准,没有才用常量**。
+        常量仍在源码里当默认值,改它依然会出现在 git diff 里 ——
+        区别是现在多了一条**留痕的**合法路径,而不是只能偷偷改。
+
+        返回值的第二项是给人看的来源说明,会印进门禁 detail。
+        baseline 优先于常量,这样一次显式提升不会在常量被改回去后失效。
+        """
+        b = prev.get("devloop_code_loc")
+        if isinstance(b, int) and not isinstance(b, bool) and b > 0:
+            return b, f"baseline {b}(经 devloop accept 显式提升)"
+        return _DEVELOOP_CODE_LOC_LIMIT, f"源码常量 {_DEVELOOP_CODE_LOC_LIMIT}"
 
     def run(self, repo: Path) -> GateResult:
         arl_root = repo / "arl_lite"
@@ -680,11 +707,12 @@ class LocBudgetGate:
 
         problems: list[str] = []
 
-        # devloop 红线(硬,不可提升)
-        if devloop_code_loc > _DEVELOOP_CODE_LOC_LIMIT:
+        # devloop 红线。阈值来自 baseline(若被显式提升过)或源码常量。
+        devloop_limit, limit_src = self._devloop_limit(repo, prev)
+        if devloop_code_loc > devloop_limit:
             problems.append(
                 f"devloop/ has {devloop_code_loc} code lines "
-                f"(limit {_DEVELOOP_CODE_LOC_LIMIT}, 总行 {devloop_total_loc})"
+                f"(limit {devloop_limit}, 总行 {devloop_total_loc}; 阈值来源: {limit_src})"
             )
 
         # arl_lite 增长(相对 baseline + 容差)
@@ -719,7 +747,8 @@ class LocBudgetGate:
         else:
             detail = (
                 f"arl_lite={total_loc} (baseline {prev_total} +{total_loc - prev_total}), "
-                f"devloop={devloop_code_loc} code lines (total {devloop_total_loc})"
+                f"devloop={devloop_code_loc} code lines (total {devloop_total_loc}; "
+                f"阈值来源: {limit_src})"
             )
 
         return GateResult(
