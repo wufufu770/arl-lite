@@ -10,6 +10,6 @@
   "rules_have_advice": 37,
   "test_baseline": {
     "failed": 9,
-    "passed": 84
+    "passed": 95
   }
 }

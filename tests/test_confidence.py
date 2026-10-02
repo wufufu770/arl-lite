@@ -22,7 +22,20 @@ from arl_lite.core.correlation_engine import (
     _parse_yaml, load_all_rules, run_all_rules, save_correlations,
 )
 
-REPO = Path(__file__).resolve().parents[1]
+def _find_repo_root() -> Path:
+    """向上找 pyproject.toml + arl_lite/ 确认根目录。
+
+    不靠 parents[N] 猜层级——__file__ 是相对路径时 resolve() 前后
+    层级数可能不同, 算错一层就会扫到项目外面去。
+    """
+    here = Path(__file__).resolve()
+    for cand in here.parents:
+        if (cand / "pyproject.toml").is_file() and (cand / "arl_lite").is_dir():
+            return cand
+    raise RuntimeError(f"找不到项目根(从 {here} 向上未找到 pyproject.toml + arl_lite/)")
+
+
+REPO = _find_repo_root()
 RULES_DIR = REPO / "arl_lite" / "modules" / "analysis" / "rules"
 
 
