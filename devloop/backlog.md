@@ -12,13 +12,19 @@ kind 取值：`change` / `test` / `doc` / `research` / `refactor`
 
 ## 已排期
 
-- [P1] change: 给关联分析规则接上置信度 | schema 里已有 `confidence INTEGER 0-100` 但无模块消费；`risk_score.py` 只用 `risk`，`correlation_engine.py` 不读 `confidence`，两套口径没打通 | python3 -m arl_lite.devloop gate rules_have_advice
-- [P1] change: 补架构约束测试 | 抄 HunterX 的思路（不必抄它 2197 行）：模块不得反向依赖、rule 必有 advice、correlation_engine 不得直接 import sqlite3 | python3 -m pytest tests/test_devloop.py
-- [P2] change: storage 异常分类去字符串化 | `db/storage.py:676-682` 靠 `if "unique" in msg` 判重复键，SQLite 改错误串就失效；应查 `sqlite_errorname` 或捕获具体异常类 | python3 -m pytest tests/
-- [P2] change: check_filter_sql 补 UNION 禁令 | `db/storage.py:58-61` 禁了 DROP/DELETE 但没禁 UNION，理论上可绕过表名白名单 | python3 -m pytest tests/
-- [P2] change: 证书 SAN/issuer/fingerprint 入库 | `httpx_probe.py` 只记 `tls_verified: bool`，证书归属维度完全空白；用 `ssl.get_server_certificate` 解析，sites 表加 cert_sha256/cert_issuer_cn/cert_san | python3 -m arl_lite.devloop test
-- [P2] doc: 重写 PROJECT_PLAN.md | 文档描述的技术栈（typer/textual/litellm/PyYAML/MCP SDK）一个都没用，实现时全推翻了；`doc_freshness` 门禁已报 39 处过期引用 | python3 -m arl_lite.devloop gate doc_freshness
-- [P3] change: 实现 DISAPPEARED 变更类型 | `core/monitor.py:115` 枚举里有但没实现，schema 注释写"需要 snapshot"；资产下线收不到通知 | python3 -m pytest tests/
+<!-- 播种按 id 跳过已完成的条目,所以下面这些"已完成"的行不会再被捡回来。
+     保留它们是为了让"这活做过、怎么做的"在源文件里也留个痕。
+     **注意:标题不要改** —— id 是从标题派生的(`_slugify_id`),
+     改标题等于换一个 id,`done` 记录拦不住,立刻变成一条新待办。
+     完成标记写进 detail 段。 -->
+
+- [P1] change: 给关联分析规则接上置信度 | ✅ r1 完成 · 新建 core/confidence.py 四因子乘法模型,37 条规则分档 | python3 -m arl_lite.devloop gate rules_have_advice
+- [P1] change: 补架构约束测试 | ✅ r2 完成 · 11 条约束全部做反向验证 | python3 -m pytest tests/test_architecture.py
+- [P2] change: storage 异常分类去字符串化 | ✅ r7 完成 · 改用 sqlite_errorcode 精确判定;实测 NOT NULL 误判成重复会静默丢数据 | python3 -m pytest tests/test_db_errors.py
+- [P2] change: check_filter_sql 补 UNION 禁令 | ✅ r3 完成 · 实测 `1=1) UNION SELECT ...` 确能跨表读数据 | python3 -m pytest tests/test_sql_injection.py
+- [P2] change: 证书 SAN/issuer/fingerprint 入库 | ✅ r5/r6 完成 · 自研 DER 解析(零依赖 + 必须采自签站) | python3 -m pytest tests/test_tls_cert.py
+- [P2] doc: 重写 PROJECT_PLAN.md | ✅ r4 完成 · 按实现现状重写;门禁首次 0 warned | python3 -m arl_lite.devloop gate doc_freshness
+- [P3] change: 实现 DISAPPEARED 变更类型 | ✅ r8 完成 · 用 first_seen/last_seen 判断,不需要 snapshot 表 | python3 -m pytest tests/test_monitor_disappeared.py
 - [P3] research: 误报率实测 | 在受控样本上跑规则集，统计 false positive 率，输出到 docs/FP_RATE.md，作为规则调优的客观输入 | test -f docs/FP_RATE.md
 
 ## 候选（待细化）

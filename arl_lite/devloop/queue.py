@@ -43,20 +43,40 @@ _VALID_KINDS = {"change", "test", "doc", "research", "refactor"}
 _VALID_STATUS = {"pending", "in_progress", "done", "dropped"}
 
 
-def _slugify_id(title: str, idx: int) -> str:
+def _slugify_id(title: str, idx: int = 0) -> str:
     """把标题派生成稳定可读的 id。
 
     中文标题 slug 化会退化成空串（正则只认 [a-z0-9]），所以：
     - 有 ASCII 部分 → 用它（`给规则加置信度 add-confidence-12`）
-    - 纯中文 → 用序号 + 标题哈希前 6 位（`item-3-a1b2c3`）
+    - 纯中文 → 用 `item-` 前缀 + 标题哈希前 6 位
 
-    哈希保证同一份 backlog 里两条相似标题不会撞 id。
+    ## 为什么**不能**把行号算进 id
+
+    早期版本是 `f"{ascii_part}-{idx}"` / `f"item-{idx}-{digest}"`。
+    看上去是为了"同一份 backlog 里两条相似标题不会撞 id",但代价是
+    id **依赖文件里的行位置**:只要在任意条目上方插入或删除一行,
+    下面所有条目的 id 全变。
+
+    而 `backlog.md` 是人手工维护的源文件 —— 加一段说明、调整顺序、
+    删掉一条做过的,都会让 `queue.json` 里所有 `done` 记录瞬间失效,
+    于是播种把它们当成全新待办重新排队。
+
+    实测踩过:给 backlog.md 顶部加了 6 行说明,8 条待办 id 全变。
+    队列"非空"但没有一件真活可干,不变式 #4 成了文字游戏。
+
+    哈希已经足够区分不同标题(同标题才会撞,那本来该合并)。
+    `idx` 现在只作**同名时的序号**,不参与正常 id 的生成。
+
+    Args:
+        title: 条目标题(决定 id 的唯一输入)
+        idx: 同名条目的序号,默认 0
     """
     ascii_part = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:40].strip("-")
     digest = hashlib.sha1(title.encode("utf-8")).hexdigest()[:6]
+    suffix = f"-{idx}" if idx else ""
     if ascii_part:
-        return f"{ascii_part}-{idx}"
-    return f"item-{idx}-{digest}"
+        return f"{ascii_part}{suffix}"
+    return f"item-{digest}{suffix}"
 
 
 # ─── 数据结构 ──────────────────────────────────────────────────────────────
@@ -330,35 +350,57 @@ class Queue:
         items = self.load()
         # 注意:必须是全部 id,不是只有活跃的。见上方 docstring。
         existing_ids = {i.id for i in items}
+        # 已经**做完**的 id。人工 backlog 里的条目做完就不该再被捡回来。
+        done_ids = {i.id for i in items if i.status in ("done", "dropped")}
         max_round = max((i.created_round for i in items), default=0)
         next_round = max_round + 1  # 每次 seed 视为新轮次
 
         added: list[Item] = []
+        # _disambiguate 要拿"加之前"的 id 集合。上面那几行 `existing_ids |=`
+        # 是给下一层做级联去重的,不能拿来当这个。
+        taken_before = set(existing_ids)
 
         # ── Tier 1:backlog.md ──
-        # backlog 内部自己会加 -r{round} 后缀,所以这里传全部已有 id
-        added += self._seed_from_backlog(existing_ids, next_round)
+        # 语义是"**跳过已完成的**",不是"改名复活"。
+        # backlog.md 是人写的清单,引擎做完一条就把它在 queue.json 里标 done,
+        # 但文件本身不会自动删行。于是播种再读它时会读到同一批条目。
+        # 如果这里"改名复活",就等于把已完成的活无限量地重新排队 ——
+        # 实测第 12 轮后队列里 8 条待办全是已完成工作的重推导
+        # (置信度/架构测试/UNION/证书/storage/DISAPPEARED ...),
+        # 队列"非空"但没有一件真活可干。不变式 #4 被满足成了文字游戏。
+        #
+        # 人想重做同一件事时,显式从 backlog.md 删掉或改 id 即可 ——
+        # "重做"应该是一个动作,不该是副作用。
+        added += self._seed_from_backlog(done_ids, next_round, skip_existing=True)
         existing_ids |= {i.id for i in added}
 
         # ── Tier 2:自动推导 ──
         if not added:
-            # 刻意传**空集**:这一层是"按仓库现状提出候选项",
-            # 跳过已存在的 id 等于让保底失效(实测:三个保底项全被跳过后
-            # seed_if_empty 返回 0,队列空掉,不变式 #4 破)。
-            # 去重统一交给末尾的 _disambiguate,这里只管提。
+            # 语义是"**总是提出**":这一层按仓库现状判断"还有没有活",
+            # 条件仍然成立就说明活确实没干完(如规则数仍 < 40),
+            # 所以复活是对的,只是 id 要换。传空集让 _disambiguate 处理冲突。
+            #
+            # 这里不能用"跳过":上一轮实测三个保底项被全跳过后
+            # seed_if_empty 返回 0,队列空掉,不变式 #4 真的破了。
             added += self._seed_from_project_state(set(), next_round)
             existing_ids |= {i.id for i in added}
 
         # ── Tier 3:保底 ──
         if not added:
-            # 同上:保底层必须**总能**提出东西,否则它就不是保底。
-            # id 冲突由 _disambiguate 加后缀解决。
+            # 长期演进项(L1..L5)本来就是"做到就算一轮、还会再来"的,
+            # 所以永远提出 + 改名。保底层必须总能提出东西,否则它不是保底。
             added += self._seed_fallback(set(), next_round)
 
         if added:
             # 兜底:任何重复 id 都在这里被就地改名。
             # 三级策略里哪一层写错了都不至于产出重复 id。
-            added = self._disambiguate(added, existing_ids)
+            #
+            # 注意传的是**加之前**的快照。早先直接传 existing_ids,而上面
+            # 那些 `existing_ids |= {added}` 早就把新条目自己的 id 塞进去了,
+            # 于是 _disambiguate 拿新条目跟它自己比,全部改名 ——
+            # 连空队列播种都产出 `item-2-97ad0c-r1` 这种"本该是首次出现"
+            # 的 id。比 id 冲突更糟的是它让首次播种看起来像重跑。
+            added = self._disambiguate(added, taken_before)
             items.extend(added)
             self.save(items)
             log.info("queue.seed_if_empty: +%d items", len(added))
@@ -494,9 +536,17 @@ class Queue:
         return self.path.parent / "backlog.md"
 
     def _seed_from_backlog(
-        self, existing_ids: set[str], round_no: int
+        self, existing_ids: set[str], round_no: int, skip_existing: bool = False
     ) -> list[Item]:
-        """读 devloop/backlog.md;不存在则创建空模板。"""
+        """读 devloop/backlog.md;不存在则创建空模板。
+
+        Args:
+            existing_ids: 已占用的 id 集合
+            round_no: 新条目的 created_round
+            skip_existing: True=撞上 existing 就**丢弃这条**(不复活);
+                False=撞上就加 -r{round} 后缀(复活)。
+                Tier 1 用 True —— 人写下的待办做完了就不该自己回来。
+        """
         bp = self._backlog_path()
         if not bp.exists():
             bp.parent.mkdir(parents=True, exist_ok=True)
@@ -515,7 +565,12 @@ class Queue:
         except OSError as e:
             log.warning("backlog read failed: %s", e)
             return out
-        for idx, line in enumerate(text.splitlines()):
+        # 同名条目的出现次数。**不是行号** —— 行号会随文件里任何一处增删
+        # 而变化,那样每次编辑 backlog.md 都会让下方所有条目的 id 全变,
+        # queue.json 里的 done 记录瞬间失效,已完成的活被重新排队。
+        # (实测踩过:文件顶部加 6 行说明,8 条待办 id 全变。)
+        title_seen: dict[str, int] = {}
+        for line in text.splitlines():
             m = self._BACKLOG_LINE.match(line)
             if not m:
                 continue
@@ -525,11 +580,18 @@ class Queue:
             detail = m.group(4).strip()
             verify = m.group(5).strip()
             # id 由 title 派生。中文标题 slug 化会退化成 "item"（正则只认
-            # [a-z0-9]），所以中文为主时退化为稳定序号 + 短哈希——保证 id
-            # 唯一、可排序、可读，而不是一堆同名 "item-N"
-            base_id = _slugify_id(title, idx)
+            # [a-z0-9]），所以中文为主时退化为 "item-" + 标题短哈希——
+            # 稳定、可读，且不依赖它在文件里的位置。
+            nth = title_seen.get(title, 0)
+            title_seen[title] = nth + 1
+            base_id = _slugify_id(title, nth)
             iid = base_id
             if iid in existing_ids:
+                if skip_existing:
+                    # 这条已经做过(或已丢弃),不复活。
+                    # 人想重做就显式改 id 或从 backlog.md 删掉 ——
+                    # "重做"应该是一个动作,不该是播种的副作用。
+                    continue
                 iid = f"{base_id}-r{round_no}"
             out.append(
                 Item(

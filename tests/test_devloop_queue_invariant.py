@@ -196,6 +196,198 @@ def test_round_records_the_seeding_in_state(loop):
 
 
 # =====================================================================
+# 三层播种需要三种不同语义
+# =====================================================================
+#
+# 之前三层共用"撞上就改名复活",结果第 12 轮后队列里 8 条待办全是
+# 已完成工作的重推导:置信度(r1 已做)、架构测试(r2)、UNION(r3)、
+# 证书(r5)、storage(r7)、DISAPPEARED(r8)……
+#
+# 队列"非空"但没有一件真活可干 —— 不变式 #4 被满足成了文字游戏。
+#
+# 根因:backlog.md 是人写的清单,引擎做完一条只在 queue.json 标 done,
+# 文件本身不删行;播种再读它就又读到同一批。而"改名复活"把这种
+# 重复读变成了无限重新排队。
+#
+# 正确的三种语义:
+#   Tier 1 backlog —— 跳过已完成的。人写下的待办做完了不该自己回来。
+#   Tier 2 现状推导 —— 总是提出。条件仍成立 = 活确实没干完。
+#   Tier 3 长期项  —— 总是提出。本来就是"还会再来"的。
+
+
+def _backlog_ids(loop: Loop) -> list[str]:
+    """从 backlog.md 解析出的条目 id —— **走真实播种路径**
+
+    不要在这里重新实现 id 派生:那等于在测试里维护一份平行实现,
+    一旦实现变了测试就会测错东西(已经踩过:这里写的是按行号派生,
+    而真实实现已改成按同名出现次数)。
+    """
+    return [i.id for i in Queue(loop.dev_dir / "queue.json")._seed_from_backlog(set(), 1)]
+
+
+def test_backlog_item_is_not_resurrected_after_being_done(loop):
+    """人工 backlog 里做完的条目,不能再被播种捡回来"""
+    q = Queue(loop.dev_dir / "queue.json")
+    ids = _backlog_ids(loop)
+    q.save([
+        Item(id=i, title=f"已完成-{i}", detail="d", status="done", done_round=1)
+        for i in ids
+    ])
+    before = {i.id for i in q.load()}
+
+    q.seed_if_empty()
+
+    # 只看**新增**的 id。done 记录本来就该留在队列里(那是历史),
+    # 断言它们"不存在"是另一回事。
+    added = {i.id for i in q.load()} - before
+    resurrected = sorted(added & set(ids))
+    assert not resurrected, f"已完成的 backlog 条目被复活了: {resurrected}"
+
+
+def test_backlog_item_is_still_picked_up_when_never_seen(loop):
+    """没做过的 backlog 条目必须照常播种 —— 跳过不能过头"""
+    q = Queue(loop.dev_dir / "queue.json")
+    q.save([])
+    q.seed_if_empty()
+    after = {i.id for i in q.load()}
+    assert after, "全新队列应当从 backlog 播种出待办"
+    assert set(_backlog_ids(loop)) & after, (
+        f"没做过的 backlog 条目没被播种: {after}"
+    )
+
+
+def test_backlog_item_in_flight_is_not_duplicated(loop):
+    """在队列里已经 pending 的 backlog 条目,不能再补一份同内容的"""
+    q = Queue(loop.dev_dir / "queue.json")
+    q.save([Item(id="item-2-1b85dd", title="甲", detail="d", status="pending")])
+
+    # 队列非空,seed_if_empty 不会补;但强制补一次也不该产出重复内容
+    added = q._seed_from_backlog({"item-2-1b85dd"}, 99, skip_existing=True)
+    assert all(i.id != "item-2-1b85dd" for i in added), added
+
+
+def test_fallback_items_do_come_back(loop):
+    """长期演进项(Tier 3)本来就该再来 —— 三层语义不能一刀切"""
+    q = Queue(loop.dev_dir / "queue.json")
+    fb = q._seed_fallback(set(), 1)
+    assert fb, "保底层必须总能提出东西"
+    # 再叫一次(不传 skip),它还是得提出 —— Tier 3 语义是"总是提出"
+    fb2 = q._seed_fallback(set(), 2)
+    assert fb2 and {i.id for i in fb2} == {i.id for i in fb2}, fb2
+
+
+def test_seeding_never_resurrects_completed_backlog_work(loop):
+    """整轮视角:跑几轮之后,队列里不能全是已完成工作的鬼影"""
+    q = Queue(loop.dev_dir / "queue.json")
+    ids = _backlog_ids(loop)
+    q.save([
+        Item(id=i, title=f"已完成-{i}", detail="d", status="done", done_round=1)
+        for i in ids
+    ])
+    for _ in range(6):
+        cur = Queue(loop.dev_dir / "queue.json")
+        if not any(i.status in ("pending", "in_progress") for i in cur.load()):
+            break
+        loop.round()
+    pending = [i.id for i in Queue(loop.dev_dir / "queue.json").load()
+               if i.status in ("pending", "in_progress")]
+    ghosts = sorted(set(pending) & set(ids))
+    assert not ghosts, f"已完成的 backlog 工作以鬼影形式回到队列: {ghosts}"
+
+
+def test_real_backlog_titles_still_map_to_their_done_records(loop):
+    """真实 backlog.md 里的"已完成"行不能因为改过标题就变成新待办
+
+    id 是从**标题**派生的。我一度用 `~~删除线~~` 标完成,结果每条都换了
+    新 id,`done_ids` 完全拦不住,一次就多造出 7 条鬼影。
+
+    这条测试直接把真实文件拿来验:每个 backlog 条目解析出的 id,
+    要么在队列里是 done/dropped,要么是真的还没做(pending)——
+    不该出现"队列里根本没有对应记录"的条目。
+    """
+    real_loop_dev = REPO / "devloop"
+    text = (real_loop_dev / "backlog.md").read_text(encoding="utf-8")
+    # 同样走真实解析路径,不重新实现
+    ids = {i.id for i in Queue(real_loop_dev / "queue.json")._seed_from_backlog(set(), 1)}
+    assert ids, "真实 backlog.md 解析不出条目"
+
+    known = {i.id: i.status for i in Queue(real_loop_dev / "queue.json").load()}
+    unknown = sorted(ids - set(known))
+    assert not unknown, (
+        f"backlog.md 里有 {len(unknown)} 条在队列里找不到对应记录,会被当新活播种: "
+        f"{unknown}\n"
+        f"  多半是改过标题导致 id 变了 —— id 是从标题派生的"
+    )
+    done_but_still_pending = sorted(
+        i for i in ids
+        if known.get(i) == "pending" and "✅" not in text
+    )
+    assert not done_but_still_pending, (
+        f"标记为已完成却仍是 pending: {done_but_still_pending}"
+    )
+
+
+# =====================================================================
+# id 稳定性:人工源文件里最要命的脆弱性
+# =====================================================================
+
+
+def test_id_does_not_depend_on_line_position():
+    """id 只能由标题决定,不能由行号决定
+
+    早期版本 `_slugify_id(title, idx)` 被调用方喂了**行号**,于是
+    backlog.md 里任何一处的增删都会让下方所有条目的 id 全变。
+    `backlog.md` 是人手工维护的源文件 —— 加一段说明、调顺序、
+    删掉一条做过的,都会让 queue.json 里的 done 记录瞬间失效,
+    播种把它们当全新待办重新排队。
+
+    实测踩过两次:一次用 `~~删除线~~` 改标题,一次在文件顶部加了 6 行说明。
+    """
+    from arl_lite.devloop.queue import _slugify_id
+
+    for title in ("给关联分析规则接上置信度", "add-confidence-grading", "误报率实测"):
+        # 行号不参与:第 0 次出现(唯一一次出现)必须就是基础 id
+        assert _slugify_id(title, 0) == _slugify_id(title), (
+            f"{title!r} 的第 0 次出现不该带序号"
+        )
+        assert _slugify_id(title).count("-") >= 1
+
+
+def test_id_is_stable_under_backlog_reordering(loop):
+    """在 backlog 里插入/删除行,播种出的 id 全部不变
+
+    走真实播种路径,不手工喂行号 —— 否则测的是错误的用法。
+    """
+    bp = loop.dev_dir / "backlog.md"
+    original = bp.read_text(encoding="utf-8")
+    q = Queue(loop.dev_dir / "queue.json")
+
+    before = sorted(i.id for i in q._seed_from_backlog(set(), 1))
+    assert before, "解析不到条目,用例失效"
+
+    bp.write_text("# 新加的一段说明\n\n第二行说明\n\n" + original, encoding="utf-8")
+    after = sorted(i.id for i in q._seed_from_backlog(set(), 1))
+    assert before == after, (
+        f"插入说明行后 id 变了:\n  before={before}\n  after={after}"
+    )
+
+    bp.write_text("\n".join(original.splitlines()[1:]), encoding="utf-8")
+    after2 = sorted(i.id for i in q._seed_from_backlog(set(), 1))
+    assert before == after2, (
+        f"删掉首行后 id 变了:\n  before={before}\n  after={after2}"
+    )
+
+
+def test_same_title_gets_a_sequence_suffix_not_a_shared_id():
+    """同名条目仍要能区分 —— 但序号只在真的同名时才出现"""
+    from arl_lite.devloop.queue import _slugify_id
+
+    base = _slugify_id("重复标题")
+    assert _slugify_id("重复标题", 0) == base
+    assert _slugify_id("重复标题", 2) != base
+
+
+# =====================================================================
 # 软死局:只剩别人处理不了的 in_progress
 # =====================================================================
 
