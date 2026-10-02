@@ -5,19 +5,25 @@
 这是 arl-lite 自持迭代协议(arl_lite.devloop.protocol)的"动力源"。
 
 协议不变量:`待办队列永远非空`(见 devloop/__init__.py 第 12 行)。当所有 item
-都 done/dropped 时,系统不能停下,必须能自动从三个来源补充新待办:
+都 done/dropped 时,系统不能停下,必须能自动从两个来源补充新待办:
 
     Tier 1 — 人工追加:devloop/backlog.md(每行一条,人写的长期待办清单)
-    Tier 2 — 项目状态自动推导(扫规则库/集成数/测试覆盖/计划文档)
-    Tier 3 — 保底:3 条长期演进项(依赖审计 / 性能基线 / 误报率实测)
+    Tier 2 — 保底:3 条长期演进项(依赖审计 / 性能基线 / 误报率实测),
+            **只提已经到期的**(verify 当前不通过的)
+
+原来中间还有一层「扫项目现状自动推导」,第 16 轮整层删除 ——
+它的五条检查逐条实测没有一条能产出真活,详见 `REMOVED_TIER2_WHY`。
 
 队列的核心职责:
     1. 持久化:JSON 落盘,原子写(tmp + os.replace),崩溃后可恢复
     2. 调度:next() 按 (priority asc, created_round asc, id asc) 稳定排序
     3. 状态机:pending → in_progress → done | dropped,attempts 在 in_progress 时 +1
     4. 自愈:seed_if_empty() 永远能产生至少 1 条新 item(协议不变量)
+    5. 多 agent:claim / release / finish / recover_stale 是加锁的原子操作,
+       绕开它们直接 load/save 在并发下会丢更新
 
-零依赖:只用标准库(json / os / tempfile / pathlib / dataclasses / re / logging)。
+零依赖:只用标准库(json / os / subprocess / tempfile / pathlib /
+dataclasses / re / time / logging / fcntl / msvcrt)。
 """
 from __future__ import annotations
 
@@ -26,6 +32,7 @@ import logging
 import os
 import re
 import hashlib
+import subprocess
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
@@ -84,6 +91,49 @@ def _slugify_id(title: str, idx: int = 0) -> str:
     return f"item-{digest}{suffix}"
 
 
+REMOVED_TIER2_WHY = """\
+「扫项目现状自动推导」这一层播种已被整层删除(2026-10,第 16 轮)。
+
+它原本有 5 条检查。逐条实测,**没有一条能产出一件真活**:
+
+| 检查 | 依据 | 实测结果 |
+|---|---|---|
+| (a) risk>=7 的规则缺 confidence | 字段是否存在 | 25 条 risk>=7,**0 条缺**。永远产不出 |
+| (b) 规则数 < 40 | 魔法数字 40 | 37 条,永远产出一条"补到 40" |
+| (c) 集成源数 < 12 | 魔法数字 12 | 实际 18,阈值早就过了,永不触发 |
+| (d) 缺 test_phaseN.py | 固定 1..7 | 一条不缺,永不触发 |
+| (e) 对齐 PROJECT_PLAN.md | —— | **它自己的 verify 此刻就通过**(文件在、18KB>200) |
+
+## 病根:把三类东西混在了一个"自动推导"里
+
+1. **常驻不变式** —— (a)「每条规则都要有 confidence」。这不是一件一次性的
+   活,是每轮都该成立的事实。放在"缺了才提一条待办"里,后果是它**只在
+   第一次被检查**:提过一次之后就不响了,之后谁新加一条漏写 confidence 的
+   规则都没人知道。→ 已搬进 `rules_have_advice` 门禁,每轮阻塞级检查。
+
+2. **目标数字** —— (b)(c)。"规则数要到 40""数据源要到 12"是**决定**,
+   不是从仓库现状推导出来的事实。而这个决定没有人拥有:阈值从哪来的?
+   第 14 轮已经判定「规则数<40 是拍脑袋定的,凑数字是自欺」。一个没人
+   负责的数字永远不会被更新,于是它要么永不触发,要么逼着人为了凑数而
+   干活。→ 目标属于人写的 `backlog.md`,不属于自动推导。
+
+3. **已经满足的验收条件** —— (e)。verify 写的是
+   `test -f docs/PROJECT_PLAN.md` 且大小 >200 —— 这条此刻就成立。
+   于是它**永远完不成**(没人能"重新做一遍"一个已经通过的条件),
+   却一直挂在队列头等人去干。
+
+> **假活比队列空掉更坏。** 队列空掉会报错;假活会让人真的去干一遍
+> 已经做完的事,干完还会被标成 done,污染后续所有轮次的判断依据。
+
+删掉这一层之后不变式 #4 依然成立:剩下 Tier 1(人工 backlog)和
+Tier 2 保底层(长期演进项),保底层永远能产出。
+
+**不要把这一层原样加回来。** 要往队列里放东西,先过两道:
+  - 这个待办的 `verify` 此刻是否已经通过?已经通过 = 假活
+  - 它的判据里有没有"对比某个数字"?有 = 那是目标,写进 backlog.md
+"""
+
+
 # ─── 数据结构 ──────────────────────────────────────────────────────────────
 @dataclass
 class Item:
@@ -110,6 +160,31 @@ class Item:
     # 只有 owner 时没法判断"活人还在干"还是"人已经没了" —— owner
     # 只是个字符串。认领时间是第二个独立信号,见 recover_stale 的策略。
     claimed_at: float = 0.0
+
+
+def _FRESH_WITHIN(rel_path: str, days: int) -> str:
+    """周期性任务的 verify:产物存在**且**在 N 天内被更新过
+
+    ## 为什么不能只写 `test -f <报告>`
+
+    这三条保底项都是**周期性**的(季度审计 / 性能基线 / 误报率实测) ——
+    做完一次还会再来。而报告文件是持久的:第 14 轮产出了 FP_RATE.md,
+    于是 `test -f docs/FP_RATE.md` 从那一刻起**永远成立**。
+
+    后果是这条待办**只能被完成一次**,之后每次被"总是提出"地重新
+    播种出来,它的验收条件都是已满足的 —— 永远完不成,却一直占着
+    队列。这跟被删掉的 Tier2 (e) 是同一种病,只是慢一点发作。
+
+    带时间边界之后,判据回到"这一轮有没有真的重做":
+    90 天内更新过 = 本周期做过了;超过 90 天 = 该重做了。
+
+    纯 stdlib(stat 的 st_mtime + time),不引第三方。
+    """
+    return (
+        "python3 -c \"import pathlib,time,sys;"
+        f"p=pathlib.Path('{rel_path}');"
+        f"sys.exit(0 if p.exists() and (time.time()-p.stat().st_mtime)<{days * 86400} else 1)\""
+    )
 
 
 # ─── 持久化 ────────────────────────────────────────────────────────────────
@@ -615,10 +690,9 @@ class Queue:
     def seed_if_empty(self) -> int:
         """空了就播种。返回新增条数。
 
-        三级策略(优先级递减):
-            1. 读 devloop/backlog.md(人工长期待办清单)
-            2. 扫项目状态自动推导(规则/集成/测试/文档)
-            3. 保底 3 条长期演进项
+        两级策略(优先级递减):
+            1. 读 devloop/backlog.md(人工长期待办清单,跳过已完成的)
+            2. 保底 3 条长期演进项(只提已经到期的)
 
         旋转规则:补进来的 id 若与**任何**已有条目重名,一律加 -r{round}
         后缀,保证 id 全局唯一。
@@ -667,26 +741,20 @@ class Queue:
         added += self._seed_from_backlog(done_ids, next_round, skip_existing=True)
         existing_ids |= {i.id for i in added}
 
-        # ── Tier 2:自动推导 ──
-        if not added:
-            # 语义是"**总是提出**":这一层按仓库现状判断"还有没有活",
-            # 条件仍然成立就说明活确实没干完(如规则数仍 < 40),
-            # 所以复活是对的,只是 id 要换。传空集让 _disambiguate 处理冲突。
-            #
-            # 这里不能用"跳过":上一轮实测三个保底项被全跳过后
-            # seed_if_empty 返回 0,队列空掉,不变式 #4 真的破了。
-            added += self._seed_from_project_state(set(), next_round)
-            existing_ids |= {i.id for i in added}
 
-        # ── Tier 3:保底 ──
+    # ── Tier 2:保底 ──
         if not added:
-            # 长期演进项(L1..L5)本来就是"做到就算一轮、还会再来"的,
-            # 所以永远提出 + 改名。保底层必须总能提出东西,否则它不是保底。
+            # 长期演进项本来就是"做到就算一轮、还会再来"的,所以永远提出
+            # + 改名。保底层必须总能提出东西,否则它不是保底。
+            #
+            # 原来这里上面还有一层"扫项目现状自动推导"(Tier 2)。它已经
+            # 被整层删掉了,理由见 `REMOVED_TIER2_WHY`。删除之后不变式 #4
+            # 依然成立:本层是保底,永远能产出。
             added += self._seed_fallback(set(), next_round)
 
         if added:
             # 兜底:任何重复 id 都在这里被就地改名。
-            # 三级策略里哪一层写错了都不至于产出重复 id。
+            # 两级策略里哪一层写错了都不至于产出重复 id。
             #
             # 注意传的是**加之前**的快照。早先直接传 existing_ids,而上面
             # 那些 `existing_ids |= {added}` 早就把新条目自己的 id 塞进去了,
@@ -784,6 +852,57 @@ class Queue:
         for it in self.load():
             counts[it.id] = counts.get(it.id, 0) + 1
         return {k: v for k, v in counts.items() if v > 1}
+
+    def drop(self, item_id: str, reason: str) -> tuple[bool, str]:
+        """把一条待办标成 dropped。返回 (成功, 说明)。
+
+        ## 为什么需要这个操作
+
+        `unmark` 是反方向的:把误标的 done 改回 pending。
+        但还有第三种情况它处理不了 —— **这条待办本身就是假的**。
+
+        实测抓到过三种假活:
+        - 判据是没人拥有的魔法数字(「规则数补到 40」)
+        - 它的 verify 此刻就已经通过(「对齐 PROJECT_PLAN.md」,而文件在)
+        - 判据是常驻不变式,不是「这次工作做没做」(「季度依赖审计」
+          验的是 `dependencies == []`,而它本来就成立)
+
+        对这类条目,改回 pending 是错的 —— 它会再次变成队列头,
+        再次被选中,再次做不出任何东西。必须让它**消失**,而且要
+        **带上原因**,否则三个月后没人记得当初为什么删。
+
+        为什么不能直接改 queue.json:那会让"为什么丢弃"这一条信息
+        绕过 review。而丢弃原因恰恰是这件事里最值钱的部分 ——
+        它记录的是"我们试过这条路,它不成立"。
+
+        dropped 的 id 也在 `done_ids` 里,所以人工 backlog 不会把它捡回来。
+        """
+        items = self.load()
+        matches = [it for it in items if it.id == item_id]
+        if not matches:
+            return False, f"no such item: {item_id!r}"
+        if len(matches) > 1:
+            return False, (
+                f"{item_id!r} has {len(matches)} records with the same id; "
+                f"run 'arl-lite devloop repair' first"
+            )
+        target = matches[0]
+        if target.status == "dropped":
+            return False, f"{item_id} is already dropped"
+        if not reason.strip():
+            return False, (
+                "丢弃必须给理由。丢弃原因记录的是'我们试过,它不成立',"
+                "那是这条记录里最值钱的部分 —— 没有它,三个月后"
+                "下一个人会把同样的东西再加回来。用 --reason 写清楚。"
+            )
+        old = target.status
+        target.status = "dropped"
+        target.owner = ""
+        target.claimed_at = 0.0
+        target.note = (target.note + "\n" if target.note else "") + \
+            f"dropped from {old}: {reason}"
+        self.save(items)
+        return True, f"{item_id}: {old} -> dropped"
 
     def unmark(self, item_id: str, reason: str = "") -> tuple[bool, str]:
         """把误标的 done/dropped 改回 pending。返回 (成功, 说明)。
@@ -900,255 +1019,24 @@ class Queue:
             )
         return out
 
-    # ── Tier 2:项目状态自动推导 ──────────────────────────────────────────
-    _RULES_DIR = Path("arl_lite/modules/analysis/rules")
-    _INTEGRATIONS_DIR = Path("arl_lite/integrations")
-    _TESTS_DIR = Path("tests")
-    _PLAN_DOC = Path("docs/PROJECT_PLAN.md")
-    _RULE_RISK = re.compile(r"^risk:\s*(\d+)\s*$", re.MULTILINE)
-    _RULE_NAME = re.compile(r"^name:\s*(\S+)\s*$", re.MULTILINE)
-    # 置信度字段。第 1 轮把置信度从 `low-confidence` **标签**改成了
-    # `confidence:` **字段**(high/medium/low 三档)。
-    _RULE_CONFIDENCE = re.compile(r"^confidence:\s*(\S+)\s*$", re.MULTILINE)
-
-    def _scan_repo_root(self) -> Path | None:
-        """尽量推断 repo 根目录:从 queue.json 向上找 pyproject.toml。"""
-        cur = self.path.resolve().parent
-        for _ in range(6):
-            if (cur / "pyproject.toml").exists() and (cur / "arl_lite").is_dir():
-                return cur
-            cur = cur.parent
-        return None
-
-    def _seed_from_project_state(
-        self, existing_ids: set[str], round_no: int
-    ) -> list[Item]:
-        """扫项目状态,产生结构化待办。
-
-        推导规则(每一条都必须能对着仓库现状独立核实):
-          - 规则 yml 中 risk >= 7 且**没有 confidence 字段** → "加置信度标注"
-          - 规则数 < 40 → "补充关联分析规则覆盖"
-          - 集成源模块数 < 12 → "新增数据源"
-          - 测试 phase 文件缺失 → "补测试"
-          - docs/PROJECT_PLAN.md 与实现差距 → "对齐项目计划文档"
-
-        ## 这一层最容易出的错:拿旧事实推新待办
-
-        规则改过之后(比如置信度从 `low-confidence` 标签改成
-        `confidence:` 字段),这个推导不会跟着改,于是对每一条高风险
-        规则都报"缺标注"。第 13 轮实测:37 条规则全部有 confidence 字段,
-        标签 0 条,而推导照样挑出风险最高的 3 条报成新活。
-
-        **假活比队列空掉更坏** —— 队列空掉会报错,假活会让人真的去干
-        一遍已经做完的事,干完还会被标成 done。
-
-        所以改完规则模型之后要回来核对这一层。
-        `tests/test_devloop_seed_truthfulness.py` 把每条断言都独立验了一遍。
-        """
-        repo = self.scan_repo_root()
-        if repo is None:
-            return []
-        out: list[Item] = []
-
-        # (a) 高风险规则缺置信度标注
-        #
-        # 这里判的是 `confidence:` **字段**是否存在,不是找 `low-confidence` 标签。
-        # 第 1 轮把置信度从标签改成了字段,标签已经全部消失(0/37),
-        # 而这个检查还在找标签 —— 于是 25 条 risk≥7 的规则**全部**被误判成
-        # "缺置信度标注",取风险最高的 3 条报成新待办。
-        # 实测:`database_with_public_web` / `docker_api_exposed` /
-        # `elasticsearch_public` 三条明明都有 confidence 字段,却被要求补标注。
-        #
-        # 播种必须基于**当下**的事实。规则改过一轮之后,这个检查不跟着改,
-        # 产出的就是假活 —— 比队列空掉更坏:空队列会报错,假活会让人白干。
-        rules_dir = repo / self._RULES_DIR
-        if rules_dir.is_dir():
-            high_risk_no_conf = []
-            all_rules = sorted(
-                p for p in rules_dir.glob("*.yml") if p.is_file()
-            )
-            for yml in all_rules:
-                try:
-                    txt = yml.read_text(encoding="utf-8")
-                except OSError:
-                    continue
-                risk_m = self._RULE_RISK.search(txt)
-                name_m = self._RULE_NAME.search(txt)
-                if not risk_m or not name_m:
-                    continue
-                risk = int(risk_m.group(1))
-                conf_m = self._RULE_CONFIDENCE.search(txt)
-                if risk >= 7 and not conf_m:
-                    high_risk_no_conf.append((name_m.group(1), risk))
-            # 限 3 条,按风险降序
-            high_risk_no_conf.sort(key=lambda x: (-x[1], x[0]))
-            for name, risk in high_risk_no_conf[:3]:
-                iid = f"add-confidence-{name}"
-                if iid in existing_ids:
-                    continue
-                out.append(
-                    Item(
-                        id=iid,
-                        title=f"为规则 {name} 加置信度标注",
-                        detail=(
-                            f"规则 {name} 的 risk={risk} ≥ 7,但 tags 中无 "
-                            f"low-confidence。建议在 advice 中补充置信度来源、"
-                            f"误报场景与样本不足时的处理建议。"
-                        ),
-                        priority=P2,
-                        kind="change",
-                        verify=(
-                            f"grep -q low-confidence arl_lite/modules/analysis/"
-                            f"rules/{name}.yml"
-                        ),
-                        tags=["confidence", "rules", name],
-                        created_round=round_no,
-                    )
-                )
-
-            # (b) 规则数 < 40 → 补充
-            if len(all_rules) < 40:
-                iid = "supplement-rules-coverage"
-                if iid not in existing_ids:
-                    out.append(
-                        Item(
-                            id=iid,
-                            title="补充关联分析规则覆盖",
-                            detail=(
-                                f"目前 {len(all_rules)} 条规则,目标 ≥ 40。"
-                                f"优先补充:云服务暴露(S3/OSS/Azure Blob)、"
-                                f"API 网关未鉴权、Web 框架 CVE、备份文件残留。"
-                            ),
-                            priority=P2,
-                            kind="change",
-                            verify=(
-                                f"python3 -c \"import pathlib; "
-                                f"n=len(list(pathlib.Path('arl_lite/modules/"
-                                f"analysis/rules').glob('*.yml'))); "
-                                f"assert n>=40, n\""
-                            ),
-                            tags=["rules", "coverage"],
-                            created_round=round_no,
-                        )
-                    )
-
-        # (c) 集成源数 < 12
-        integ_dir = repo / self._INTEGRATIONS_DIR
-        if integ_dir.is_dir():
-            srcs = [
-                p
-                for p in integ_dir.glob("*.py")
-                if p.stem not in ("__init__", "tool_checker")
-            ]
-            if len(srcs) < 12:
-                iid = "add-data-source"
-                if iid not in existing_ids:
-                    out.append(
-                        Item(
-                            id=iid,
-                            title="新增数据源集成",
-                            detail=(
-                                f"目前 {len(srcs)} 个数据源,目标 ≥ 12。"
-                                f"候选:Censys/Shodan/ThreatBook/ZoomEye/"
-                                f"Binaryedge。复用 arl_lite.integrations 子类模板。"
-                            ),
-                            priority=P3,
-                            kind="change",
-                            verify=(
-                                f"python3 -c \"import pathlib; "
-                                f"n=len([p for p in pathlib.Path('arl_lite/"
-                                f"integrations').glob('*.py') "
-                                f"if p.stem not in ('__init__','tool_checker')]); "
-                                f"assert n>=12, n\""
-                            ),
-                            tags=["integrations", "data-source"],
-                            created_round=round_no,
-                        )
-                    )
-
-        # (d) 测试 phase 缺失
-        tests_dir = repo / self._TESTS_DIR
-        if tests_dir.is_dir():
-            present = {
-                p.stem
-                for p in tests_dir.glob("test_phase*.py")
-            }
-            missing = [
-                n
-                for n in range(1, 8)
-                if f"test_phase{n}" not in present
-            ]
-            if missing:
-                iid = "add-missing-phase-tests"
-                if iid not in existing_ids:
-                    out.append(
-                        Item(
-                            id=iid,
-                            title="补缺失阶段测试",
-                            detail=(
-                                f"缺失 phase 测试: {missing}。"
-                                f"参考 test_phase1.py 的 pytest 风格补齐。"
-                            ),
-                            priority=P2,
-                            kind="test",
-                            verify=(
-                                "python3 -m pytest "
-                                + " ".join(f"tests/test_phase{n}.py" for n in missing)
-                                + " -q"
-                            ),
-                            tags=["tests", "coverage"],
-                            created_round=round_no,
-                        )
-                    )
-
-        # (e) 计划文档对齐
-        plan = repo / self._PLAN_DOC
-        if plan.is_file():
-            iid = "align-project-plan-doc"
-            if iid not in existing_ids:
-                out.append(
-                    Item(
-                        id=iid,
-                        title="对齐 PROJECT_PLAN.md 与实现",
-                        detail=(
-                            "逐节检查 docs/PROJECT_PLAN.md 中声明的功能/阶段,"
-                            "对照 arl_lite/* 实现,标注未完成/不一致条目,"
-                            "并在 plan 中更新状态。"
-                        ),
-                        priority=P3,
-                        kind="doc",
-                        verify=(
-                            "python3 -c \"import pathlib; "
-                            "p=pathlib.Path('docs/PROJECT_PLAN.md'); "
-                            "assert p.exists() and p.stat().st_size>200\""
-                        ),
-                        tags=["docs", "plan"],
-                        created_round=round_no,
-                    )
-                )
-
-        return out
-
-    def scan_repo_root(self) -> Path | None:
-        """公开别名,方便测试/协议层调用。"""
-        return self._scan_repo_root()
-
-    # ── Tier 3:保底 ──────────────────────────────────────────────────────
+    # ── Tier 2:保底 ──────────────────────────────────────────────────────
     _FALLBACK: tuple[dict, ...] = (
         {
             "id": "quarterly-dep-audit",
             "title": "季度依赖审计",
             "detail": (
-                "pip-audit 或安全公告巡检,记录 optional-dependencies 与"
+                "巡检 pyproject 与安全公告,记录 optional-dependencies 与"
                 "运行时风险的边界;目标保持核心零依赖(见 pyproject.toml)。"
             ),
             "priority": P3,
             "kind": "research",
-            "verify": (
-                "python3 -c \"import tomllib,pathlib; "
-                "t=tomllib.loads(pathlib.Path('pyproject.toml')."
-                "read_text()); assert t['project']['dependencies']==[]\""
-            ),
+            # verify 必须是**本次工作留下的证据**,不能是常驻不变式。
+            # 原先写的是 `assert t['project']['dependencies']==[]` ——
+            # 那是"核心保持零依赖"这条不变式,它**此刻就成立**,于是这条
+            # 审计永远不可能被判定为"做过":没人能重新做一遍已经为真的
+            # 条件。它和被删掉的 Tier2 (e) 是同一种病。
+            # 改成查审计报告本身存在,这才区分得了"做了"和"本来就成立"。
+            "verify": _FRESH_WITHIN("docs/DEP_AUDIT.md", 90),
             "tags": ["deps", "audit"],
         },
         {
@@ -1161,7 +1049,7 @@ class Queue:
             ),
             "priority": P3,
             "kind": "research",
-            "verify": "test -f docs/PERF_BASELINE.md",
+            "verify": _FRESH_WITHIN("docs/PERF_BASELINE.md", 90),
             "tags": ["perf", "baseline"],
         },
         {
@@ -1173,18 +1061,72 @@ class Queue:
             ),
             "priority": P3,
             "kind": "research",
-            "verify": "test -f docs/FP_RATE.md",
+            "verify": _FRESH_WITHIN("docs/FP_RATE.md", 90),
             "tags": ["rules", "quality"],
         },
     )
 
+    @staticmethod
+    def verify_passes(verify: str, timeout: float = 30.0) -> bool:
+        """跑一条 verify,返回是否通过。
+
+        跑不起来(超时/命令不存在/异常)一律按**不通过**处理 ——
+        宁可当成"没做",也不要因为判断不了就下结论。
+        `verify` 全部来自本模块的源码常量或本仓库的 backlog.md,
+        是只读检查;仍然加超时,一条写坏的 verify 不能挂死播种。
+        """
+        if not verify.strip():
+            return False
+        try:
+            r = subprocess.run(
+                ["bash", "-c", verify],
+                cwd=Path.cwd(), capture_output=True, text=True, timeout=timeout,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return False
+        return r.returncode == 0
+
     def _seed_fallback(
         self, existing_ids: set[str], round_no: int
     ) -> list[Item]:
-        """保底:3 条长期演进项。"""
+        """保底:3 条长期演进项,**只提已经到期的**。
+
+        ## 为什么加"到期"判断
+
+        早先这里是"总是提出 + 改名",理由是保底层必须总能产出,
+        否则不变式 #4(队列永远非空)会破。
+
+        但这三条是**周期性**任务,而 verify 已经带 90 天时间边界了 ——
+        它回答的正是"这条到点了吗"。到点没做的才该被提;刚做过的
+        每轮被重新提一次,就是噪音,而且是第 16 轮刚清掉的那类假活
+        换个马甲又回来了(实测:FP_RATE.md 刚在第 14 轮产出,
+        `false-positive-rate-measurement` 就成了永远完不成的条目)。
+
+        所以改成:**verify 当前不通过的才提**。这让 verify 同时承担
+        两个角色,它们本来就是同一件事 ——
+          - 播种时:这条到点了吗?
+          - 验收时:这件事做完了吗?
+
+        ## 到期判断失败时保守处理
+
+        verify 跑不起来(命令写错/超时/非零退出码之外的异常)时,
+        按**已到期**处理 —— 宁可多提一条让人看一眼,也不要因为
+        判断不了而静默地什么都不提。静默是这类系统最坏的失败模式。
+
+        真要是三条全都还没到期,本层返回空,队列会空掉。那是对
+        "眼下确实没有维护活要干"的诚实回答,不是不变式被破坏 ——
+        该做的是往 `backlog.md` 里加新的人写待办,或者往 `_FALLBACK`
+        里加新的长期项(那是个决定,应该由人做)。
+        """
         out: list[Item] = []
         for spec in self._FALLBACK:
             if spec["id"] in existing_ids:
+                continue
+            if self.verify_passes(spec["verify"]):
+                log.info(
+                    "queue._seed_fallback: %s 尚未到期(verify 通过),不提出",
+                    spec["id"],
+                )
                 continue
             out.append(
                 Item(

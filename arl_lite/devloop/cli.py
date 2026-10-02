@@ -42,6 +42,18 @@ def _loop():
     return Loop(_repo_root())
 
 
+def _queue():
+    """devloop 队列句柄。
+
+    路径只在这里定义一次 —— 五个子命令都从它拿。早先每处各写一遍
+    `Queue(_loop().dev_dir / "queue.json")`,改路径就得改五处,而漏掉
+    那一处不会报错,只会让某个子命令读写**另一份队列**。那种 bug 极难查:
+    命令返回成功,但干的事全落在没人看的地方。
+    """
+    from .queue import Queue
+    return Queue(_loop().dev_dir / "queue.json")
+
+
 def cmd_devloop(args) -> int:
     """devloop 总入口"""
     sub = getattr(args, "devloop_sub", None)
@@ -67,6 +79,8 @@ def cmd_devloop(args) -> int:
         return _cmd_repair(args)
     if sub == "unmark":
         return _cmd_unmark(args)
+    if sub == "drop":
+        return _cmd_drop(args)
     if sub == "claim":
         return _cmd_claim(args)
     if sub == "release":
@@ -92,7 +106,7 @@ def _cmd_claim(args) -> int:
     """原子认领一条待办 —— 多 agent 并行的入口"""
     from .queue import Queue
     owner = getattr(args, "owner", "") or _default_owner()
-    q = Queue(_loop().dev_dir / "queue.json")
+    q = _queue()
     it = q.claim(
         owner=owner,
         item_id=getattr(args, "item_id", None),
@@ -109,8 +123,7 @@ def _cmd_claim(args) -> int:
 
 def _cmd_release(args) -> int:
     """放弃认领(agent 挂掉/超时后用)"""
-    from .queue import Queue
-    q = Queue(_loop().dev_dir / "queue.json")
+    q = _queue()
     # 参数名必须是 note:Queue.release 的签名是 (item_id, note="")。
     # 早先这里传的是 reason=,一调就 TypeError —— 命令看着存在,实际不可用。
     ok = q.release(args.item_id, note=getattr(args, "reason", "") or "")
@@ -149,6 +162,17 @@ def _cmd_finish_item(args) -> int:
         print(f"[+] {args.item_id} -> pending (退回,下轮可再领)")
     else:
         print(f"[+] {args.item_id} -> done (round {round_no})")
+    return 0
+
+
+def _cmd_drop(args) -> int:
+    """把一条假活标成 dropped(必须给理由)"""
+    q = _queue()
+    ok, msg = q.drop(args.item_id, reason=getattr(args, "reason", "") or "")
+    if not ok:
+        print(f"[!] {msg}", file=sys.stderr)
+        return 1
+    print(f"[+] {msg}")
     return 0
 
 
@@ -280,8 +304,7 @@ def _cmd_repair(args) -> int:
     启发式保留了 pending)。这种时候唯一的出路是拿 devloop history
     里的事实来源人工校正,所以必须先看清楚它打算改什么。
     """
-    from .queue import Queue
-    q = Queue(_loop().dev_dir / "queue.json")
+    q = _queue()
     dupes = q.find_duplicates()
     if not dupes and not getattr(args, "force", False):
         print("[i] no duplicate ids; nothing to repair")
@@ -315,8 +338,7 @@ def _cmd_unmark(args) -> int:
     逻辑在 Queue.unmark 里,这里只做参数接线 —— 这样能在隔离目录里测,
     不用去动真实仓库的状态。
     """
-    from .queue import Queue
-    q = Queue(_loop().dev_dir / "queue.json")
+    q = _queue()
     ok, detail = q.unmark(args.item_id, getattr(args, "reason", "") or "")
     if not ok:
         print(f"[!] {detail}", file=sys.stderr)
@@ -388,6 +410,17 @@ def add_devloop_parser(sub) -> None:
     )
     pu.add_argument("item_id")
     pu.add_argument("--reason", default="", help="为什么改回(记进 item.note)")
+
+    pdr = dsub.add_parser(
+        "drop",
+        help="把一条假活标成 dropped(必须给理由)",
+    )
+    pdr.add_argument("item_id")
+    pdr.add_argument(
+        "--reason", required=True,
+        help="为什么丢弃。丢弃原因记录的是'我们试过,它不成立',"
+             "是这条记录里最值钱的部分",
+    )
 
     # ── 多 agent 协作 ──
     # 三个命令合起来是"领活 → 干 → 交活"的闭环。少任何一个,

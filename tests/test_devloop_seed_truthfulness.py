@@ -1,179 +1,460 @@
-"""播种产出的每一条都必须**能被独立核实**
+"""播种产出的每一条待办,都必须是一件**真能干的活**
 
-第 13 轮播种提出 5 条,其中 3 条是假的:
+## 为什么这个文件存在
 
-    add-confidence-database_with_public_web
-    add-confidence-docker_api_exposed
-    add-confidence-elasticsearch_public
+第 13、14、16 轮各撞到过一次同一类 bug,每次长得都不一样:
 
-这三条规则其实都有 `confidence:` 字段。原因是检查还在找
-`low-confidence` **标签** —— 第 1 轮把置信度从标签改成了字段,
-标签全没了(0/37),于是 25 条 risk≥7 的规则全部被误判成"缺标注",
-取风险最高的 3 条报上来。
+- 第 13 轮:Tier 2 还在找 `low-confidence` **标签**,而标签早改成
+  `confidence:` **字段**了 → 25 条明明合规的规则被要求补标注
+- 第 14 轮:播种提出「规则数补到 40」,而 40 是个没人拥有的数字
+- 第 16 轮:五条推导检查逐条实测,**没有一条能产出真活** ——
+  三条阈值早就过了永不触发,一条提不出东西,还有一条
+  (`align-project-plan-doc`)**它自己的 verify 此刻就通过**,
+  于是永远完不成,却一直挂在队列头等人去干
 
-**假活比队列空掉更坏**:队列空掉会报错,假活会让人真的去干一遍已经
-做完的事,而且干完之后引擎还会把它标 done。
+第 16 轮把整个「扫项目现状自动推导」层删掉了(`queue.REMOVED_TIER2_WHY`
+记了逐条实测数据)。删掉之后,防止它回来的办法不是"记得别加" ——
+是让"假活"这件事**在机制上就通不过**。
 
-所以本文件的立场是:任何"按现状推导"出来的待办,它的每一条断言都
-必须能对着仓库现状独立验证为真。本文件把三类推导全部验一遍:
+## 本文件验的是「能不能干完」,不是「说法对不对」
 
-  (a) 高风险规则缺 confidence 字段
-  (b) 数据源数量不足
-  (c) 阶段测试缺失
+早先这个文件验的是"播种的断言是否符合仓库现状"。那是**真的**但不够:
+「规则数 37 < 40」这句话是真的,可是 40 本身没人拥有,照着它干活
+就是凑数字。
 
-外加一条更一般的:真实队列里不允许存在被自动推导出来、却与仓库
-现状矛盾的条目。
+真正该拦的是另一件事:**一条待办的验收条件此刻是否已经成立**。
+已经成立的待办是假活 —— 没人能"重新做一遍"一个已经为真的条件,
+它会永远挂在队列里,消耗注意力并污染 done 记录。
 """
 from __future__ import annotations
 
+import json
 import re
+import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
 
-from arl_lite.devloop.queue import Queue
+from arl_lite.devloop.queue import REMOVED_TIER2_WHY, Item, Queue
 
 REPO = Path(__file__).parents[1]
 RULES = REPO / "arl_lite" / "modules" / "analysis" / "rules"
 
 
-def _derive() -> list:
-    return Queue(REPO / "devloop" / "queue.json")._seed_from_project_state(set(), 99)
+def _run_verify(verify: str) -> tuple[bool, str]:
+    """跑一条 verify,返回 (是否通过, 输出)
 
-
-# =====================================================================
-# (a) 高风险规则缺置信度
-# =====================================================================
-
-
-def test_no_rule_is_flagged_that_already_has_confidence():
-    """被提名的规则必须真的没有 confidence 字段
-
-    这条直接对应第 13 轮那 3 条假活。
+    verify 全部来自我们自己的源码常量或本仓库的 backlog.md,是只读检查。
+    仍然加超时:一条写坏的 verify 绝不能让测试套件挂死。
     """
-    conf = re.compile(r"^confidence:\s*(\S+)\s*$", re.MULTILINE)
-    name = re.compile(r"^name:\s*(\S+)\s*$", re.MULTILINE)
-
-    for item in _derive():
-        m = re.match(r"^add-confidence-(.+)$", item.id)
-        if not m:
-            continue
-        rule_name = m.group(1)
-        f = RULES / f"{rule_name}.yml"
-        assert f.is_file(), f"{item.id} 指向的规则文件不存在: {f}"
-        txt = f.read_text(encoding="utf-8")
-        assert not conf.search(txt), (
-            f"{item.id} 是假的: {rule_name}.yml 已经有 confidence 字段\n"
-            f"  {conf.search(txt).group(0) if conf.search(txt) else ''}"
+    if not verify.strip():
+        return False, "(空 verify)"
+    try:
+        r = subprocess.run(
+            ["bash", "-c", verify],
+            cwd=REPO, capture_output=True, text=True, timeout=30,
         )
-        assert name.search(txt), f"{rule_name}.yml 缺 name 字段"
+    except subprocess.TimeoutExpired:
+        return False, "(超时)"
+    return r.returncode == 0, (r.stdout + r.stderr).strip()[:200]
 
 
-def test_detection_uses_the_confidence_field_not_a_retired_tag():
-    """检查必须读 `confidence:` 字段,而不是已废弃的 `low-confidence` 标签
+def _fallback_items(round_no: int = 999) -> list[Item]:
+    """保底层能产出的全部待办"""
+    return Queue(REPO / "devloop" / "queue.json")._seed_fallback(set(), round_no)
 
-    置信度模型第 1 轮把标签换成了字段。如果推导还在找标签,
-    它对每一条高风险规则都会报"缺标注"。
 
-    这里断言的是**行为**而不是源码文本:早先试过 grep 源码里有没有
-    "low-confidence" 字样,但文档字符串在解释"这个标记为什么被废弃"
-    时必然会提到它,文本匹配分不出"在用它"和"在说它已经不用了"。
-    真正该守的是行为 —— 已经有 confidence 的规则不能被提名。
+def _seeded_items() -> list[Item]:
+    """走**真实**播种路径,返回这次新增的待办
+
+    ## 为什么不直接调 `_seed_from_backlog(...)`
+
+    早先这个辅助函数是 `_seed_from_backlog(set(), 999, skip_existing=True)`
+    —— 第一个参数传的是**空集**,也就是"什么都不跳过"。于是它把 8 条早已
+    完成的 backlog 条目全当成新待办返回,测试红在"播种产出了假活"上。
+
+    而生产路径 `seed_if_empty()` 传的是 `done_ids`,那 8 条本来就被正确跳过。
+    **产品代码是对的,测试是错的** —— 它绕过了一个关键参数,测的根本不是
+    真实行为。
+
+    这正是本项目记过的教训:测试辅助函数**不得重新实现**被测逻辑。
+    这里"重新实现"的是"怎么调",而那个"怎么调"里恰好藏着唯一要紧的
+    参数 —— 抄近路的那一步,正是出问题的那一步。
+
+    所以改成:复制一份真实队列 → 跑真的 `seed_if_empty()` → 取新增项。
     """
-    conf = re.compile(r"^confidence:\s*(\S+)\s*$", re.MULTILINE)
-    risk = re.compile(r"^risk:\s*(\d+)\s*$", re.MULTILINE)
+    import shutil
+    import tempfile
 
-    # 造一条高风险但**有** confidence 的规则,看推导会不会提名它
-    high_risk_with_conf = [
-        p.stem for p in RULES.glob("*.yml")
-        if (m := risk.search(p.read_text(encoding="utf-8")))
-        and int(m.group(1)) >= 7
-        and conf.search(p.read_text(encoding="utf-8"))
-    ]
-    assert high_risk_with_conf, (
-        "仓库里没有'高风险且有 confidence'的规则,这条用例就验证不了任何东西"
+    with tempfile.TemporaryDirectory() as td:
+        tq = Path(td) / "queue.json"
+        src = REPO / "devloop" / "queue.json"
+        if src.exists():
+            shutil.copy2(src, tq)
+        q = Queue(tq)
+        before = {i.id for i in q.load()}
+        q.seed_if_empty()
+        return [i for i in q.load() if i.id not in before]
+
+
+# =====================================================================
+# 核心不变式:播种不许产出「已经完成」的待办
+# =====================================================================
+
+
+def test_no_auto_seeded_item_is_already_done():
+    """自动播种产出的每一条,verify 此刻都必须**不通过**
+
+    这条是本文件的核心。它直接对应第 16 轮删掉的那一整层里
+    `align-project-plan-doc` 的死法:
+
+        verify = test -f docs/PROJECT_PLAN.md   # 此刻就成立
+
+    一条 verify 已经通过的待办,**永远不可能被判定为完成** ——
+    没有人能"重新做一遍"一个已经为真的条件。它会一直挂在队列头,
+    被下一轮选中、被标成 done(其实什么都没做),或者永远 pending
+    挡着真正的活。
+
+    > 假活比队列空掉更坏:队列空掉会报错,假活不会。
+
+    保底层因为 verify 带 90 天时间边界(见 `queue._FRESH_WITHIN`),
+    只提**已经到期**的项,所以这一条对它是恒成立的 ——
+    刚做完的周期性任务不会因为"总被提出"而变成假活。
+    """
+    for item in _fallback_items() + _seeded_items():
+        passed, out = _run_verify(item.verify)
+        assert not passed, (
+            f"播种产出了假活:{item.id} —— {item.title}\n"
+            f"  它的验收条件此刻就已经通过,这条待办永远完不成:\n"
+            f"    verify: {item.verify}\n"
+            f"  要么把 verify 改成能区分'做了'和'本来就成立'的判据\n"
+            f"  (比如查工作产物,而不是查一条常驻不变式),\n"
+            f"  要么这条就不该被提出。"
+        )
+
+
+def test_recurring_items_are_not_reproposed_before_they_are_due():
+    """周期性任务没到期就不该被反复提出
+
+    第 16 轮的实测:`FP_RATE.md` 刚在第 14 轮产出,而保底层
+    "总是提出"的语义让 `false-positive-rate-measurement` 每轮都冒出来,
+    而它的 verify(那时是 `test -f`)早就在 pass —— 一条永远完不成的
+    条目一直占着队列。
+
+    修法是让 verify 回答"到点了吗"(90 天边界),保底层只提不通过的。
+    这条守住那个修复不被退回去。
+
+    注意用 `_fallback_items(existing_ids=...)` 绕开 id 占位 ——
+    这里验的是"到期判断",不是"哪些 id 已经在队列里"。
+    """
+    q = Queue(REPO / "devloop" / "queue.json")
+    proposed = {i.id for i in q._seed_fallback(set(), 999)}
+    for spec in q._FALLBACK:
+        due = not q.verify_passes(spec["verify"])
+        if due:
+            assert spec["id"] in proposed, (
+                f"{spec['id']} 已到期(verify 不通过)却没被提出 —— "
+                f"到期任务漏掉,队列就少了真活"
+            )
+        else:
+            assert spec["id"] not in proposed, (
+                f"{spec['id']} 还没到期(verify 通过)却被提出了 —— "
+                f"刚做完的周期性任务每轮冒一次,就是噪音"
+            )
+
+
+def test_periodic_verify_can_tell_done_from_overdue():
+    """周期性条目的 verify 必须能区分「刚做完」和「该重做了」
+
+    ## 为什么这条不能省
+
+    变异验证时发现过一个漏网:把 `false-positive-rate-measurement` 的
+    verify 从 `_FRESH_WITHIN("docs/FP_RATE.md", 90)` 退回裸
+    `test -f docs/FP_RATE.md`,**两个相关测试都照样绿** ——
+    因为到期判断会看到它「还没到期」而跳过它。
+
+    但那是真退化:文件一旦存在就永远存在,于是这条周期性工作
+    **再也不会被提出**。不是"多提了",是"彻底不干了",而且悄无声息。
+
+    教训:「没有产出假活」不等于「机制是对的」。到期判断会**掩盖**
+    verify 本身退化。所以这里直接验 verify 本身 ——
+    同样的文件,新的时候通过、旧的时候必须不通过。
+    """
+    import os
+    import time
+
+    from arl_lite.devloop.queue import _FRESH_WITHIN
+
+    with tempfile.TemporaryDirectory() as td:
+        art = Path(td) / "report.md"
+        art.write_text("x", encoding="utf-8")
+        verify = _FRESH_WITHIN(str(art), 90)
+
+        # 刚产出 → 通过
+        now = time.time()
+        os.utime(art, (now, now))
+        passed, out = _run_verify(verify)
+        assert passed, f"刚产出的报告应判为'本周期已做':{out}"
+
+        # 100 天前 → 必须不通过(该重做了)
+        old = now - 100 * 86400
+        os.utime(art, (old, old))
+        passed, out = _run_verify(verify)
+        assert not passed, (
+            f"100 天前的报告仍被判为'已做' —— 这条 verify 永远成立,\n"
+            f"  于是这条周期性工作再也不会被提出(静默失效):{out}"
+        )
+
+        # 边界内(89 天)→ 仍通过,别让边界本身过敏
+        os.utime(art, (now - 89 * 86400, now - 89 * 86400))
+        passed, _ = _run_verify(verify)
+        assert passed, "89 天还在 90 天窗口内,不该判为过期"
+
+
+def test_every_fallback_item_uses_a_time_bounded_verify():
+    """三条周期项都必须用带时间边界的 verify,不许用裸 `test -f`
+
+    裸 `test -f <报告>` 只能被完成一次:文件是持久的,第一次做完之后
+    条件永远成立。这条把 `_FRESH_WITHIN` 钉成硬要求。
+
+    判据用 AST 查函数调用,不用文本匹配 —— 源码里完全可能在**解释**
+    为什么不能用裸 test -f,那也含 "test -f" 这个词。
+    """
+    import ast
+
+    from arl_lite.devloop import queue as qmod
+
+    src = Path(qmod.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    # _FALLBACK 这个 ClassVar 的字面量里,每条 verify 都该是 _FRESH_WITHIN(...)
+    found = 0
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Dict) and any(
+                isinstance(k, ast.Constant) and k.value == "verify" for k in node.keys)):
+            continue
+        for k, v in zip(node.keys, node.values):
+            if not (isinstance(k, ast.Constant) and k.value == "verify"):
+                continue
+            if isinstance(v, ast.Constant):
+                # 纯字面量:那就必须是 _FRESH_WITHIN(...) 的调用结果,
+                # 静态字面量在这里就是裸 test -f
+                found += 1
+                pytest.fail(
+                    f"_FALLBACK 里有字面量 verify: {v.value!r}\n"
+                    f"  周期性条目必须用 _FRESH_WITHIN(path, days) —— "
+                    f"裸 test -f 只能完成一次,之后永远满足"
+                )
+            elif isinstance(v, ast.Call) and getattr(v.func, "id", "") == "_FRESH_WITHIN":
+                found += 1
+    assert found == 3, (
+        f"只找到 {found} 条 _FRESH_WITHIN verify,_FALLBACK 里应有 3 条"
     )
 
-    nominated = {i.id for i in _derive() if i.id.startswith("add-confidence-")}
-    for stem in high_risk_with_conf:
-        assert f"add-confidence-{stem}" not in nominated, (
-            f"{stem}.yml 是 risk>=7 且**已有** confidence 字段,不该被提名"
-        )
+
+# =====================================================================
+# drop:让一条假活消失,并且必须带原因
+# =====================================================================
 
 
-def test_every_high_risk_rule_actually_has_confidence_now():
-    """现状核对:37 条规则全都有 confidence 字段
+def test_drop_refuses_without_a_reason(tmp_path):
+    """丢弃不给理由必须被拒
 
-    记录事实依据。如果哪天真的缺了,这条会提醒重新审视推导逻辑。
+    丢弃原因记录的是「我们试过这条路,它不成立」—— 那是这条记录里
+    最值钱的部分。没有它,三个月后下一个人会把同样的东西再加回来,
+    而且这次连"当初为什么不行"都查不到。
     """
-    ymls = sorted(RULES.glob("*.yml"))
-    assert ymls, "规则目录为空"
-    conf = re.compile(r"^confidence:\s*(\S+)\s*$", re.MULTILINE)
-    missing = [p.stem for p in ymls if not conf.search(p.read_text(encoding="utf-8"))]
-    assert not missing, f"这些规则缺 confidence 字段: {missing}"
+    q = Queue(tmp_path / "q.json")
+    q.save([Item(id="x", title="t", detail="", status="pending")])
+    ok, msg = q.drop("x", reason="")
+    assert not ok
+    assert "理由" in msg
+    assert q.load()[0].status == "pending", "被拒之后不该改动状态"
 
 
-# =====================================================================
-# (b)(c) 其余推导同样要能核实
-# =====================================================================
+def test_drop_records_the_reason_and_clears_the_claim(tmp_path):
+    """drop 要记原因、清 owner、保留原 note"""
+    q = Queue(tmp_path / "q.json")
+    it = Item(id="x", title="t", detail="", status="pending", note="前情")
+    it.owner = "agent#1"
+    it.claimed_at = 123.0
+    q.save([it])
+    ok, msg = q.drop("x", reason="阈值是拍脑袋的")
+    assert ok and "dropped" in msg
+    back = q.load()[0]
+    assert back.status == "dropped"
+    assert "前情" in back.note and "阈值是拍脑袋的" in back.note
+    assert back.owner == "" and back.claimed_at == 0.0
+    # done_round 不能被抹掉:审计要看出它曾经是什么状态
+    assert back.done_round is None or isinstance(back.done_round, int)
 
 
-def test_add_data_source_claim_matches_reality():
-    """提出"新增数据源"时,数据源数量必须真的不足"""
-    srcs = [
-        p for p in (REPO / "arl_lite" / "integrations").glob("*.py")
-        if p.stem not in ("__init__", "tool_checker")
-    ]
-    for item in _derive():
-        if item.id != "add-data-source":
-            continue
-        m = re.search(r"目前 (\d+) 个数据源", item.detail)
-        assert m, f"detail 里应当写明当前数据源数量: {item.detail!r}"
-        assert int(m.group(1)) == len(srcs), (
-            f"detail 说 {m.group(1)} 个,实际 {len(srcs)} 个 —— 假活"
+def test_drop_is_not_reversible_by_seeding(tmp_path):
+    """dropped 的 id 不会被播种捡回来
+
+    这是 drop 和 unmark 的根本区别:unmark 把误标的 done 改回 pending
+    (「其实做了,要重新标」),drop 是让假活**消失**(「这东西不成立」)。
+    要是 dropped 还会被播种捡回来,drop 就等于没做。
+
+    ## 为什么 id 必须从真实播种里取,不能手写
+
+    早先这条测试在 fixture 里手写了 `id="item-1"`,而 `backlog.md` 那行
+    实际推导出的 id 是 `item-a7438e`。于是播种提出的是一条**全新条目**,
+    `item-1` 原封不动地留在那儿 —— 断言通过,但它验的是"没有东西动过",
+    不是"dropped 不被复活"。**假绿。**
+
+    改法:先用真实播种拿到条目,再 drop 它,再重新播种。
+    id 一致性由生产代码自己保证,测试不插手。
+    """
+    (tmp_path / "backlog.md").write_text(
+        "- [P1] change: 一条会被丢弃的待办 | 细节 | test -f 不存在的文件\n",
+        encoding="utf-8",
+    )
+    q = Queue(tmp_path / "q.json")
+
+    # 先让真实播种种出这条,拿到**它自己的** id
+    q.seed_if_empty()
+    seeded = q.load()
+    assert len(seeded) == 1, f"前置条件不成立:{[i.id for i in seeded]}"
+    victim = seeded[0]
+    assert victim.status == "pending"
+
+    ok, _ = q.drop(victim.id, reason="假活")
+    assert ok
+    assert q.load()[0].status == "dropped"
+
+    # 再播种一次:它不该被复活,也不该换个后缀重新出现。
+    # 注意不能断言"队列里只有 1 条" —— backlog 跳过它之后保底层会补
+    # 长期项,总数会变。要断的是"**这一条**没回来",不是"队列没长"。
+    q.seed_if_empty()
+    back = q.load()
+    mine = [i for i in back if i.id == victim.id or i.id.startswith(victim.id + "-r")]
+    # 集合推导不能写在 f-string 表达式里,先算出来
+    seen = sorted((i.id, i.status) for i in mine)
+    assert len(mine) == 1, f"被丢弃的条目以别的身份回来了:{seen}"
+    assert mine[0].status == "dropped", (
+        f"{mine[0].id} 被重新提成了 {mine[0].status}"
+    )
+
+def test_drop_rejects_a_duplicate_id(tmp_path):
+    """id 有重复时拒绝 drop —— 丢哪一条是歧义的,猜错等于改得更乱"""
+    p = tmp_path / "q.json"
+    p.write_text(json.dumps({
+        "version": 1,
+        "items": [
+            {"id": "dup", "title": "a", "status": "pending"},
+            {"id": "dup", "title": "b", "status": "pending"},
+        ],
+    }), encoding="utf-8")
+    ok, msg = Queue(p).drop("dup", reason="x")
+    assert not ok
+    assert "repair" in msg, msg
+
+
+def test_every_seeded_item_states_how_to_verify_it():
+    """没有 verify 的待办等于没定验收标准
+
+    引擎在人工模式下不会替人干活,它只能靠 verify 让人事后自查。
+    verify 为空的条目,唯一的"完成"判据是引擎自己拍板 ——
+    那正是第 12 轮 `completion_source` 要暴露的事。
+    """
+    for item in _fallback_items() + _seeded_items():
+        assert item.verify.strip(), (
+            f"{item.id} 缺 verify —— 没有验收标准的待办没法判定完成"
         )
-        assert len(srcs) < 12, "数据源已达标,不该再提这条"
-
-
-def test_missing_phase_tests_claim_matches_reality():
-    """提出"补缺失阶段测试"时,列出的阶段必须真的缺"""
-    present = {p.stem for p in (REPO / "tests").glob("test_phase*.py")}
-    for item in _derive():
-        if item.id != "add-missing-phase-tests":
-            continue
-        m = re.search(r"缺失 phase 测试: ([^。]+)", item.detail)
-        assert m, f"detail 里应当列缺失的阶段: {item.detail!r}"
-        listed = {int(x) for x in re.findall(r"\d+", m.group(1))}
-        real = {n for n in range(1, 8) if f"test_phase{n}" not in present}
-        assert listed == real, (
-            f"detail 列的缺失阶段 {sorted(listed)} 与实际 {sorted(real)} 不符 —— 假活"
+        assert item.detail.strip(), (
+            f"{item.id} 缺 detail —— 只给标题的话执行者不知道要做什么"
         )
 
 
-def test_supplement_rules_claim_matches_reality():
-    """提出"补充规则覆盖"时,规则数必须真的不足"""
-    n = len(list(RULES.glob("*.yml")))
-    for item in _derive():
-        if item.id == "supplement-rules-coverage":
-            assert n < 40, f"规则数 {n} 已达标,不该再提这条"
+def test_seeded_item_ids_are_derivable_and_readable():
+    """id 必须能看出它是什么,且不含随机成分
+
+    id 是引擎按 id 定位每一条记录的唯一依据
+    (`mark_in_progress`/`mark_done`/`finish` 全是 `next(i.id == ...)`)。
+    id 一旦含轮次/行号,人工源文件动一行就会让所有 done 记录失效,
+    已完成的活被重新排队 —— 第 12 轮踩过。
+    """
+    for item in _fallback_items() + _seeded_items():
+        assert re.fullmatch(r"[a-z0-9][a-z0-9-]*", item.id), (
+            f"{item.id!r} 不符合 id 规范(小写字母/数字/短横线)"
+        )
+        assert item.id == item.id.strip().lower(), item.id
 
 
 # =====================================================================
-# 通用:真实队列不能有站不住脚的自动推导条目
+# 删除的那一层不许悄悄回来
 # =====================================================================
 
 
-def test_real_queue_auto_derived_items_are_all_justified():
-    """真实队列里凡 id 带自动推导特征的,断言都要能被核实"""
-    auto_prefixes = ("add-confidence-", "add-data-source",
-                     "add-missing-phase-tests", "supplement-rules-coverage")
-    q = Queue(REPO / "devloop" / "queue.json")
-    active = [i for i in q.load() if i.status in ("pending", "in_progress")]
-    flagged = [i for i in active if i.id.startswith(auto_prefixes)]
-    # 逐条交给上面那些已验证的检查去核实
-    derived = {i.id for i in _derive()}
-    unjustified = [i.id for i in flagged if i.id not in derived]
-    assert not unjustified, (
-        f"队列里有无法核实的自动推导条目: {unjustified}\n"
-        f"  当前 _seed_from_project_state 能证实的: {sorted(derived)}"
+def test_project_state_derivation_is_gone_and_its_reason_is_recorded():
+    """「扫项目现状自动推导」不许原样回来,且删除理由必须在代码里
+
+    这条不是"禁止加新功能",是"禁止把**这一层**加回来" ——
+    因为它的五个检查里没有一条能产出真活(数据见常量)。
+    真要加新的推导,先过 `test_no_auto_seeded_item_is_already_done`。
+
+    顺带钉住 `REMOVED_TIER2_WHY` 非空:没有记录,后人只能靠 git log
+    考古,而 `git log` 不会告诉他那五个阈值的实测数字。
+    """
+    assert not hasattr(Queue, "_seed_from_project_state"), (
+        "扫项目现状自动推导被加回来了。它的五个检查实测产不出真活:\n"
+        + REMOVED_TIER2_WHY
+    )
+    assert len(REMOVED_TIER2_WHY) > 500, "删除理由的记录太短,后人查不到"
+    # 五条检查的实测数据必须还在记录里,不然下一个人会重新踩一遍
+    for marker in ("(a)", "(b)", "(c)", "(d)", "(e)", "假活比队列空掉更坏"):
+        assert marker in REMOVED_TIER2_WHY, f"删除理由里缺了 {marker}"
+
+
+def test_confidence_is_enforced_by_a_gate_not_by_seeding():
+    """「每条规则都要有 confidence」现在住在门禁里
+
+    它原先是播种的检查 (a),后果是**只在第一次被检查** —— 提过一次
+    之后就不响了,之后谁新加一条漏写 confidence 的规则都没人知道。
+    常驻不变式该住在每轮都执行的地方。
+    """
+    from arl_lite.devloop.gates import _RULES_REQUIRED_KEYS
+
+    assert "confidence:" in _RULES_REQUIRED_KEYS, (
+        "confidence 要求不在门禁的白名单里 —— 又退回成'缺了才响一次'了"
+    )
+    # 现状必须真的合规,否则门禁一直红着
+    for p in sorted(RULES.glob("*.yml")):
+        txt = p.read_text(encoding="utf-8")
+        assert re.search(r"^confidence:\s*\S+", txt, re.M), (
+            f"{p.name} 缺 confidence 字段,门禁会红"
+        )
+
+
+# =====================================================================
+# 真实队列:不许有已经完成却还挂在 pending 的条目
+# =====================================================================
+
+
+def test_real_queue_has_no_pending_item_whose_verify_already_passes():
+    """真实队列里不该有"验收条件已通过却还 pending"的条目
+
+    比单测更狠:它直接查**正在用的那份** queue.json。第 16 轮实测就
+    抓到 `align-project-plan-doc` 一直挂在队头,而它的 verify 早通过。
+    """
+    qpath = REPO / "devloop" / "queue.json"
+    if not qpath.exists():
+        pytest.skip("本机没有 queue.json(每机一份)")
+    data = json.loads(qpath.read_text(encoding="utf-8"))
+    offenders = []
+    for raw in data.get("items", []):
+        if raw.get("status") != "pending":
+            continue
+        verify = raw.get("verify") or ""
+        if not verify:
+            continue
+        passed, _ = _run_verify(verify)
+        if passed:
+            offenders.append(f"{raw['id']} — {raw.get('title','')}")
+    assert not offenders, (
+        "真实队列里有验收条件已通过却还 pending 的假活:\n  "
+        + "\n  ".join(offenders)
+        + "\n  用 devloop unmark <id> 改回 pending,或确认它是真的没干完"
+        "就换一条能区分'做了'和'本来就成立'的 verify。"
     )

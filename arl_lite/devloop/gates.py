@@ -745,14 +745,30 @@ class LocBudgetGate:
 # 零依赖:用文本扫描而不是 PyYAML 解析(项目铁律)。
 
 
-_RULES_REQUIRED_KEYS = ("advice:", "name:", "risk:")
+_RULES_REQUIRED_KEYS = ("advice:", "name:", "risk:", "confidence:")
 
 
 class RulesHaveAdviceGate:
-    """防的退化:分析规则的 advice / name / risk 字段被删。
+    """防的退化:分析规则的 advice / name / risk / confidence 字段被删。
 
     扫描 arl_lite/modules/analysis/rules/*.yml,用文本子串检查,
     避免引入 PyYAML 解析(项目零依赖铁律)。
+
+    ## 为什么 confidence 在这个门禁里,而不在播种里
+
+    「每条规则都要有 confidence」是一条**常驻不变式**,不是一件一次性的活。
+    它原先被放在 `queue._seed_from_project_state` 里当"缺了才提一条待办",
+    后果有两层:
+
+    - 提过一次之后就不响了。之后谁新加一条没写 confidence 的规则,
+      没人知道 —— 不变式只在**第一次**被检查,之后形同虚设
+    - 实测它已经永远产不出东西了(37/37 条都有 confidence,包括 25 条
+      risk>=7 的),是个纯死代码
+
+    放进门禁之后,它每轮都被检查,而且是**阻塞级**的:新规则漏了字段,
+    门禁立刻红,而不是等到某天有人碰巧重跑播种。
+
+    > 一条不变式该住在会反复执行的地方,不该住在"缺了才响一次"的地方。
     """
 
     name = "rules_have_advice"
