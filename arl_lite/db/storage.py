@@ -55,14 +55,62 @@ def compute_hash(*parts: str) -> str:
 # 这样 `domain LIKE '%update%'` 不再误拦,而裸的 `drop table x` 仍然拦截。
 # WITH 也禁:recursive CTE 可以在只读语句里无限循环,规则引擎有 5s 预算兜底,
 # 用户 filter 直接禁掉最省心。
+#
+# UNION / UNION ALL 是**读操作**,不加会漏过一次真泄漏:
+#   filter = "1=1) UNION SELECT title,1,99 FROM findings --"
+# 拼进 `SELECT * FROM domains WHERE workspace_id=? AND (<filter>) ORDER BY id`
+# 之后, 括号闭合 + 注释吃掉尾部 → findings 表内容被 UNION 进结果集。
+# 实测确认能读到别表数据(finding 的 title 泄漏), 不是理论风险。
+# 写操作关键字拦不住它, 所以必须显式禁。
 _FORBIDDEN_SQL_KEYWORDS = (
     "DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE",
     "ATTACH", "DETACH", "PRAGMA", "VACUUM", "REPLACE", "WITH",
+    "UNION",
 )
 
 
+def strip_sql_comments(sql: str) -> str:
+    """把 SQL 注释整段替换成空格
+
+    为什么必须做: SQLite 支持 `un/**/ion` 这种注释分隔的关键字,
+    而 check_filter_sql 靠 \\b 词边界匹配拦关键字——
+    `un/**/ion` 被当成两个独立的词放行, 实测能绕过去。
+    注释还能吃掉行尾, 配合括号闭合就是完整注入。
+
+    替换成空格而非空串是为保持偏移量, 这样报错信息里的列号
+    才对得上原文。
+    """
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        two = sql[i : i + 2]
+        if two == "--":
+            while i < n and sql[i] != "\n":
+                out.append(" ")
+                i += 1
+        elif two == "/*":
+            out.append("  ")
+            i += 2
+            while i < n and sql[i : i + 2] != "*/":
+                out.append(" ")
+                i += 1
+            if i < n:
+                out.append("  ")
+                i += 2
+        else:
+            out.append(sql[i])
+            i += 1
+    return "".join(out)
+
+
 def strip_sql_literals(sql: str) -> str:
-    """把 SQL 里的 '...' / "..." 字面量替换成 ?,支持 '' 转义"""
+    """把 SQL 里的 '...' / "..." 字面量替换成 ?,支持 '' 转义
+
+    顺序很关键: **先剥注释, 再剥引号**。反过来的话, 引号里的
+    `--` 或 `/*` 会被误当注释, 把本该保留的字面量截断——
+    `domain = '--not a comment'` 就会变成 `domain = '          '`。
+    """
+    sql = strip_sql_comments(sql)
     out: list[str] = []
     i, n = 0, len(sql)
     while i < n:
@@ -90,13 +138,29 @@ def check_filter_sql(filter_sql: str) -> None:
 
     规则:
     - 不允许多语句(;)
-    - 字符串字面量之外不允许写操作关键字(词边界匹配)
+    - 字符串字面量之外不允许出现危险关键字
+
+    为什么要两轮扫描(去空白版 + 原样版):
+      SQLite 把 `un/**/ion` 当成 `union` 执行, 而注释已被我们替换成
+      空格 → `un      ion`。只用原样版扫描, \\b 词边界看到的是两个独立的
+      词, 会放行。所以先扫一版"所有空白压成单个空格再删掉"的文本,
+      把被注释拆开的关键字也粘回一个词。
+      再扫一版原样的, 是为了拦住 `union` 出现在字面量之外的各种形态。
     """
     residue = strip_sql_literals(filter_sql)
     if ";" in residue:
         raise ValueError("filter must be a single expression (';' not allowed)")
-    upper = residue.upper()
+
     import re as _re
+
+    # 第一轮:压掉所有空白, 抓被注释/换行拆开的关键字
+    squashed = _re.sub(r"\s+", "", residue).upper()
+    for kw in _FORBIDDEN_SQL_KEYWORDS:
+        if kw in squashed:
+            raise ValueError(f"filter contains forbidden keyword: {kw}")
+
+    # 第二轮:保留边界的原样扫描, 防止上面的压空白产生误判之外的绕过
+    upper = residue.upper()
     for kw in _FORBIDDEN_SQL_KEYWORDS:
         if _re.search(rf"\b{kw}\b", upper):
             raise ValueError(f"filter contains forbidden keyword: {kw}")
