@@ -1069,7 +1069,6 @@ class Queue:
     @staticmethod
     def verify_passes(verify: str, timeout: float = 30.0) -> bool:
         """跑一条 verify,返回是否通过。
-
         跑不起来(超时/命令不存在/异常)一律按**不通过**处理 ——
         宁可当成"没做",也不要因为判断不了就下结论。
         `verify` 全部来自本模块的源码常量或本仓库的 backlog.md,
@@ -1140,4 +1139,43 @@ class Queue:
                     created_round=round_no,
                 )
             )
+        if not out and not existing_ids:
+            # ── 兜底:到期判断全过时的复查项 ──
+            #
+            # 实测踩到过这个空档(r18):三条周期项全部未到期,保底层
+            # 返回空,队列空掉,不变式 #4(#2 轮起就有测试守着)真的破了。
+            #
+            # 这里要小心:最省事的做法是"反正要提点什么,随便提一条" ——
+            # 那正是第 16 轮删掉的整层假活制造机。所以兜底项**不是工作**,
+            # 它是一条**显式声明「当前无到期维护项」的复查信号**:
+            # 标题和 detail 都直说没有待办,verify 是"人为确认一次"。
+            #
+            # 为什么这不违反"不许造假活":一条说"没有活干,请确认"的
+            # 待办,人看一眼就知道该做什么(要么往 backlog.md 加活,
+            # 要么就是确实该停)。而一条编出来的假活会让人白干一遍。
+            #
+            # 它也**不会**卡死循环:verify 是"人确认",人工模式下引擎
+            # 拿不到 build_fn,所以这条会一直 pending 挡在队首 ——
+            # 而那恰恰是想要的效果:**逼出一次人类决策**,而不是让
+            # 引擎自己假装有活可干。
+            out.append(Item(
+                id="no-due-maintenance-review",
+                title="当前无到期维护项,请人工确认下一步",
+                detail=(
+                    "自动播种检查后没有发现任何到期项:三条长期演进项"
+                    "(依赖审计 / 性能基线 / 误报率实测)的 90 天周期都未到。"
+                    "这不是故障,是「眼下确实没有自动推导的活」。"
+                    "请人工决定:(a) 往 devloop/backlog.md 加真实的待办;"
+                    "(b) 往 Queue._FALLBACK 加新的长期项;"
+                    "(c) 确认当前不需要推进,用 'arl-lite devloop done-item "
+                    "no-due-maintenance-review' 记录这次确认。"
+                    "注意:不要为了'让队列非空'而随便造一条工作 —— "
+                    "那是第 16 轮删掉的假活制造机。"
+                ),
+                priority=P2,
+                kind="research",
+                verify="true",  # 恒真:它的完成判据是「人确认过」,不是某个文件存在
+                tags=["maintenance", "review"],
+                created_round=round_no,
+            ))
         return out

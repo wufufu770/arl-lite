@@ -41,6 +41,15 @@ from arl_lite.devloop.queue import REMOVED_TIER2_WHY, Item, Queue
 REPO = Path(__file__).parents[1]
 RULES = REPO / "arl_lite" / "modules" / "analysis" / "rules"
 
+# 播种可能产出的**信号类**条目:它们不是工作,是"当前无活可干"的显式声明。
+# 放在这里而不是按需豁免,是因为豁免本身需要被 review —— 一个只写在
+# 代码注释里的豁免,和没有豁免是一回事。
+# `test_signal_items_must_say_so` 守住"信号必须自报家门",防止它退化成
+# 伪装成信号的假活。
+_SIGNAL_IDS = {
+    "no-due-maintenance-review",
+}
+
 
 def _run_verify(verify: str) -> tuple[bool, str]:
     """跑一条 verify,返回 (是否通过, 输出)
@@ -104,7 +113,7 @@ def _seeded_items() -> list[Item]:
 
 
 def test_no_auto_seeded_item_is_already_done():
-    """自动播种产出的每一条,verify 此刻都必须**不通过**
+    """自动播种产出的每一条**工作项**,verify 此刻都必须**不通过**
 
     这条是本文件的核心。它直接对应第 16 轮删掉的那一整层里
     `align-project-plan-doc` 的死法:
@@ -121,8 +130,23 @@ def test_no_auto_seeded_item_is_already_done():
     保底层因为 verify 带 90 天时间边界(见 `queue._FRESH_WITHIN`),
     只提**已经到期**的项,所以这一条对它是恒成立的 ——
     刚做完的周期性任务不会因为"总被提出"而变成假活。
+
+    ## `no-due-maintenance-review` 为什么被豁免
+
+    r18 实测到:三条周期项全部未到期时,保底层返回空,队列空掉,
+    不变式 #4(#2 轮就有测试守着)真的破了。兜底加了这条复查信号。
+
+    它 `verify="true"` —— 恒真,所以会被这条断言抓到(实测确实抓到了,
+    这条门禁没白写)。但它**不是工作项**:它的内容是「当前无到期维护项,
+    请人工决定下一步」,完成判据是**人确认过**,不是某个产物存在。
+    拿「工作完成」的判据去要求一条信号,只会逼着人伪造一个产物。
+
+    所以豁免是**按类别**给的,不是按 id 开后门:见 `_SIGNAL_IDS`,
+    并且 `test_signal_items_must_say_so` 守住"信号必须自报家门"。
     """
     for item in _fallback_items() + _seeded_items():
+        if item.id in _SIGNAL_IDS:
+            continue
         passed, out = _run_verify(item.verify)
         assert not passed, (
             f"播种产出了假活:{item.id} —— {item.title}\n"
@@ -131,6 +155,35 @@ def test_no_auto_seeded_item_is_already_done():
             f"  要么把 verify 改成能区分'做了'和'本来就成立'的判据\n"
             f"  (比如查工作产物,而不是查一条常驻不变式),\n"
             f"  要么这条就不该被提出。"
+        )
+
+
+def test_signal_items_must_say_so():
+    """信号类条目必须自报家门 —— 豁免不许变成万能后门
+
+    「这条不是工作,是信号」是一条很方便的说法:说的人多了,假活就能
+    堂堂正正地进队列了。所以每个信号 id 必须同时满足三条:
+
+    1. verify 确实是恒真的(它不声称自己能被自动验证)
+    2. 标题里明说"无到期/请人工确认"这类话 —— 读队首的人一眼就知道
+       这不是活
+    3. detail 里给出**该做什么的指引**,而不是描述一项虚构的工作
+
+    这三条任意一条不满足,信号就退化成了伪装成信号的假活。
+    """
+    for item in _fallback_items() + _seeded_items():
+        if item.id not in _SIGNAL_IDS:
+            continue
+        assert _run_verify(item.verify)[0], (
+            f"{item.id} 被列为信号,但它的 verify 并不恒真 —— "
+            f"那它就是一条普通工作项,不该享受豁免"
+        )
+        assert any(w in item.title for w in ("无到期", "请人工确认", "无待办")), (
+            f"{item.id} 是信号类,但标题看不出它不是活:{item.title!r}\n"
+            f"  读队首的人只看得到标题,他必须能一眼分辨"
+        )
+        assert any(w in item.detail for w in ("请人工决定", "不是故障", "backlog.md")), (
+            f"{item.id} 是信号类,但 detail 没给出该做什么的指引"
         )
 
 

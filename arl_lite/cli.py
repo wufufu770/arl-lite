@@ -713,6 +713,37 @@ def cmd_tools_list(args) -> int:
     return 0
 
 
+def cmd_perf_bench(args) -> int:
+    """跑核心流水线性能基线,产出 docs/PERF_BASELINE.md
+
+    全程离线且不碰网络:负载是按真实 schema 形状合成的数据,
+    测的是存储写入 / 规则引擎 / 置信度 / 风险打分这四段。
+    测不到的部分(子域名枚举、HTTP 探测)写在报告的「局限」里。
+
+    默认跑 3 次取中位数 —— 单次测量会被 GC 和磁盘缓存干扰,
+    那种抖动画进趋势线只会误导下一个人。
+    """
+    from pathlib import Path as _P
+    from .core import perf_bench as pb
+
+    scale = getattr(args, "scale", "medium") or "medium"
+    repeat = int(getattr(args, "repeat", 3) or 3)
+    rep = pb.run_repeated(scale=scale, repeat=repeat)
+
+    out = _P(args.out) if getattr(args, "out", "") else _P("docs/PERF_BASELINE.md")
+    pb.write_report(out, rep)
+
+    print(f"[i] scale={rep.scale}  repeat={repeat}  "
+          f"{rep.total_rows} 行  {rep.total_seconds:.2f}s  "
+          f"峰值 {rep.peak_kb / 1024:.1f} MB")
+    print(f"[i] {rep.rules} 条规则 / {rep.hits} 个命中")
+    for p in sorted(rep.phases, key=lambda x: -x.seconds)[:5]:
+        rps = f"{p.rows_per_sec:,.0f} 行/s" if p.rows_per_sec else "-"
+        print(f"   {p.name:36s} {p.seconds:7.3f}s  {rps}")
+    print(f"[+] 报告已写入 {out}")
+    return 0
+
+
 def cmd_fp_bench(args) -> int:
     """离线跑规则集误报率基准,产出 docs/FP_RATE.md
 
@@ -1087,6 +1118,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pfb.add_argument("--out", default="", help="报告输出路径(默认 docs/FP_RATE.md)")
     pfb.set_defaults(func=cmd_fp_bench)
+
+    # perf-bench(核心流水线性能基线)
+    ppb = sub.add_parser(
+        "perf-bench",
+        help="跑核心流水线性能基线,产出 docs/PERF_BASELINE.md",
+    )
+    ppb.add_argument("--out", default="", help="报告输出路径(默认 docs/PERF_BASELINE.md)")
+    ppb.add_argument(
+        "--scale", default="medium", choices=["small", "medium", "large"],
+        help="数据规模档(默认 medium)",
+    )
+    ppb.add_argument(
+        "--repeat", type=int, default=3,
+        help="跑几次取中位数(默认 3)。单次测量会被 GC 和磁盘缓存干扰",
+    )
+    ppb.set_defaults(func=cmd_perf_bench)
 
     # monitor(资产监控)
     pm = sub.add_parser("monitor", help="资产监控管理")
