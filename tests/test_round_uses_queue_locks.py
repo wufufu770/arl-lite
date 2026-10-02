@@ -130,7 +130,7 @@ def _seeded_loop(tmp_path, item_id="real-work", priority=2):
     (lp.dev_dir / "backlog.md").write_text("# backlog\n", encoding="utf-8")
     Queue(lp.dev_dir / "queue.json").add(
         Item(id=item_id, title="一件真活", priority=priority, kind="change",
-             verify="test -f 不存在的文件", detail="", tags=[]))
+             verify="true", detail="", tags=[]))  # r35: 占位 verify 必须是**通过**的,收尾闸门会真跑它
     lp.gates.run_all = lambda repo, only=None: [
         GateResult("fake", True, "ok", 0, 0, True)]
     return lp
@@ -240,7 +240,7 @@ def test_two_concurrent_rounds_claim_different_items(tmp_path):
     q = Queue(dev / "queue.json")
     for i in range(4):
         q.add(Item(id=f"w{i}", title=f"活 {i}", priority=2, kind="change",
-                   verify="test -f 不存在", detail="", tags=[]))
+                   verify="true", detail="", tags=[]))  # r35: 收尾闸门会真跑 verify
 
     w = tmp_path / "w.py"
     w.write_text(WORKER.format(repo=str(REPO), dev=str(tmp_path)), encoding="utf-8")

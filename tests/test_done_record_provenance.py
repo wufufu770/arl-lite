@@ -62,7 +62,7 @@ def _q(loop) -> Queue:
 
 def _seed(q: Queue, item_id: str) -> None:
     q.add(Item(id=item_id, title=f"标题 {item_id}", priority=2,
-               kind="change", verify="test -f 不存在的文件", detail="", tags=[]))
+               kind="change", verify="true", detail="", tags=[]))  # r35: 占位 verify 必须是**通过**的,收尾闸门会真跑它
 
 
 # --- 引擎写的 done 必须自带 provenance ---

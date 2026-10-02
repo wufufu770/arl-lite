@@ -62,6 +62,18 @@ class TestRedGateIsDowngradedNotSwallowed(unittest.TestCase):
     def setUp(self):
         self.d = Path(tempfile.mkdtemp())
         self.lp = Loop(REPO, state_dir=self.d)
+        # r35:本文件测的是「收到红门禁之后协议怎么反应」,不是「怎么播种」。
+        # 原来靠 round 自己播种并**当场完成**来造出工作项 —— r35 之后
+        # 首轮是空转轮(播种的条目属于下一轮),那批断言全部失效。
+        # 这里直接备好一条 pending 的活,让每条测试都有事可做。
+        #
+        # verify 用 `true`(真能跑通):门禁红时压根走不到 verify 检查,
+        # 门禁绿时它必须放行,否则会把"门禁绿 → DONE"和"verify 过 → DONE"
+        # 两种原因混在一起,分不清是哪条在起作用。
+        from arl_lite.devloop.queue import Item, Queue
+        q = Queue(self.lp.dev_dir / "queue.json")
+        q.add(Item(id="fixture-work", title="给门禁测试备的活", priority=1,
+                   kind="change", verify="true", detail="", tags=[]))
 
     def _round_with(self, *results):
         """用假门禁结果跑一整轮。finally 恢复,不留污染。"""

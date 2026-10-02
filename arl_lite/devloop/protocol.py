@@ -277,7 +277,7 @@ class Loop:
         active = [i for i in items if i.status in ("pending", "in_progress")]
         if not active:
             before = len(items)
-            added = q.seed_if_empty()
+            added = q.seed_if_empty(round_no=state.round + 1)
             items = q.load()
             if added <= 0:
                 return StepResult(
@@ -323,7 +323,7 @@ class Loop:
         items = q.load()
         if any(i.status in ("pending", "in_progress") for i in items):
             return 0, ""
-        added = q.seed_if_empty()
+        added = q.seed_if_empty(round_no=state.round + 1)
         if added <= 0:
             return 0, (
                 "queue exhausted and seeding produced nothing — "
@@ -503,25 +503,53 @@ class Loop:
             items = q.load()
             messages.append(f"recovered {stale} stale in_progress item(s) from a previous round")
 
+        # r35:队列在轮初为空时,播种是给**下一轮**备的料,本轮不能领。
+        #
+        # 原来这里是 seed 完直接往下走 claim,于是刚播下的条目立刻成为
+        # 队首、被同一轮 finish 掉。r34 实测造出一条假 done:
+        # 23:51:09 seed +1 → 23:53:22 round DONE,中间那 132 秒跑的是
+        # 门禁,不是那条活的实现,而记录写着"本轮完成了它"。
+        # 引擎能自己造一条活再自己宣布做完 —— 队列每次耗尽都会发生,
+        # 是结构性缺陷不是偶发。
+        #
+        # 改成"轮初没活就如实空转一轮":播种照做(不变式 #4 要求队列
+        # 永远非空),但 item 留 None,让既有的 RESULT_NOOP 分支记账。
+        # 空转一轮是诚实的,假完成不是。
+        seeded_this_round = 0
         if not any(i.status in ("pending", "in_progress") for i in items):
             before = len(items)
-            q.seed_if_empty()
+            q.seed_if_empty(round_no=state.round + 1)
             items = q.load()
-            seeded = len(items) - before
-            if seeded > 0:
-                messages.append(f"queue was empty, seeded {seeded} item(s)")
+            seeded_this_round = len(items) - before
+            if seeded_this_round > 0:
+                messages.append(
+                    f"queue was empty at round start; seeded "
+                    f"{seeded_this_round} item(s) for the **next** round — "
+                    f"this round does no work (r35: a freshly seeded item "
+                    f"cannot be completed in the round that created it)"
+                )
 
-        # r31:走带锁的 `q.claim()`,不再自己 load→改→save。
-        # claim 在一把锁里完成 load→挑→标 in_progress→save,所以两个并发
-        # round 拿到的一定是**不同的条目**;而裸 load→save 时它们可能同时
-        # 挑中同一条,然后互相把对方的 status 改回去。
+        # 显式指定的校验**无条件**先跑。它不依赖队列非空,而是问
+        # "你点名的那条到底能不能做" —— 跳过它会让本轮静默忽略操作者的
+        # 显式指令,那是比报错更坏的失败(人以为在点 A,引擎在干 B)。
+        # 顺带保证了:点名一条 pending 时队列必然非空,不会走到下面
+        # 的 seeded 分支,所以"跳过 claim"永远不会顶掉一个合法请求。
         self._check_explicit_item(q, item_id, record)
-        item = q.claim(owner=self._owner(), item_id=item_id)
-        if item is None and item_id:
-            raise LookupError(
-                f"item {item_id!r} 校验之后变得不可认领了"
-                f"(可能被别的 agent 领走或完成);拒绝拿别的条目记账"
-            )
+
+        # r35:本轮播种的条目一律不领。
+        if seeded_this_round:
+            item = None
+        else:
+            # r31:走带锁的 `q.claim()`,不再自己 load→改→save。
+            # claim 在一把锁里完成 load→挑→标 in_progress→save,所以两个并发
+            # round 拿到的一定是**不同的条目**;而裸 load→save 时它们可能同时
+            # 挑中同一条,然后互相把对方的 status 改回去。
+            item = q.claim(owner=self._owner(), item_id=item_id)
+            if item is None and item_id:
+                raise LookupError(
+                    f"item {item_id!r} 校验之后变得不可认领了"
+                    f"(可能被别的 agent 领走或完成);拒绝拿别的条目记账"
+                )
         if item is not None:
             record.item_id = item.id
             record.item_title = item.title
@@ -584,7 +612,30 @@ class Loop:
             record.result = RESULT_NOOP
             record.note = "no pending item"
         else:
-            if t.ok:
+            # r35:最后一道闸门 —— 条目自己的验收命令现在过不过?
+            #
+            # 这道闸门是 r34 那条假 done 逼出来的。r34 全部门禁 6/0/0、
+            # 487 条测试全过,却把一条 `pytest tests/没写的文件.py`
+            # 标成了 done:**没有哪道门禁看"刚被完成的条目,它自己的
+            # verify 现在过不过"**。门禁查的是代码的性质,不是这一轮
+            # 的记账是否属实。
+            #
+            # 只在 `fail`(确认是检查命令、确认跑得起来、确认没过)时拦。
+            # `unknown`(散文 verify)不拦 —— 拿散文去挡完成,会把所有人
+            # 写的待办永久卡死,那道闸门活不过三轮就会被拆掉。
+            vr = q.verify_result(item.verify) if t.ok else "unknown"
+            if t.ok and vr == q.VERIFY_FAIL:
+                record.result = RESULT_DONE_WITH_FAILURES
+                record.blocking_failures.append(f"verify_failed: {item.verify}")
+                q.release(item.id, note=(
+                    f"refused done: its own verify does not pass -> "
+                    f"{item.verify}"))
+                messages.append(
+                    f"refused to mark {item.id!r} done: its verify command "
+                    f"fails right now ({item.verify}). 门禁全绿不等于这条活"
+                    f"做完了 —— 门禁查代码,这条查的是记账是否属实。"
+                )
+            elif t.ok:
                 record.result = RESULT_DONE
                 # r31:带锁的收尾入口,顺带清掉 owner/claimed_at。
                 # 原来在裸 items 上 mark_done 完再 q.save(items) 整份写回。

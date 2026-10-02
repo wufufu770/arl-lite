@@ -756,7 +756,8 @@ class Queue:
         return not any(i.status in ("pending", "in_progress") for i in items)
 
     # ── 播种(核心:队列永远非空) ──────────────────────────────────────────
-    def seed_if_empty(self, timeout: float = _LOCK_TIMEOUT) -> int:
+    def seed_if_empty(self, round_no: int | None = None,
+                      timeout: float = _LOCK_TIMEOUT) -> int:
         """空了就播种。返回新增条数。
 
         两级策略(优先级递减):
@@ -765,6 +766,10 @@ class Queue:
 
         旋转规则:补进来的 id 若与**任何**已有条目重名,一律加 -r{round}
         后缀,保证 id 全局唯一。
+
+        `round_no`:新条目的 `created_round` 记什么。传真轮次
+        (调用方给 `state.round + 1`);不给则退回旧的 `max+1` 计数器。
+        见下面那段注释为什么必须传。
 
         ## 这里曾经有个能把队列彻底废掉的 bug
 
@@ -785,12 +790,40 @@ class Queue:
         """
         with self._locked("seed", timeout):
             items = self.load()
-            # 注意:必须是全部 id,不是只有活跃的。见上方 docstring。
+            # r35:让名字成真。函数叫 `seed_if_empty`,以前**并不判空** ——
+            # 它无条件播种,三个调用方各自在外部守了一遍。名字承诺
+            # 「没活干才播」,实现做的是「照播不误」,于是实测连播两次
+            # 会把同一条 backlog 变成两条(`活 D` 和 `活 D-r2`)。
+            #
+            # 判据是「**有没有活干**」而不是「列表是不是空的」——
+            # 队列里躺着一堆 done 条目时列表非空,但那恰恰是最该播种的
+            # 时刻(第 9 轮踩过:全是 done 却播不出新活,队列看着"有内容",
+            # 实际上永远选不出待办)。三个既有调用方判的也都是 active,
+            # 这里跟它们对齐,行为不变,换来的是名字可信。
+            if any(i.status in ("pending", "in_progress") for i in items):
+                return 0
             existing_ids = {i.id for i in items}
             # 已经**做完**的 id。人工 backlog 里的条目做完就不该再被捡回来。
             done_ids = {i.id for i in items if i.status in ("done", "dropped")}
-            max_round = max((i.created_round for i in items), default=0)
-            next_round = max_round + 1  # 每次 seed 视为新轮次
+            # r35:`created_round` 现在记**真轮次**。
+            #
+            # 原来这里是 `max(created_round) + 1` —— 一个跟 state.json 的
+            # `round` 毫无关系的播种计数器。r34 实测:round 33 播种的条目
+            # 记成 `created_round=14`(队列里剩下的最大 created_round 是 13),
+            # 而 `done_round` 是真轮次,于是同一条记录上出现「r14 创建、
+            # r33 完成」,读的人会以为这条活做了 19 轮。
+            #
+            # 计数器会漂移是因为它只在自己身上长:队列一空,`max()` 就只
+            # 看得见剩下的记录,它和真实轮次从此各走各的。
+            #
+            # 调用方传 `state.round + 1`(与 `finish` 的 `round_no` 同一
+            # 口径),于是 `created_round <= done_round` 恒成立。
+            # 不传时退回旧行为 —— 播种是公开方法,别偷偷改它的契约。
+            if round_no is not None:
+                next_round = int(round_no)
+            else:
+                max_round = max((i.created_round for i in items), default=0)
+                next_round = max_round + 1  # 每次 seed 视为新轮次
 
             added: list[Item] = []
             # _disambiguate 要拿"加之前"的 id 集合。上面那几行 `existing_ids |=`
@@ -1138,6 +1171,65 @@ class Queue:
             "tags": ["rules", "quality"],
         },
     )
+
+    # ── verify 的三种结局。r35 新增 ───────────────────────────────
+    #
+    # 原来只有 True/False,把「跑不通」和「跑通但没过」混成一种。
+    # 那对**播种**没问题(判断不了就当没做,宁可多提一条),但对
+    # **收尾**是致命的:一条散文 verify 恒为 False,若拿它去挡
+    # 「这条不许标 done」,所有人写的人写待办都会被永久卡死 ——
+    # 于是这道闸门会被「太吵」这个理由拆掉,和 r16 删掉整层假活
+    # 是同一个动机。所以必须三态。
+    VERIFY_PASS = "pass"
+    VERIFY_FAIL = "fail"
+    VERIFY_UNKNOWN = "unknown"
+
+    # 只有以这些开头的 verify 才算数(第一个空白前的词)。
+    # 全部来自本仓库真实在用的写法,实测见 `verify_result` 的说明。
+    VERIFY_RUNNERS = ("python3", "test", "true")
+
+    @classmethod
+    def verify_result(cls, verify: str, timeout: float = 30.0) -> str:
+        """跑一条 verify,返回三态之一。
+
+        - `pass`    命令跑起来了,退出码 0。
+        - `fail`    命令跑起来了,退出码非 0。**这条是真的没过。**
+        - `unknown` 不是本仓库认可的检查写法(散文),或者超时/系统错误。
+                     **判断不了,不构成任何结论。**
+
+        ## 为什么不靠退出码判断「这是不是命令」
+
+        试过,不行。`backlog.md` 里人写的散文 verify,实测能跑出三种
+        完全不同的退出码,全都不是 0:
+
+            `docs/ 里有一节说明…`              -> 126(首词是个目录)
+            `core/risk_score.py:46 按 risk…`  -> 127(命令找不到)
+            `造 60 条关联…(改前会被截掉)`      -> 2  (反引号/括号语法错)
+
+        而 2 同时也是**合法命令**的正常失败码(grep 参数错、脚本用法错)。
+        也就是说退出码这个信号**和散文高度重叠**,拿它当"是不是命令"
+        的判据,就是在猜。猜错的方向是**误挡真实完成** —— 那道闸门
+        会被"太吵"拆掉,于是连本该拦住假账的那部分也一起没了。
+
+        所以改成白名单:只有以 `python3` / `test` / `true` 开头的才算
+        检查命令,其余一律 `unknown`。这条判据是**声明式**的 ——
+        不推断,只认写下来的形式。代价是新写法要加进这个元组,
+        好处是绝不会把散文误判成"没过"。
+        """
+        stripped = verify.strip()
+        if not stripped:
+            return cls.VERIFY_UNKNOWN
+        first = stripped.split(None, 1)[0]
+        if first not in cls.VERIFY_RUNNERS:
+            return cls.VERIFY_UNKNOWN
+        try:
+            r = subprocess.run(
+                ["bash", "-c", verify],
+                cwd=Path.cwd(), capture_output=True, text=True, timeout=timeout,
+            )
+        except (subprocess.TimeoutExpired, OSError):
+            return cls.VERIFY_UNKNOWN
+        return cls.VERIFY_PASS if r.returncode == 0 else cls.VERIFY_FAIL
 
     @staticmethod
     def verify_passes(verify: str, timeout: float = 30.0) -> bool:

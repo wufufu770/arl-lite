@@ -208,20 +208,44 @@ class TestLoopRound(unittest.TestCase):
         self.lp = Loop(REPO, state_dir=self.d)
 
     def test_first_round_seeds_automatically(self):
-        """首轮不能空转——队列空必须先播种"""
+        """首轮必须播种,但**播种出来的那条不归这一轮做**
+
+        r35 改的正是这里。原来首轮播种完立刻领走它、当场标 done ——
+        而那 132 秒跑的是门禁不是实现。r34 实测就是这么造出一条假账的
+        (`pytest tests/没写的文件.py` 被标成 done)。
+
+        所以"首轮不能空转"这条旧断言已经不成立了,而且**它本来就不该
+        成立**:首轮的工作是"把队列备好料",不是"假装做完一条"。
+
+        这里改成断言新契约,并把理由写进断言 —— 不是为了让它变绿,
+        是为了让下一个改回旧行为的人立刻看到为什么。
+        """
         out = self.lp.round(only_gates=FAST_GATES)
-        self.assertIsNotNone(out.record.item_id, "首轮应有待办")
-        self.assertEqual(out.record.result, RESULT_DONE)
+        self.assertEqual(out.record.result, RESULT_NOOP, (
+            "轮初没活时应当如实空转。首轮播种出来的那条属于**下一轮**;"
+            "在本轮把它标 done 就是 r34 那条假账的成因"
+        ))
+        # 料确实备下了 —— 不变式 #4 仍然成立
+        from arl_lite.devloop.queue import Queue as _Q
+        _st = _Q(self.lp.dev_dir / "queue.json").stats()
+        self.assertGreater(_st.get("pending", 0), 0, "首轮没有播种,队列空了")
 
     def test_item_tracked_across_rounds(self):
-        """每轮完成一个不同的待办,item 追踪不能串"""
+        """每轮完成一个不同的待办,item 追踪不能串
+
+        r35 起,**首轮是空转轮**(只播种不做活),所以要多跑一轮才攒够
+        3 条。空转轮不产出 item_id,这里据此断言"完成的轮次没有重复"。
+        """
         seen = set()
-        for _ in range(3):
+        completed = 0
+        for _ in range(4):
             out = self.lp.round(only_gates=FAST_GATES)
-            self.assertIsNotNone(out.record.item_id)
+            if not out.record.item_id:
+                continue          # 空转轮:本轮播种,不完成任何条目
             self.assertNotIn(out.record.item_id, seen, "同一待办被重复完成")
             seen.add(out.record.item_id)
-        self.assertEqual(self.lp.status().items_done, 3)
+            completed += 1
+        self.assertEqual(self.lp.status().items_done, completed)
 
     def test_status_never_raises(self):
         text = self.lp.status_text()
