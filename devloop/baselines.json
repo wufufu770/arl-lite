@@ -1,8 +1,8 @@
 {
-  "doc_freshness": 39,
+  "doc_freshness": 0,
   "loc_budget": {
-    "devloop_loc": 2595,
-    "total_loc": 12182
+    "total_loc": 12246,
+    "devloop_loc": 2617
   },
   "no_import_cycle": 0,
   "no_thirdparty_import": 0,

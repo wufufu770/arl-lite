@@ -788,6 +788,10 @@ _DOC_STALE_DEPS = (
     "pyyaml",
 )
 
+# 文档豁免标记: 包裹"有意保留的历史记录"段落
+_DOC_IGNORE_MARKER = "<!-- devloop:ignore-doc-stale -->"
+_DOC_IGNORE_END = "<!-- /devloop:ignore-doc-stale -->"
+
 
 class DocFreshnessGate:
     """防的退化:PROJECT_PLAN.md 还在吹嘘已下架的依赖。
@@ -822,7 +826,25 @@ class DocFreshnessGate:
             )
 
         hits: list[tuple[str, int, str]] = []
+        # 豁免机制:文档用 `<!-- devloop:ignore-doc-stale -->` 开启一段
+        # "有意保留的历史记录", 直到出现 `<!-- /devloop:ignore-doc-stale -->`
+        # 或文件结束。
+        #
+        # 没有豁免, 门禁只能靠猜: 对照表里提 typer 是合理记录, 但没法和
+        # "声称项目依赖 typer"区分开——只能全报, 逼人去删本该留的信息。
+        # 豁免把判断权还给文档作者, 而作者是唯一知道这段话是吹嘘还是
+        # 记录的人。
+        #
+        # 开闭标记在同一行出现时, 该行自身也豁免。
+        ignoring = False
         for line_no, line in enumerate(text.splitlines(), 1):
+            if _DOC_IGNORE_MARKER in line:
+                ignoring = not line.rstrip().endswith(_DOC_IGNORE_END)
+                continue
+            if ignoring:
+                if _DOC_IGNORE_END in line:
+                    ignoring = False
+                continue
             for dep in _DOC_STALE_DEPS:
                 # 单词边界匹配,避免误命中子串(如 `typer` 不应命中 `typer-like`)
                 if re.search(rf"\b{re.escape(dep)}\b", line, re.IGNORECASE):
