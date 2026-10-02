@@ -281,12 +281,27 @@ class Storage:
 
         # 1b. sites 表补 server 列(关联分析 istio_no_auth 规则需要)
         site_cols = {row["name"] for row in conn.execute("PRAGMA table_info(sites)").fetchall()}
-        if "server" not in site_cols:
-            try:
-                conn.execute("ALTER TABLE sites ADD COLUMN server TEXT")
-                log.info("migrated: sites ADD COLUMN server")
-            except Exception as e:
-                log.warning(f"failed to add sites.server: {e}")
+        # 迁移列 → 字面量 SQL(不走 f-string 拼接,列名是代码写死的常量)
+        site_needed = {
+            "server": "ALTER TABLE sites ADD COLUMN server TEXT",
+            # v0.7.10: TLS 证书(资产归属判定的核心维度)
+            "cert_sha256": "ALTER TABLE sites ADD COLUMN cert_sha256 TEXT",
+            "cert_issuer_cn": "ALTER TABLE sites ADD COLUMN cert_issuer_cn TEXT",
+            "cert_issuer_org": "ALTER TABLE sites ADD COLUMN cert_issuer_org TEXT",
+            "cert_subject_cn": "ALTER TABLE sites ADD COLUMN cert_subject_cn TEXT",
+            "cert_san": "ALTER TABLE sites ADD COLUMN cert_san TEXT",
+            "cert_not_after": "ALTER TABLE sites ADD COLUMN cert_not_after TEXT",
+            "cert_expired": "ALTER TABLE sites ADD COLUMN cert_expired INTEGER DEFAULT 0",
+            "cert_self_signed": "ALTER TABLE sites ADD COLUMN cert_self_signed INTEGER DEFAULT 0",
+            "cert_days_left": "ALTER TABLE sites ADD COLUMN cert_days_left INTEGER",
+        }
+        for col, sql in site_needed.items():
+            if col not in site_cols:
+                try:
+                    conn.execute(sql)
+                    log.info(f"migrated: sites ADD COLUMN {col}")
+                except Exception as e:
+                    log.warning(f"failed to add sites.{col}: {e}")
 
         # 2. 删重复(保留 id 最大的)— 现在 target 列存在了
         try:
@@ -573,13 +588,20 @@ class Storage:
     _MUTABLE_TEXT: dict[str, tuple[str, ...]] = {
         "domains": ("resolved_ip",),
         "hosts": ("ip",),
-        "sites": ("title", "server", "tech", "scheme", "ip"),
+        # 证书字段放 TEXT 类:证书换了(SAN/issuer 变)但新值可能为空,
+        # 空值不该把已知的旧证书信息抹掉。cert_expired/self_signed/days_left
+        # 放 PLAIN —— 状态变了就是变了,不能被"新值为空"掩盖。
+        "sites": (
+            "title", "server", "tech", "scheme", "ip",
+            "cert_sha256", "cert_issuer_cn", "cert_issuer_org",
+            "cert_subject_cn", "cert_san", "cert_not_after",
+        ),
         "ports": ("version", "banner"),
         "findings": ("description", "evidence", "cve", "reference_url", "severity"),
     }
     _MUTABLE_PLAIN: dict[str, tuple[str, ...]] = {
         "ports": ("state", "service", "protocol"),
-        "sites": ("status_code",),
+        "sites": ("status_code", "cert_expired", "cert_self_signed", "cert_days_left"),
     }
 
     def _upsert_asset(
@@ -1002,6 +1024,16 @@ class Storage:
         module: str = "httpx",
         confidence: int = 50,
         risk: int = 0,
+        # TLS 证书(可选,非 https 站点为空)—— 资产归属判定的核心维度
+        cert_sha256: str | None = None,
+        cert_issuer_cn: str | None = None,
+        cert_issuer_org: str | None = None,
+        cert_subject_cn: str | None = None,
+        cert_san: str | None = None,
+        cert_not_after: str | None = None,
+        cert_expired: int = 0,
+        cert_self_signed: int = 0,
+        cert_days_left: int | None = None,
     ) -> bool:
         workspace_id = self.workspace_id
         return self._upsert_asset(
@@ -1018,6 +1050,15 @@ class Storage:
                 "server": server,
                 "status_code": status_code,
                 "tech": tech,
+                "cert_sha256": cert_sha256,
+                "cert_issuer_cn": cert_issuer_cn,
+                "cert_issuer_org": cert_issuer_org,
+                "cert_subject_cn": cert_subject_cn,
+                "cert_san": cert_san,
+                "cert_not_after": cert_not_after,
+                "cert_expired": cert_expired,
+                "cert_self_signed": cert_self_signed,
+                "cert_days_left": cert_days_left,
             },
             module=module,
             confidence=confidence,

@@ -167,6 +167,16 @@ CREATE TABLE IF NOT EXISTS sites (
     tech TEXT,                         -- JSON,指纹结果
     response_headers TEXT,            -- JSON,响应头
     body_hash TEXT,                    -- 用于 site_change 检测
+    -- TLS 证书(资产归属判定的核心维度, 见 integrations/tls_cert.py)
+    cert_sha256 TEXT,                  -- 证书指纹,跨时间稳定
+    cert_issuer_cn TEXT,               -- 签发者 CN,如 GlobalSign nv-sa
+    cert_issuer_org TEXT,              -- 签发者组织
+    cert_subject_cn TEXT,              -- 主体 CN
+    cert_san TEXT,                     -- JSON array,证书认领的域名
+    cert_not_after TEXT,               -- 过期日期 YYYY-MM-DD
+    cert_expired INTEGER DEFAULT 0,    -- 1=已过期
+    cert_self_signed INTEGER DEFAULT 0,-- 1=自签(归属判定时降权)
+    cert_days_left INTEGER,            -- 距过期天数, NULL=未知
     screenshot_path TEXT,
     -- 5 列 + 2 列(标准 7 列)
     hash TEXT NOT NULL,                -- sha256(workspace_id+url)

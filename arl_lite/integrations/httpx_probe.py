@@ -57,6 +57,26 @@ def _do_request(url: str, timeout: int) -> dict:
             # 避免 MITM 伪造 title/Server 污染指纹与关联分析。
             # 注意 urllib 对证书错误抛的是 URLError(包裹 reason),不是
             # 裸 SSLCertVerificationError——只接后者会让降级成死代码
+            #
+            # 证书信息另开一条连接取: urllib 的响应读完就关了,
+            # 拿不到 peer cert。资产归属判定需要 SAN/issuer/指纹,
+            # 所以这里额外 fetch 一次(失败不影响主流程)。
+            cert: dict = {}
+            try:
+                from urllib.parse import urlparse
+                from .tls_cert import fetch as _fetch_cert
+                _u = urlparse(url)
+                _c = _fetch_cert(
+                    _u.hostname or url,
+                    _u.port or 443,
+                    timeout=timeout,
+                    server_hostname=_u.hostname,
+                )
+                if _c is not None:
+                    cert = _c.to_dict()
+            except Exception as e:  # 证书采集绝不能拖垮站点探测
+                log.debug(f"cert fetch failed for {url}: {type(e).__name__}: {e}")
+
             try:
                 resp_ctx = _ssl_context(verify=True)
                 resp = urllib.request.urlopen(req, timeout=timeout, context=resp_ctx)
@@ -70,11 +90,13 @@ def _do_request(url: str, timeout: int) -> dict:
         else:
             resp = urllib.request.urlopen(req, timeout=timeout, context=None)
             tls_verified = None
+            cert = {}
         with resp:
             body = resp.read(200 * 1024)  # 最多读 200KB(标题和元信息够了)
             return {
                 "url": url,
                 "tls_verified": tls_verified,
+                "cert": cert,
                 "status": resp.status,
                 "server": resp.headers.get("Server", ""),
                 "content_type": resp.headers.get("Content-Type", ""),
