@@ -1,10 +1,29 @@
-"""r60:面向用户的建议里不能混着跑不通的 arl-lite 命令。
+"""r60/r61:面向用户的建议里不能混着跑不通的 arl-lite 命令。
 
 背景(实测,不是推演):`arl-lite correlate first`、`arl-lite export json`、
-README 里 `ai explain --finding-id` / `ai suggest --target` / `ai fix --rule-id`
-共 5 条死路。跑不通的报错和真正原因毫无关系——用户看到「没关联分析」,照着提示
-敲 `correlate first`,撞上的是 argparse 的「unrecognized arguments」。
-给用户一条走不通的路,比不给更坏(r59 之后立的规矩)。
+README 里 `ai explain --finding-id` / `ai suggest --target` / `ai fix --rule-id`、
+`arl-lite perf-bench --scale 0.2` 共 6 处死路。跑不通的报错和真正原因毫无
+关系——用户看到「没关联分析」,照着提示敲 `correlate first`,撞上的是 argparse
+的「unrecognized arguments」。给用户一条走不通的路,比不给更坏(r59 立的规矩)。
+
+## r61 修的是判据自己的两个洞,不是新增第 7 处死路
+
+`arl-lite perf-bench --scale 0.2` 这条 r60 就已经在扫了,却整整一轮没人看见。
+原因不在建议,在判据:r60 用「argparse 有没有 SystemExit」一刀切,把四类完全
+不同的抱怨混成一句「查不动」,而这一条是**值错**不是缺值 —— 值错后面补什么都
+救不回来,和占位符缺值根本不是一回事。
+
+顺带查出提取器三个把「能跑的建议」误判成「查不动」的缺陷,每一个都是**静默**
+少验若干条,没有一条会报错:
+
+| 缺陷 | 后果 |
+|---|---|
+| shlex 把反引号当引用符,而文档里反引号是 markdown 代码围栏 | `<name>` 被粘成 `` <name>`` 再被 ASCII 检查丢掉,一轮丢 4 个占位符 |
+| 对每个 token 都 `rstrip` 闭标点 | `<provider>` → `<provider`,`--reason ...` → 空串,flag 后于是「没有值」 |
+| 闭引号粘在末位 token 上 | `run 'arl-lite run' first` → 凭空造出 `arl-lite run first` |
+
+三个修完:提到 100 条建议,86 条真验通过,12 条查不动(占位符 `<subcmd>`、
+中文引号值、f-string 槽),死路 1 条(已修)。
 
 ## 为什么不是「按建议动词扫」
 
@@ -14,7 +33,7 @@ README 里 `ai explain --finding-id` / `ai suggest --target` / `ai fix --rule-id
 漏掉 85%,而死路恰恰长在裸命令行里(本轮 README 那 3 条就全是裸命令)。
 
 真正把噪声压下去的是**命令形状**本身:`arl-lite <token>` 的第一个 token 必须是
-真子命令,最终提取到 87 条建议,只有 2 处形状撞车,而这 2 处各有明确理由排除:
+真子命令,提到 100 条建议,只有 2 处形状撞车,而这 2 处各有明确理由排除:
 
 | 撞车处 | 形状 | 为什么不是建议 | 排除规则 |
 |---|---|---|---|
@@ -25,9 +44,15 @@ README 里 `ai explain --finding-id` / `ai suggest --target` / `ai fix --rule-id
 符号,里面装的是真命令,实测没有一条真命令被这条规则吃掉。
 `arl-lite v1.2.3` / `arl-lite v{__version__}` 是版本号不是命令,单独一条规则;
 这条规则必须写成 `v` 后接数字/`{`/空白,写成 `arl-lite v` 会把真子命令
-`arl-lite version` 一起吃掉——第一版探针正是这么写的,靠「`arl-lite version`
-在候选列表里凭空消失」这件事发现的,`test_extractor_ignores_version_banners_but_keeps_the_version_subcommand`
-把它钉住。
+`arl-lite version` 一起吃掉(第一版就犯了这个,靠候选列表里 `arl-lite version`
+凭空消失发现的)。
+
+## 已知且接受的误报面
+
+英文散文里写 `arl-lite <单词>` 会被 A1 当成「不存在的子命令」。实测只撞上 1 处
+(`docs/merge-analysis` 里许可证那句 "Modified by arl-lite contributors"),
+改成了 "Modified by contributors of arl-lite" —— 不是加豁免名单,是让这句话
+不再长成命令的样子。将来再撞上同样处理:**改文案,不加名单**。
 
 ## 扫多大
 
@@ -35,12 +60,20 @@ README 里 `ai explain --finding-id` / `ai suggest --target` / `ai fix --rule-id
 不扫 `tests/`(里面故意有畸形输入)、不扫顶层 `devloop/`(变异脚本的字符串里全是
 故意的坏命令)、不扫 `devloop/backlog.md`(任务队列,引的都是片段)。
 
-## 查不动的就放过,但不许悄悄不查
+## 三类判定,不是两类
 
-占位符(`<provider>`、`{table}`)和被截断的建议会让 argparse 直接 SystemExit,
-这种一律放过(保守方向:宁可漏报不可误报)。但放过不等于不查——
-`test_criterion_actually_checks_enough_commands` 钉住「真验的条数」下限,
-防止提取器哪天退化成什么都不产出,判据变成恒真。
+r60 只有「跑得通 / 查不动」两类,靠「有没有 SystemExit」分。r61 拆成三类
+(`_verdict`):干净 / 死路 / 查不动。分法是**看 argparse 具体抱怨什么**,加上
+**命令后面还有没有原文**:
+
+* `invalid choice` 且抱怨的值不是占位符 → **死路**。值错不是缺值。
+* 抱怨的值本身是占位符(`<subcmd>`、`...`)→ 查不动,那本来就是「填这里」。
+* 抱怨缺参数/缺值 → 看尾巴。尾巴里还有东西就是提取器够不着
+  (`arl-lite ai ask "解释这个关联分析"` 里明明有 question),尾巴空了才是建议没给。
+
+放过不等于不查:`test_criterion_actually_checks_enough_commands` 钉住「真验条数」
+下限,`test_the_unchecked_ones_stay_unchecked` 钉住「查不动条数」下界 —— 两头
+都钉,提取器退化了、或者被人悄悄放松,都会有声音。
 """
 from __future__ import annotations
 
@@ -114,48 +147,91 @@ def _py_strings(path: pathlib.Path):
 
 
 def _commands_in(text: str):
-    """从一段文本里切出所有 `arl-lite <子命令> ...` 形状的命令。"""
+    """切出所有 `arl-lite <子命令> ...` 形状的命令,并带上**命令之后的原文**。
+
+    返回 (命令, 尾巴)。尾巴是提取器没吃掉的剩余文本,判据靠它分辨
+    「argparse 说缺参数」和「参数被提取器截断在后面了」:
+    `arl-lite ai ask "解释这个关联分析"` 里 argparse 抱怨缺 `question`,
+    但尾巴里明明有值 —— 那不是死路,是提取器够不着。
+    """
     for m in re.finditer(r"arl-lite", text):
         seg = text[m.start() : text.find("\n", m.start()) if text.find("\n", m.start()) != -1 else len(text)]
         if VERSION_BANNER.match(seg) or BANNER_LEFT.search(text[: m.start()]):
             continue
+        # shlex 把反引号当引用符,而这里的反引号是 markdown 的**代码围栏**
+        # (`arl-lite devloop gate <name>` | 说明),不是命令的一部分。
+        # 不换掉的话 ``<name>``` 会被粘成 ``<name>``,再被 ASCII 检查连坐丢掉
+        # —— 实测一轮就悄悄丢了 4 个占位符,`gate <name>` 被记成 `gate`。
+        seg = seg.replace("`", " ")
         try:
             toks = shlex.split(seg, comments=False)
         except ValueError:
+            # 引号没闭合 ⇒ `arl-lite ...` 被包在引号里(如 "use 'arl-lite watch
+            # add' first")。引号本体不是命令的一部分,切到它之前为止。
+            # 不这么做的话 shlex 报错后回退的 .split() 会把闭引号粘在末位
+            # token 上,凭空造出一条 `arl-lite run first` 这种不存在的建议。
+            cuts = [i for i in (seg.find(c) for c in "'\"") if i > 0]
+            seg = seg[: min(cuts)] if cuts else seg
             toks = seg.split()
         if not toks or toks[0] != "arl-lite":
             continue
         keep = []
+        # 尾巴的位置要用**原 token** 的长度(剥标点前的):用剥完的长度会让偏移
+        # 一点点错位,报出来的尾巴变成别的字 —— 诊断信息自己骗人,比没诊断更坏。
+        # 占位符(`<provider>`、`{table}`)整体留着:它就是给 argparse 吃的值,
+        # 剥掉闭合的 `>` 会让 `<provider>` 变成 `<provider`,于是 `--api-key`
+        # 后面「没有值」—— 把一条**能跑**的建议误判成查不动。
+        used = len("arl-lite") + 1
         for t in toks[1:]:
-            t = t.rstrip(")]}>,;:.!")
+            raw_len = len(t)
+            if t[:1] not in "<{":
+                # `.` 不剥:`--reason ...` 的 `...` 是合法取值,剥光就成空串,
+                # 于是「flag 后面没有值」—— 一条能跑的建议被误判成查不动。
+                stripped = t.rstrip(")]}>,;:_!")
+                t = stripped or t
             if t.isascii() and TOKEN.fullmatch(t):
                 keep.append(t)
+                used += raw_len + 1
             else:
                 break
+        # 首 token 得像个子命令:子命令名总是字母/连字符开头。`arl-lite` 后面
+        # 跟个 `:`(docs 里「等价于安装后的 `arl-lite`:」这种纯提及)不是命令,
+        # 放它进来只会被 A1 当成「不存在的子命令」误报。
+        if keep and not keep[0][:1].isalpha() and not keep[0].startswith("-"):
+            continue
         if keep:
-            yield " ".join(["arl-lite", *keep])
+            yield " ".join(["arl-lite", *keep]), seg[used:].strip()
 
 
 def _all_advice():
-    """全量建议。产出 (来源标签, 命令),同一条命令只出现一次。"""
-    seen = set()
+    """全量建议。产出 (来源标签, 命令, 尾巴),同一条命令只出现一次。
+
+    同一条命令在多个地方出现时,尾巴取**最长**的那次:尾巴越长,越说明
+    提取器是在中途停下的而不是命令真的写完了 —— 判保守放过的依据就在这。
+    """
+    tails: dict = {}
+    order: list = []
+
+    def offer(src, cmd, tail):
+        key = src.rsplit(":", 1)[0] + "|" + cmd
+        if key not in tails:
+            order.append(key)
+            tails[key] = [src, cmd, tail]
+        elif len(tail) > len(tails[key][2]):
+            tails[key][2] = tail
+
     for path in sorted(PKG.rglob("*.py")):
         for lineno, text, _ in _py_strings(path):
-            for cmd in _commands_in(text):
-                key = (str(path.relative_to(REPO)), cmd)
-                if key not in seen:
-                    seen.add(key)
-                    yield f"{key[0]}:{lineno}", cmd
+            for cmd, tail in _commands_in(text):
+                offer(f"{path.relative_to(REPO)}:{lineno}", cmd, tail)
     for path in MARKDOWN:
         if not path.exists():
             continue
         rel = str(path.relative_to(REPO))
         for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            for cmd in _commands_in(line):
-                key = (rel, cmd)
-                if key not in seen:
-                    seen.add(key)
-                    yield f"{rel}:{lineno}", cmd
+            for cmd, tail in _commands_in(line):
+                offer(f"{rel}:{lineno}", cmd, tail)
+    return [tails[k] for k in order]
 
 
 # ---------------------------------------------------------------- 校验
@@ -169,8 +245,26 @@ def _real_subcommands() -> set:
     raise AssertionError("build_parser() 里找不到 command 子命令表")
 
 
+def _argparse_says(cmd: str) -> str:
+    """跑一遍真 parser,把 argparse 的抱怨原样带回来;没抱怨则返回空串。"""
+    sink = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(sink), contextlib.redirect_stdout(io.StringIO()):
+            build_parser().parse_known_args(cmd.split()[1:])
+    except SystemExit:
+        lines = [ln for ln in sink.getvalue().splitlines() if "error:" in ln]
+        return lines[-1].split("error:")[-1].strip() if lines else "(无 error 行)"
+    return ""
+
+
 def _leftovers(cmd: str):
-    """跑一遍真 parser。返回 [] = 干净,None = 查不动(保守放过),否则是多余参数。"""
+    """A2 的内核。返回 [] = 干净,None = 查不动(保守放过),否则是多余参数。
+
+    r60 版的分界是「有没有 SystemExit」—— 那把四类完全不同的信号混成一句,
+    于是 r61 实测到的第 6 处死路(`arl-lite perf-bench --scale 0.2`,--scale
+    只收 {small,medium,large})在「查不动」里被放过了整整一轮:
+    值是**错的**而不是缺的,补什么都救不回来,和占位符缺值根本不是一回事。
+    """
     parser = build_parser()
     sink = io.StringIO()
     try:
@@ -182,7 +276,42 @@ def _leftovers(cmd: str):
 
 
 ADVICE = list(_all_advice())
-CHECKED = [(src, cmd) for src, cmd in ADVICE if _leftovers(cmd) is not None]
+
+
+def _verdict(cmd: str, tail: str) -> str:
+    """这条建议是「干净」「死路」还是「查不动」。
+
+    r60 用「有没有 SystemExit」一刀切,把 argparse 的四类抱怨混成一句,
+    于是 r61 实测到的第 6 处死路被放过了一整轮。这一版按抱怨类型分开:
+
+    * `invalid choice` 且抱怨的值**不是**占位符 → 死路。值是**错的**不是缺的,
+      后面补什么都救不回来(`--scale 0.2` 只收 {small,medium,large})。
+    * 抱怨的值本身就是占位符(`<subcmd>`、`...`)→ 查不动,那本来就是「填这里」。
+    * 抱怨「缺参数 / 缺值」→ 看尾巴:尾巴里还有东西,说明是提取器够不着
+      (`arl-lite ai ask "解释这个关联分析"` 里明明有 question);
+      尾巴空了才是建议真的没给。
+    * 没抱怨但 parse_known_args 剩了东西 → 死路(A2 管的那些)。
+    """
+    says = _argparse_says(cmd)
+    if not says:
+        extra = _leftovers(cmd)
+        return "clean" if not extra else f"deadend:多余参数 {extra}"
+    if "invalid choice" in says:
+        value = says.split("invalid choice:")[-1].split("(")[0].strip().strip("'\"")
+        if value[:1] in "<{" or value == "...":
+            return f"unchecked:占位符 {value}"
+        return f"deadend:值不合法 {value}"
+    if not tail or tail.startswith("#"):
+        # 尾巴是注释(命令后面跟 `# 说明`)也算「没给」:注释不可能是参数值。
+        # 这条不是洁癖 —— 判据自己第一版就靠合成输入逮到了:说缺 `gate_name`
+        # 而尾巴是 `# 跑单个门禁并打印实测值`,那是表格的说明列,不是参数。
+        return f"deadend:{says}"
+    return f"unchecked:提取到 {tail[:20]}"
+
+
+CLEAN = [a for a in ADVICE if _verdict(a[1], a[2]).startswith("clean")]
+DEAD = [a for a in ADVICE if _verdict(a[1], a[2]).startswith("deadend")]
+UNCHECKED = [a for a in ADVICE if _verdict(a[1], a[2]).startswith("unchecked")]
 
 
 # ---------------------------------------------------------------- 判据
@@ -191,7 +320,7 @@ CHECKED = [(src, cmd) for src, cmd in ADVICE if _leftovers(cmd) is not None]
 def test_every_advice_command_starts_with_a_real_subcommand():
     """A1:`arl-lite` 后面的第一个 token 必须是真子命令。"""
     real = _real_subcommands()
-    bad = [(src, cmd) for src, cmd in ADVICE if cmd.split()[1] not in real]
+    bad = [(src, cmd) for src, cmd, _ in ADVICE if cmd.split()[1] not in real]
     assert not bad, "建议里出现了不存在的子命令:\n" + "\n".join(f"  {s}: {c}" for s, c in bad)
 
 
@@ -201,39 +330,91 @@ def test_advice_command_leaves_no_unparseable_arguments():
     这条专治 r57/r58/r59/r60 同一个病:子命令对,但后面挂的东西跑不通
     (`correlate first`、`export json`、`--finding-id`)。
     """
-    bad = [(src, cmd, _leftovers(cmd)) for src, cmd in CHECKED if _leftovers(cmd)]
+    bad = [(src, cmd, _leftovers(cmd)) for src, cmd, _ in CLEAN if _leftovers(cmd)]
     assert not bad, "建议里的命令跑不通(argparse 收不下多余部分):\n" + "\n".join(
         f"  {s}: {c}   多余={e}" for s, c, e in bad
+    )
+
+
+def test_no_advice_command_carries_a_value_argparse_rejects():
+    """A3(r61 新增):值写错了也判死路,不再混进「查不动」。
+
+    r60 那一版只要 argparse SystemExit 就放过,于是
+    `arl-lite perf-bench --scale 0.2`(只收 {small,medium,large})整整一轮
+    没人看见。值错和缺值是两回事:缺值后面还有东西可以补,值错补什么都救不回来。
+    """
+    assert not DEAD, "建议里的命令 argparse 明确不认:\n" + "\n".join(
+        f"  {src}: {cmd}\n      {_verdict(cmd, tail)}" for src, cmd, tail in DEAD
     )
 
 
 def test_criterion_actually_checks_enough_commands():
     """防恒真:提取器哪天退化成什么都不产出,判据不能跟着变成空转。
 
-    实测基线:提到 87 条建议,其中 60 条能真验(其余因占位符/截断被保守放过)。
-    下限取 75 / 55,给未来新增的 `<占位符>` 写法留余量,但不给退化的空间。
-    对照过旧版提取器:新提取器多抓到 2 条(`arl-lite version`、`arl-lite devloop drop`),
-    恰好排掉 2 处非建议(包元数据、gates 横幅),零真丢。
+    r60 基线是提到 87 条 / 真验 60 条;r61 修完提取器(shlex 反引号当引用符、
+    占位符被剥、闭引号粘末位 token)提到 101 条 / 真验 86 条。
+    下限取 90 / 75,给新增的 `<占位符>` 写法留余量,但不给退化的空间。
     """
-    assert len(ADVICE) >= 75, f"只提到 {len(ADVICE)} 条建议,提取器多半退化了"
-    assert len(CHECKED) >= 55, f"只有 {len(CHECKED)} 条真验,判据基本在空转"
+    assert len(ADVICE) >= 90, f"只提到 {len(ADVICE)} 条建议,提取器多半退化了"
+    assert len(CLEAN) >= 75, f"只有 {len(CLEAN)} 条真验通过,判据基本在空转"
 
 
 def test_the_unchecked_ones_stay_unchecked():
     """「查不动就放过」不许被悄悄改成「查不动就当通过」。
 
-    变异测试 M14 把 `except SystemExit: return None` 改成 `return []`,
-    结果 27 条占位符型建议从「查不动」变成「已验通过」,一条测试都没红——
-    判据的覆盖面少了一截,却没有任何声音。这是 r57~r59 一路吃过的暗亏:
-    静默降级比降级本身更坏。
-
-    所以这里把「查不动的那一批」钉成一个**有下界**的集合。实测 27 条
-    (`<provider>`、`{table}`、devloop docstring 里被截断的清单)。
+    变异测试 M14(r60)把 `except SystemExit: return None` 改成 `return []`,
+    一批占位符建议从「查不动」变成「已验通过」,一条测试都没红——判据的覆盖面
+    少了一截,却没有任何声音。所以这里把「查不动的那一批」钉成有下界的集合。
+    r61 修完提取器后实测 15 条(占位符 `<subcmd>`、中文引号值、f-string 槽)。
     """
-    unchecked = [c for _, c in ADVICE if _leftovers(c) is None]
-    assert len(unchecked) >= 10, (
-        f"只剩 {len(unchecked)} 条查不动,其余 70+ 条全被当成「已验通过」了 —— "
+    assert len(UNCHECKED) >= 5, (
+        f"只剩 {len(UNCHECKED)} 条查不动,其余全被当成「已验通过」了 —— "
         f"检查覆盖面被静默削掉了吗"
+    )
+    # 三类必须**分完**,不许有第四类。第一版这条写成了 `UNCHECKED + CLEAN ==
+    # ADVICE`,漏了 DEAD 一类 —— 于是它歪打正着当成了「一条死路都不能有」的
+    # 后盾,覆盖变异 C-value 明明 skip 掉了 A3 却被它杀掉,我一度以为 A3 之外
+    # 还有别的守卫。查下去才发现是自己的断言写错了:它守的东西和它宣称的名字
+    # 不是一回事,和 r35 那条「字段名承诺的语义必须和承载的语义对得上」同一族。
+    assert len(UNCHECKED) + len(CLEAN) + len(DEAD) == len(ADVICE), (
+        f"三类没分完:{len(CLEAN)} 干净 + {len(DEAD)} 死路 + "
+        f"{len(UNCHECKED)} 查不动 != {len(ADVICE)} 条建议"
+    )
+
+
+# ---------------------------------------------------------------- 分类器自身
+
+
+@pytest.mark.parametrize(
+    "cmd, tail, expect",
+    [
+        # 干净
+        ("arl-lite stats", "", "clean"),
+        ("arl-lite query domains", "", "clean"),
+        # 死路:值错(补什么都救不回来)
+        ("arl-lite perf-bench --scale 0.2", "# 冒烟", "deadend"),
+        ("arl-lite monitors add", "", "deadend"),
+        # 死路:多余参数
+        ("arl-lite correlate first", "", "deadend"),
+        # 死路:建议真的没给必填参数(尾巴是空的)
+        ("arl-lite devloop gate", "", "deadend"),
+        ("arl-lite devloop gate", "# 说明", "deadend"),
+        # 查不动:抱怨的值本来就是占位符
+        ("arl-lite devloop <subcmd>", "", "unchecked"),
+        ("arl-lite devloop ...", "  ", "unchecked"),
+        # 查不动:尾巴里明明有值,是提取器够不着
+        ("arl-lite ai ask", '"解释这个关联分析"', "unchecked"),
+        ("arl-lite devloop add foo", '"标题"', "unchecked"),
+    ],
+)
+def test_verdict_classifies_each_argparse_complaint(cmd, tail, expect):
+    """`_verdict` 是 A3 的全部判据,直接拿合成输入钉住它的每一类。
+
+    没有这组单测,A3 在仓库当前状态下是**空转**的(0 条死路),于是把
+    `invalid choice` 那一支整个删掉它照样绿 —— 判据看着在,其实已经不看了。
+    """
+    assert _verdict(cmd, tail).startswith(expect), (
+        f"{cmd!r} + 尾巴 {tail!r} 被判成 {_verdict(cmd, tail)!r},期望 {expect}"
     )
 
 
@@ -242,35 +423,75 @@ def test_the_unchecked_ones_stay_unchecked():
 
 def test_extractor_finds_advice_in_python_and_markdown():
     """提取器要同时吃 .py 和 .md——死路在两边都真实发生过。"""
-    py = {src for src, _ in ADVICE if src.endswith(".py") or ":1" in src or ".py:" in src}
-    md = {src for src, _ in ADVICE if ".md:" in src}
+    py = {src for src, _, _ in ADVICE if ".py:" in src}
+    md = {src for src, _, _ in ADVICE if ".md:" in src}
     assert len(md) >= 10, f"markdown 只提到 {len(md)} 条建议"
-    assert any(s.startswith("arl_lite/") for s in py), "python 侧一条都没提到"
+    assert len(py) >= 15, f"python 侧只提到 {len(py)} 条建议"
 
 
 def test_extractor_ignores_package_metadata():
     """`__author__ = "arl-lite contributors"` 是包元数据,不是建议。"""
-    for src, cmd in ADVICE:
+    for src, cmd, _ in ADVICE:
         assert "contributors" not in cmd, f"{src}: 把包元数据当成了建议"
 
 
 def test_extractor_ignores_decorated_title_lines():
     """`== arl-lite gates ==` 是横幅,`gates` 压根不是子命令。"""
-    for src, cmd in ADVICE:
+    for src, cmd, _ in ADVICE:
         assert not cmd.startswith("arl-lite gates"), f"{src}: 把标题行当成了建议"
 
 
 def test_extractor_ignores_version_banners_but_keeps_the_version_subcommand():
     """`arl-lite v{__version__}` 是版本号;`arl-lite version` 是真命令,不能一起吃掉。"""
-    assert any(c == "arl-lite version" for _, c in ADVICE), "arl-lite version 被版本号规则误伤了"
-    for src, cmd in ADVICE:
+    assert any(c == "arl-lite version" for _, c, _ in ADVICE), "arl-lite version 被版本号规则误伤了"
+    for src, cmd, _ in ADVICE:
         assert not re.match(r"arl-lite v[\d{]", cmd), f"{src}: 把版本号当成了命令"
 
 
 def test_extractor_stops_at_non_ascii_prose():
     """`arl-lite query correlations 看)` 里的「看」是正文,不是参数。"""
-    for _, cmd in ADVICE:
+    for _, cmd, _ in ADVICE:
         assert all(t.isascii() for t in cmd.split()), f"把中文正文吃进了命令: {cmd!r}"
+
+
+def test_extractor_keeps_placeholders_intact():
+    """占位符必须整体留着 —— 剥掉闭合符就等于把参数删了。
+
+    r60 那一版对每个 token 都 `rstrip(")]}>,;:.!")`,于是 `<provider>` 变成
+    `<provider`、`--reason ...` 的 `...` 变成空串,argparse 反过来报
+    「flag 后面没有值」—— **一条能跑的建议被判成查不动**。
+    """
+    cmds = {c for _, c, _ in ADVICE}
+    assert "arl-lite ai config set <provider> --api-key ..." in cmds, (
+        "占位符 `<provider>` 或取值 `...` 被提取器弄坏了"
+    )
+    assert any("--reason ..." in c for c in cmds), "取值 `...` 被当成标点剥掉了"
+
+
+def test_extractor_does_not_invent_a_command_from_a_quote_wrapper():
+    """`run 'arl-lite run' first` 里的闭引号不是命令的一部分。
+
+    r60 修占位符时顺手把 `'` 加进了 rstrip 集合,结果闭引号被剥掉、`first`
+    留下,凭空造出一条 `arl-lite run first` 这种不存在的建议。
+    """
+    cmds = {c for _, c, _ in ADVICE}
+    assert not any(c.startswith("arl-lite run first") for c in cmds), "闭引号没处理,凭空造出一条不存在的建议"
+    # 真正该守的是:建议里的 `run` 必带它自己的必填参数 `-t`,否则用户照抄就报错
+    assert "arl-lite run -t <target>" in cmds, "run 的建议没带必填的 -t,照抄就跑不通"
+
+
+def test_extractor_treats_backticks_as_code_fences_not_quotes():
+    """shlex 把反引号当引用符,于是 ``<name>``` 被粘成 ``<name>`` 再被 ASCII
+    检查连坐丢掉 —— `arl-lite devloop gate <name>` 被记成 `gate`。实测一轮
+    就这么悄悄丢了 4 个占位符。"""
+    cmds = {c for _, c, _ in ADVICE}
+    assert "arl-lite devloop gate <name>" in cmds, "markdown 代码围栏把占位符吃掉了"
+
+
+def test_extractor_ignores_a_bare_program_mention():
+    """docs 里「等价于安装后的 `arl-lite`:」这种纯提及后面没有子命令。"""
+    for src, cmd, _ in ADVICE:
+        assert len(cmd.split()) >= 2, f"{src}: 提到了程序名却没提到子命令 —— {cmd!r}"
 
 
 # ---------------------------------------------------------------- 本轮 5 处死路的回归
@@ -285,14 +506,14 @@ def test_extractor_stops_at_non_ascii_prose():
 )
 def test_fixed_advice_is_present_and_clean(src, cmd):
     """修完不能顺手把建议删干净了——删建议不叫修,得是能跑的建议。"""
-    found = [c for s, c in ADVICE if s.startswith(src)]
+    found = [c for s, c, _ in ADVICE if s.startswith(src)]
     assert cmd in found, f"{src} 里找不到修好的建议 {cmd!r}"
     assert not _leftovers(cmd), f"{cmd!r} 还是跑不通"
 
 
 def test_readme_ai_commands_have_no_invented_flags():
     """README 那 3 条曾经凭空发明了 --finding-id / --target / --rule-id。"""
-    readme = [c for s, c in ADVICE if s.startswith("README.md")]
+    readme = [c for s, c, _ in ADVICE if s.startswith("README.md")]
     for bogus in ("--finding-id", "--target", "--rule-id"):
         assert not any(bogus in c for c in readme), f"README 又写回了 {bogus}"
 

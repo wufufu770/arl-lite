@@ -648,7 +648,7 @@ def cmd_correlate(args) -> int:
         print(_limit_notice)
 
     if not hits:
-        print("[i] no correlations found (target too clean? run 'arl-lite run' first)")
+        print("[i] no correlations found (target too clean? run 'arl-lite run -t <target>' first)")
         return 0
 
     print()
@@ -1159,7 +1159,7 @@ def cmd_risk_top(args) -> int:
     storage = Storage(workspace=args.workspace)
     risks = compute_asset_risks(storage)[:limit]
     if not risks:
-        print("[i] no risks (run 'arl-lite run' + 'arl-lite correlate' first)")
+        print("[i] no risks (run 'arl-lite run -t <target>' + 'arl-lite correlate' first)")
         return 0
     print(f"[+] top {len(risks)} high-risk assets:")
     use_color = _use_color()

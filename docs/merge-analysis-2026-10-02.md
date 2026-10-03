@@ -252,7 +252,7 @@ reproducibility: 2          # 至少 N 轮独立观测才报
 
 1. 保留文件顶部 `# SPDX-License-Identifier: Apache-2.0`（HunterX 已自带）
 2. 新建 `THIRD_PARTY_NOTICES`
-3. 修改过的文件标注 "Modified by arl-lite contributors"
+3. 修改过的文件标注 "Modified by contributors of arl-lite"
 4. 不得对 Apache-2.0 文件加额外限制
 
 **AtlasX 闭源镜像不能碰**。

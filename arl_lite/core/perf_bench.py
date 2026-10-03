@@ -23,7 +23,7 @@
 ## 用法
 
     arl-lite perf-bench                  # 跑标准规模,输出 markdown
-    arl-lite perf-bench --scale 0.2      # 快速冒烟
+    arl-lite perf-bench --scale small   # 快速冒烟(档位是 small/medium/large)
     arl-lite perf-bench --repeat 3       # 取 3 次的中位数,抗抖动
 """
 from __future__ import annotations
