@@ -85,6 +85,26 @@ def _ensure_workspace_exists(name: str) -> int:
     print(f"[!] workspace not found: {name!r}", file=sys.stderr)
     if available:
         print(f"    available: {sorted(available)}", file=sys.stderr)
+    else:
+        # 没有任何工作区时,只报一句「not found」等于把用户堵死 ——
+        # 全新安装的用户正是这个处境(实测 7 个只读子命令全都走这里:
+        # stats / query / search / export / diff / correlate / risk top,
+        # 每条都只有那一行报错,零出路)。
+        #
+        # 出路指向**用户本来就想做的事**,不是 workspace 子命令:
+        # 实测 `arl-lite run -t <target>` 在空环境下 rc=0 且自动建出
+        # default 工作区,之后这些只读命令就都跑得通了。
+        #
+        # 刻意**不**指向 `workspace create default`:实测在空环境下
+        # 它报「workspace 'default' already exists」rc=1 ——
+        # Storage 会先静默建库,于是最像样的那条出路本身是条错路。
+        # 也不指向 `workspace list`:它确实 rc=0,但让用户去"列一下
+        # 工作区"不是他此刻想做的事,那是绕路。
+        print("    这台机器上还没有任何工作区。先跑一次任务即可自动建出:",
+              file=sys.stderr)
+        print(f"        arl-lite run -t <target>", file=sys.stderr)
+        print("    (想换个名字就用 -w <name>;已有工作区可用时上面会列出)",
+              file=sys.stderr)
     return 1
 
 
