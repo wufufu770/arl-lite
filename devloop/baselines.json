@@ -147,13 +147,25 @@
       "gate": "loc_budget",
       "reason": "r48 给 monitor changes 加了按资产过滤(_ASSET_IDENTITY 单一来源 + --asset 解析 + 删死参数 hash_key),total_loc 14847→15152,超出的 305 行里有相当一部分是把「为什么」写下来的判据注释(工作区作用域那条被自己推翻的说法、port 为什么从右边切、findings 为什么拒绝按名字、假死的 hash_key 是什么)。按协议不为省行删判据文档,走 accept 留痕。",
       "round": 54
+    },
+    {
+      "at": "2026-10-03T15:40:10",
+      "changes": {
+        "total_loc": {
+          "from": 15152,
+          "to": 15561
+        }
+      },
+      "gate": "loc_budget",
+      "reason": "r51 给 asset_changes 加了时间维度:monitor changes --since、monitor prune --older-than(默认只试算)、时间戳两种格式的归一化比较,以及把 --since 解析器从 cmd_diff 抽成三处共用的一个函数。total_loc 15152→15561,超出的 409 行里有相当一部分是把「为什么」写下来的判据:删的方向为什么必须是两个函数名而不是一个布尔参数(第一版方向反了,删掉的是最新的行且命令报成功)、为什么默认不删而不是加 --dry-run 标志、为什么清理必须点明它会改变基线判据的输入、为什么 workspace_id 条件在当前布局下空转但仍要留着。按协议不为省行删判据文档,走 accept 留痕。",
+      "round": 58
     }
   ],
   "doc_freshness": 0,
   "loc_budget": {
     "devloop_code_loc": 2900,
     "devloop_loc": 2617,
-    "total_loc": 15152
+    "total_loc": 15561
   },
   "no_import_cycle": 0,
   "no_thirdparty_import": 0,
