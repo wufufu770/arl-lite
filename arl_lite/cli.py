@@ -98,12 +98,17 @@ def _needs_total(shown: int, limit: int) -> bool:
 
 
 def _limit_notice_text(shown: int, total: int | None, limit: int,
-                       noun: str = "row") -> str:
+                       noun: str = "row", how: str | None = None) -> str:
     """被 `--limit` 截断时的说明。没截断时返回空串。
 
     `noun` 是给用户看的量词(`change` / `row` / `rule`):模板共用,但
     「200 个什么」得和命令的语境对得上 —— `monitor changes` 说 row
     会让人以为是资产行。
+
+    `how` 是「要全看怎么办」的建议,**默认那句对多数命令成立**。
+    r58 踩过一次:它写着「要全看就调大 --limit,机器消费用 `--json`」,
+    而 `correlate` 根本没有 `--json` —— 共用文案照抄到不适用的语境上,
+    就是给用户一条不存在的出路。宁可少说一句,也不能说错。
 
     ## 为什么要有这么一个共用函数(r56)
 
@@ -129,8 +134,12 @@ def _limit_notice_text(shown: int, total: int | None, limit: int,
         return (f"[i] {shown} {noun}(s) shown; total UNKNOWN "
                 f"(计数查询失败,不猜 —— 见上面的 warning)")
     if total > shown:
-        return (f"[i] {shown} of {total} {noun}(s) (只显示了最新 {shown} 条;"
-                f"--limit {limit}。要全看就调大 --limit,机器消费用 --json)")
+        # 不说「最新 N 条」:那是 `ORDER BY id DESC` 的措辞,而 `correlate`
+        # 是按 risk 降序取的(高风险在前)—— 共用文案照抄「最新」就是在
+        # 骗人。两条命令都是降序取前 N,去掉它不损失任何信息。
+        advice = how or "要全看就调大 --limit,机器消费用 --json"
+        return (f"[i] {shown} of {total} {noun}(s) "
+                f"(只显示了 {shown} 条;--limit {limit}。{advice})")
     # 没截断时**也**说总数:「200 条,以下是全部」是有用信息,
     # 而「静默地给全了」让用户分不清「这就是全部」和「恰好没超 limit」。
     return f"[i] {total} {noun}(s)"
@@ -619,7 +628,23 @@ def cmd_correlate(args) -> int:
     hits.sort(key=lambda h: -h.risk)
     # 过滤 min_risk
     hits = [h for h in hits if h.risk >= args.min_risk]
+    # `min_risk` 是用户**主动**要求的筛选,不是截断;`limit` 才是隐式的
+    # 上界。所以提示要说「因 limit 少了多少」,基准是过了 min_risk 之后的数,
+    # 不是引擎命中的总数(首行那句已经报过后者了)。
+    matched_total = len(hits)
     hits = hits[:args.limit]
+
+    # r58:`--limit` 截掉了多少必须说出来。首行 `[+] 60 hits` 是**引擎命中
+    # 总数**,和下面列出的行数不是一回事 —— 两个数字挨着出现却没人解释
+    # 差在哪,用户只会以为列出来的那 50 条就是全部(和 r50 那条
+    # 「两个数字并排出现却没人解释差在哪」是同一个形状)。
+    _limit_notice = _limit_notice_text(len(hits), matched_total, args.limit,
+                                       "correlation",
+                                       how="要全看就调大 --limit(命中全都在 "
+                                           "correlations 表里,也能用 "
+                                           "arl-lite query correlations 看)")
+    if _limit_notice:
+        print(_limit_notice)
 
     if not hits:
         print("[i] no correlations found (target too clean? run 'arl-lite run' first)")
@@ -638,18 +663,31 @@ def cmd_correlate(args) -> int:
     # 通知。notify_correlation 此前是死代码 —— 有定义、有导出、只有测试在调,
     # 关联命中永远不外发。规则自己的 tags(rce/unauth/data_leak...)也一直被
     # 丢掉,通知里只剩一个风险等级。
-    notified = _notify_correlations(args, hits)
+    notified = _notify_correlations(args, hits, matched_total)
     if notified is not None:
         print()
         print(notified)
     return 0
 
 
-def _notify_correlations(args, hits) -> str | None:
+def _notify_correlations(args, hits, total: int | None = None) -> str | None:
     """把关联命中推给 webhook;返回给人看的汇总行,没配置则返回 None
 
     配置沿用项目既有约定:**由调用方注入**(Watcher 也是
     `Watcher(storage, webhook_config=...)`),不在这里凭空造一个。
+
+    ## `total` 是「本该推多少条」(r58)
+
+    `hits` 是**已经按 `--limit` 截断过**的。汇总行原来写的是
+    `notified {ok}/{len(hits)}` —— 那个分母是截断后的数,所以 60 条命中
+    推了 50 条时它会说「notified 50/50」,**主动说谎**。
+
+    比谎报更实际的问题是:通知是**发给别人的**。收通知的人没有终端输出
+    可看,不知道少推了什么,也不会追问。所以这里必须把「共多少、推了多少、
+    还剩多少」一起说出去。
+
+    推的**条数**仍然有上界(几十条就够淹掉一个 webhook 了),但那个上界
+    必须是**明说**的,不能是看起来像「这就是全部」的假象。
     """
     if not getattr(args, "notify", False):
         return None
@@ -687,6 +725,10 @@ def _notify_correlations(args, hits) -> str | None:
                         getattr(h, "rule_name", "?"), e)
             failed += 1
     line = f"[i] notified {ok}/{len(hits)} correlation(s)"
+    if total is not None and total > len(hits):
+        line += (f" —— 共命中 {total} 条,按 --limit 只推了前 {len(hits)} 条,"
+                 f"其余 {total - len(hits)} 条**没有推**"
+                 f"(它们在命令输出和 correlations 表里)")
     if failed:
         line += f" ({failed} failed)"
     return line
