@@ -314,19 +314,100 @@ class Monitor:
 DEFAULT_BASELINE_LEARN = 3
 
 
+def _val_identity(value):
+    """给一个从 JSON 里读出来的值一个可比较的身份
+
+    带类型名:JSON 的 `true` 和 `1` 被 Python 读成 `True` 和 `1`,
+    而 `True == 1` 为真 —— 布尔字段改成数字会被误当成"变回过"。
+    """
+    return (type(value).__name__, value)
+
+
+def _field_transitions(rows, field: str) -> tuple[int, bool]:
+    """从历史行里读出这个字段"变过几次"和"有没有变回过"
+
+    返回 `(证据条数, 是否变回过)`。
+
+    ## 「变回过」是把取值排成一条序列,看有没有重复
+
+    序列 = 第一次的 before,后面每次的 after。所以
+
+    - `A→B, B→A` 的序列是 `A, B, A` —— A 出现两次,它回来过,是抖动;
+    - `A→B1, B1→B2` 的序列是 `A, B1, B2` —— 三个值各一次,它一路往前,
+      是演进。
+
+    **不能**在遍历时看"当前 before 在不在见过的值里"—— 连续链的接缝
+    必然命中(A→B 之后见过 B,下一条 B→C 的 before 就是 B),那样两段以上
+    的链一律被判成"变回过",等于这个判据根本不干活。接缝在序列里只占
+    **一个**位置,所以必须先把序列拼出来再看重复。
+
+    ## 为什么 LIKE 不能当判据,一定要 parse
+
+    `diff LIKE '%"ip"%'` 会把 `{"geo": {"before": {"ip": ...}}}` 这种**嵌套**
+    同名字段也算进去 —— 那只是别的字段的取值内容。所以 LIKE 现在只当
+    **预筛**:宁可多捞几行(漏掉才是致命的),捞回来的一律 parse,
+    判据由 parse 后的**顶层 key** 决定。预筛里 `%`/`_` 仍是通配符,
+    只会多捞不会少捞,这个方向的宽松是安全的。
+
+    ## 认不出来的行不算证据
+
+    diff 缺失 / 坏 JSON / 结构不对 → 跳过,**不**当成"变回过"。
+    少一条证据 = 少一次抑制 = 多报一次。反过来会把真变化吃掉。
+    """
+    n = 0
+    values: list = []  # 用 list 不用 set:JSON 值可能是 dict/list,不可哈希
+    for row in rows:
+        try:
+            parsed = json.loads(row["diff"]) if row["diff"] else None
+        except (TypeError, ValueError):
+            parsed = None
+        entry = parsed.get(field) if isinstance(parsed, dict) else None
+        if not isinstance(entry, dict) or "before" not in entry or "after" not in entry:
+            log.debug("基线判据:第 %s 行的 diff 里认不出字段 %s,跳过",
+                      row["id"], field)
+            continue
+        n += 1
+        b = _val_identity(entry["before"])
+        # 接缝上的 before 就是上一条的 after,重复记一次会把"继续往前"
+        # 误读成"回来过"(第一版就这么写错了)。但断链时(中间有没记到的
+        # 变更)它是**新出现**的取值,必须补进去,否则后续的回访会漏判。
+        if not values or values[-1] != b:
+            values.append(b)
+        values.append(_val_identity(entry["after"]))
+    # 有过重复取值 = 回来过。用切片而不是 set:值可能不可哈希。
+    came_back = any(v in values[:i] for i, v in enumerate(values))
+    return n, came_back
+
+
 def is_baseline_noise(storage, asset_hash: str, change_type: str,
                       field: str | None = None,
                       threshold: int = DEFAULT_BASELINE_LEARN) -> bool:
     """这个变更是不是"这个资产本来就这样"的基线噪声
 
-    ## 判据
+    ## 判据:两条都要满足
 
-    同一 workspace 里,同一 `asset_hash` + 同一 `change_type` 已经出现过
-    **至少 `threshold` 次**(field 非 None 时再加字段判据),就判为基线 ——
-    这个资产反复变这一项,说明它平时的样子就是会变,再报一次只是噪音。
+    1. 同一 `asset_hash` + `change_type` + `field` 已经变过 **至少
+       `threshold` 次**;
+    2. 历史里这个字段**变回过** —— 某个取值出现过不止一次。
+
+    只看第 1 条会把单向演进一起吃掉(r41 实测修掉的):证书到期日一路
+    往后推、IP 段迁移、DNS 切到新机房,全都是"变了 N 次"却从不停在
+    某个值上,默认阈值 3 意味着第 4 次起就被静默 —— 而那恰恰是最该
+    被看见的东西。加上第 2 条之后:抖动(A→B→A)照常压,演进
+    (A→B1→B2→B3)继续报。
 
     前 `threshold - 1` 次照常上报:刚开始抖的时候没人知道它是抖动,
-    这正是"学习"的含义 —— 连着变够多次才敢下结论。
+    这正是"学习"的含义 —— 连着抖够多次才敢下结论。
+
+    ## 第 2 条为什么问"回来过没有"而不是"取值不超过 2 个"
+
+    三值轮转(A→B→C→A)抖得比两值还厉害,但取值有 3 个 —— 按"不超过
+    2 个"会把它误判成演进,于是永远刷屏。"某个取值出现过不止一次"
+    直接问的就是它回来没有,3 值轮转照样判成抖动。
+
+    ## `field=None` 一律 False
+
+    没有字段就无从判断变没变回过,不构成任何噪声结论。
 
     ## 为什么不新增存储字段
 
@@ -336,24 +417,25 @@ def is_baseline_noise(storage, asset_hash: str, change_type: str,
 
     ## 局限(说在前面)
 
-    - **它只认"变过几次",不认"变回过"。** 一个资产连着 3 次从 A 变到 B,
-      和连着 3 次在 A/B 之间来回,这里判成同一件事。前者其实是真变化。
-    - **阈值是全局的,不 per-asset 学习。** 真正按资产各自的历史长度调
-      阈值要一张新表,那超出这一步的范围。
-    - **只看历史条数,不看时间。** 一年前变过 3 次的资产,今天再变第 4 次
-      仍会被当基线噪声 —— 除非它的 `asset_hash` 变了(那通常意味着重建)。
+    - **只看历史,不看时间。** 一年前抖过 3 次的资产,今天再抖会被当基线;
+      反过来一年前演进过的资产,今天开始真抖也要先攒够次数才学得出来。
+    - **阈值是全局的,不 per-asset 学习。** 按资产各自的历史长度调阈值
+      要一张新表,那超出这一步的范围。
+    - **判据要靠 before/after 快照,只有单边快照的变更学不出来。**
+      `record_change` 允许只传 `after`(NEW_ASSET)或只传 `before`
+      (DISAPPEARED),那类记录没有字段级 diff,一律照报。
     """
-    if threshold <= 0:
+    if threshold <= 0 or field is None:
         return False
-    sql = ("SELECT COUNT(*) FROM asset_changes "
-           "WHERE workspace_id = ? AND asset_hash = ? AND change_type = ?")
-    params: list = [storage.workspace_id, asset_hash, change_type]
-    if field is not None:
-        sql += " AND diff LIKE ?"
-        params.append(f'%"{field}"%')
+    sql = ("SELECT id, diff FROM asset_changes "
+           "WHERE workspace_id = ? AND asset_hash = ? AND change_type = ? "
+           "AND diff IS NOT NULL AND diff LIKE ? ORDER BY id")
+    params: list = [storage.workspace_id, asset_hash, change_type,
+                    f'%"{field}"%']
     with storage._conn() as conn:
-        n = conn.execute(sql, params).fetchone()[0]
-    return int(n) >= int(threshold)
+        rows = conn.execute(sql, params).fetchall()
+    n, came_back = _field_transitions(rows, field)
+    return int(n) >= int(threshold) and came_back
 
 
 def record_change(storage, asset_type: str, change_type: str,
@@ -373,12 +455,13 @@ def record_change(storage, asset_type: str, change_type: str,
     # 拿它当基线不代表整条记录都不值得看,但足以说明这一条会持续刷屏。
     if before and after and baseline_threshold > 0:
         for k in set(before) | set(after):
-            if before.get(k) == after.get(k):
+            if _val_identity(before.get(k)) == _val_identity(after.get(k)):
                 continue
             if is_baseline_noise(storage, asset_hash, change_type, k,
                                  baseline_threshold):
                 log.info(
-                    "record_change: %s/%s 的 %s 已变 %d 次,判为基线噪声,不记",
+                    "record_change: %s/%s 的 %s 变过 %d 次且变回过,"
+                    "判为基线抖动,不记",
                     asset_hash[:12], change_type, k, baseline_threshold)
                 return False
 
@@ -390,7 +473,10 @@ def record_change(storage, asset_type: str, change_type: str,
         for k in keys:
             bv = before.get(k)
             av = after.get(k)
-            if bv != av:
+            # 比身份不比相等:`True == 1`、`False == 0` 在 Python 里为真,
+            # 用 `!=` 判会把「布尔字段改成数字」整条吞掉 —— 变更记了,
+            # diff 却是空的(存成 NULL),基线系统永远看不见它。
+            if _val_identity(bv) != _val_identity(av):
                 diff[k] = {"before": bv, "after": av}
     try:
         with storage._conn() as conn:
