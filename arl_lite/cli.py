@@ -34,6 +34,7 @@ from .core.signal_handler import GracefulShutdown
 from .core.monitor import CHANGE_TYPES, Monitor as _Monitor
 
 _ASSET_TYPES = tuple(_Monitor._ASSET_TABLES)
+_ASSET_TYPES_TO_TABLE = dict(_Monitor._ASSET_TABLES)
 from .modules.registry import discover_modules
 
 log = logging.getLogger("arl_lite.cli")
@@ -625,6 +626,132 @@ def cmd_monitor_enable(args) -> int:
     return 2
 
 
+# 给人看的资产标识:hash 前缀对人没有意义,而身份字段本来就在快照里。
+# 认不出来就回退到 hash —— 宁可难看,也不能什么都不显示。
+_ASSET_LABEL_FIELDS = {
+    "domain": ("domain",),
+    "host": ("host", "ip"),
+    "port": ("ip", "port", "protocol"),
+    "site": ("url",),
+    "finding": ("cve", "title", "description"),
+}
+
+# `diff` 为 NULL 的**正常**情形:这两种变更本来就只有单边快照,没有可比的
+# 另一边。写明白是为了让「本来就没有」和「该有却没存下来」在输出上分得开。
+_SINGLE_SIDED = {
+    "NEW_ASSET": "首次入库,只有 after 快照 —— 本来就没有 before 可比",
+    "DISAPPEARED": "资产消失,只有 before 快照 —— 本来就没有 after 可比",
+}
+
+
+def _row_json(row: dict, key: str) -> dict:
+    """把一行里的 JSON 文本列读成 dict;读不出来就返回空 dict
+
+    读不出来**不抛** —— 展示层因为一条坏数据就整个崩掉,那是拿报表换进程。
+    """
+    raw = row.get(key)
+    if not raw:
+        return {}
+    try:
+        v = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def _change_label(storage, row: dict, cache: dict | None = None) -> str:
+    """这一行是人看的资产标识
+
+    ## 为什么不直接用 hash 前缀
+
+    `68cd3922cdc45da2` 对人没有意义,而身份字段本来就在库里。
+
+    ## 为什么**查表优先**,快照只当兜底
+
+    字段级变更的 `before_value`/`after_value` **只装变动的那一个字段**
+    (`{"ip": "2.2.2.2"}`),里面没有资产身份。只看快照的话,host 的
+    标识会退化成 `ip` —— 而 ip 正是会变的那个字段,于是「标识」每次
+    都跟着变,比给个稳定 hash 还误导人。所以顺序是:表 → 快照 → hash。
+
+    代价:表里是**当前**值,不是变更当时的值。身份字段(host/domain/url)
+    本身是稳定的,所以这不构成问题;真变了的话,变的是被报告的那个字段。
+
+    查不到就往下退,三级都不抛 —— 展示层因为一条坏数据崩掉不值当。
+    """
+    h = row.get("asset_hash", "")
+    at = row.get("asset_type", "")
+    key = (at, h)
+    fields = _ASSET_LABEL_FIELDS.get(at, ())
+    if cache is not None and key in cache:
+        return cache[key]
+
+    def _found(v) -> str:
+        if cache is not None:
+            cache[key] = str(v)
+        return str(v)
+
+    table = _ASSET_TYPES_TO_TABLE.get(at)
+    if table and fields:
+        try:
+            with storage._conn() as conn:
+                got = conn.execute(
+                    f"SELECT {', '.join(fields)} FROM {table} WHERE hash = ?",
+                    (h,)).fetchone()
+            if got:
+                for f in fields:
+                    v = got[f]
+                    if v not in (None, ""):
+                        return _found(v)
+        except Exception:       # noqa: BLE001 - 展示层,查不到就往下退
+            pass
+    for src in ("after_value", "before_value"):
+        payload = _row_json(row, src)
+        for f in fields:
+            v = payload.get(f)
+            if v not in (None, ""):
+                return _found(v)
+    return str(h)[:16]
+
+
+def _change_lines(row: dict) -> list[str]:
+    """一行变更的详情,可能有多行(多字段各一行)
+
+    ## 为什么 NULL 的 diff 要写明白,而不是显示成空
+
+    `NEW_ASSET` / `DISAPPEARED` 只有一个快照,`diff` 是 NULL 是**正常的**。
+    如果只是什么都不显示,那「本来就没有可比的」和「本该存却没存下来」
+    看起来一模一样 —— 后者是 bug,前者是设计。分不开就等于看不见。
+    """
+    raw = row.get("diff")
+    if not raw:
+        ct = row.get("change_type", "")
+        return ["(无字段级 diff:" + _SINGLE_SIDED.get(
+            ct, "这一条本该有 diff 却没存下来 —— 这是异常") + ")"]
+    try:
+        d = json.loads(raw)
+    except (TypeError, ValueError):
+        return ["(diff 解析不出来,原样无法展示)"]
+    if not isinstance(d, dict) or not d:
+        return ["(diff 是空的)"]
+    out = []
+    for field, ch in d.items():
+        if not isinstance(ch, dict) or "before" not in ch or "after" not in ch:
+            out.append(f"{field}: (结构异常,渲染不了)")
+            continue
+        out.append(f"{field}: {_fmt(ch['before'])} → {_fmt(ch['after'])}")
+    return out
+
+
+def _fmt(v) -> str:
+    """一个值怎么印给人看。None 印成 ∅ 而不是 None —— 后者像 bug"""
+    if v is None:
+        return "∅"
+    if v == "":
+        return "(空串)"
+    s = str(v)
+    return s if len(s) <= 60 else s[:57] + "..."
+
+
 def cmd_monitor_changes(args) -> int:
     from .core.monitor import list_changes
     if args.limit is not None and args.limit <= 0:
@@ -632,12 +759,30 @@ def cmd_monitor_changes(args) -> int:
         return 2
     storage = Storage(workspace=args.workspace)
     rows = list_changes(storage, asset_type=args.type, change_type=args.change_type, limit=args.limit)
+    if getattr(args, "json", False):
+        # 机器消费:payload 原样带出去,不经过给人看的那些渲染/截断。
+        # 想要 diff 就自己 parse,想要标签就自己取。
+        cache: dict = {}   # (asset_type, hash) -> 标识
+        print(json.dumps(
+            [{"change_type": r["change_type"], "asset_type": r["asset_type"],
+              "asset_hash": r["asset_hash"],
+              "label": _change_label(storage, r, cache),
+              "detected_at": r.get("detected_at", ""),
+              "before_value": _row_json(r, "before_value"),
+              "after_value": _row_json(r, "after_value"),
+              "diff": _row_json(r, "diff"), "detail": _change_lines(r)}
+             for r in rows], ensure_ascii=False, indent=2))
+        return 0
     if not rows:
         print("[i] no changes")
         return 0
     print(f"[i] {len(rows)} change(s):")
+    cache: dict = {}
     for r in rows:
-        print(f"  [{r['change_type']:18}] {r['asset_type']:10} {r['asset_hash'][:16]} {r.get('detected_at', '')}")
+        print(f"  [{r['change_type']:18}] {r['asset_type']:10} "
+              f"{_change_label(storage, r, cache):32} {r.get('detected_at', '')}")
+        for line in _change_lines(r):
+            print(f"      {line}")
     return 0
 
 
@@ -1182,6 +1327,8 @@ def build_parser() -> argparse.ArgumentParser:
     pmc.add_argument("-c", "--change-type", choices=list(CHANGE_TYPES),
                     help="变更类型")
     pmc.add_argument("-l", "--limit", type=int, default=50, help="最多显示多少条")
+    pmc.add_argument("--json", action="store_true",
+                    help="输出 JSON(payload 原样,供机器消费)")
     pmc.add_argument("-w", "--workspace", help="工作空间名", default="default")
     pmc.set_defaults(func=cmd_monitor_changes)
 
