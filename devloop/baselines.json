@@ -135,13 +135,25 @@
       "gate": "loc_budget",
       "reason": "r44 实现字段级变更检测(资产换 IP/标题/tech/证书 一律不报,实测一个 host 的 IP 来回换 2 次 asset_changes 是 0 条)。净增 33 行:core/monitor.py 的 FIELD_CHANGE_TYPES 契约表与 attach_field_change_sink、db/storage.py 的 _detect_field_changes、core/task_runner.py 的接线,其余是判据说明的文档。关键设计约束:检测必须在 db 层做,因为旧值和新值在同一条 ON CONFLICT DO UPDATE 里就没了,放到上层任何地方都比不出来;而 db 不能依赖 core(架构规则),所以切成 db 只交出 diff、core 解释其含义。这条是资产监控最主要的一类信号,不是膨胀。",
       "round": 45
+    },
+    {
+      "at": "2026-10-03T14:15:35",
+      "changes": {
+        "total_loc": {
+          "from": 14847,
+          "to": 15152
+        }
+      },
+      "gate": "loc_budget",
+      "reason": "r48 给 monitor changes 加了按资产过滤(_ASSET_IDENTITY 单一来源 + --asset 解析 + 删死参数 hash_key),total_loc 14847→15152,超出的 305 行里有相当一部分是把「为什么」写下来的判据注释(工作区作用域那条被自己推翻的说法、port 为什么从右边切、findings 为什么拒绝按名字、假死的 hash_key 是什么)。按协议不为省行删判据文档,走 accept 留痕。",
+      "round": 54
     }
   ],
   "doc_freshness": 0,
   "loc_budget": {
     "devloop_code_loc": 2900,
     "devloop_loc": 2617,
-    "total_loc": 14847
+    "total_loc": 15152
   },
   "no_import_cycle": 0,
   "no_thirdparty_import": 0,

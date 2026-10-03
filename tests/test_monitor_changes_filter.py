@@ -26,13 +26,24 @@
 一份 `_ASSET_LABEL_FIELDS`。现在收进 `_ASSET_IDENTITY` 一张表,
 `add_*` 和 CLI 都走 `compute_asset_hash`,并用测试把两侧的键集合双向钉住。
 
-## 已知没做的(不是忘了,是不该一锅端)
+## 已知没做的(逐条实测过的准确说法,不是「它已经漂了」)
 
-`bulk_insert`(storage.py:802 附近)有**第三份**去重键推导,还是 if-else 链,
-兜底是 `str(i)`(行号)。`fp_bench` / `perf_bench` 是第四、第五份,故意用
-`json.dumps(row, sort_keys=True)` —— 它们要的只是「每行 hash 不重复」,
-不是「hash 恒等于身份」。这三条各有各的理由,混进本轮只会把 diff 撑大,
-已单独立项。
+`bulk_insert`(storage.py:862 附近)有**第三份**去重键推导,还是 if-else 链。
+查完之后的结论:
+
+- 5 种资产类型**实测一致** —— 拿 `bulk_insert` 存的 hash 和契约表算的逐个
+  对过,hosts 连大小写两种都对。所以现在说它「已经漂了」是夸大。
+- 但这份一致性**没有任何东西在守**:`bulk_insert` 生产零调用(r44 已用 AST
+  钉住),所以把它改坏不会有任何测试变红。等哪天有人重新启用它,两条推导
+  就各自漂 —— 而漂了的表现是「按名字过滤返回空」,看起来完全正常。
+- if-else 链的兜底 `str(i)`(行号)实测**走不到**:白名单里 6 张表每一张都有
+  NOT NULL 的身份列,缺列的行在插入那一刻就报 IntegrityError 了(实测:hosts
+  缺 host → `NOT NULL constraint failed: hosts.host`)。所以「hash 依赖行序」
+  这个风险今天**不存在** —— 但那是 NOT NULL 约束的副作用,不是这条兜底写对了。
+  往白名单里加一张没有 NOT NULL 身份列的表,它就会变成真的。
+- `fp_bench` / `perf_bench` 是第四、第五份,故意用
+  `json.dumps(row, sort_keys=True)`:它们要的只是「每行 hash 不重复」,
+  不是「hash 恒等于身份」,所以那不算漂移,别顺手「统一」掉。
 """
 from __future__ import annotations
 
