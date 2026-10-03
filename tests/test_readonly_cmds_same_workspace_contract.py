@@ -59,6 +59,47 @@ MUST_NOT_REJECT = [
     ["tools", "check"],
 ]
 
+# ---- r69:从源码推导,而不是靠手写清单覆盖
+#
+# r68 的判据靠上面那份手写 MUST_REJECT 守住「只读命令必须走工作区校验」。
+# 漏洞实测过:往 cli.py 注入一个**不在清单里**的静默建库只读命令
+# (cmd_probe_new_readonly),判据报 19 passed 一声不响 ——
+# 靠猜的清单会漏,和 r65 建议判据栽的是同一个坑。
+#
+# 推导分两层,第一层实测可靠、第二层实测**不可靠**,如实记着:
+#
+# 1) 「这个命令碰不碰工作区 / 有没有守卫」——可靠。看 cmd_ 函数体里
+#    `_ensure_workspace_exists` 与 `Storage` 谁**先**出现:先守卫的是只读
+#    契约,先 Storage 的是写/建库。实测 20 个碰 Storage 的 cmd_ 被这个
+#    信号干净地分成 10 + 10,零交叉零遗漏。
+#
+# 2) 「它该不该有守卫」——**不可靠**。试过按 SQL 关键字 / 写方法名 /
+#    只读方法名白名单分类,结果 `cmd_watch_add`、`cmd_watch_start` 这类
+#    明明在写的命令被判成「只读+缺守卫」,另有 4 个「判不准」。
+#    真因:写操作都在更深一层(`Monitor(storage).add(...)`、
+#    `Watcher(...)`),只看 cmd_ 函数体看不出来。
+#    按错信号建判据 = 判据比它守的事宽,误报一片,比没有更糟。
+#
+# 所以守门人不是「推导该有哪些」,而是**双向不变量**:
+# 碰工作区的命令,要么有守卫(只读契约),要么出现在下面的例外清单里
+# 且清单里写了理由。新加命令忘了守卫又没登记例外 → 报红。
+EXCEPTIONS = {
+    # 每个例外都必须写清「为什么静默建库是对的」,不许只列名字。
+    # 理由长度下限 10 字符这条判据当场逮到了我自己的敷衍:
+    # 「删除监控是写操作」只有 8 个字,说清了「是什么」却没说清
+    # 「为什么建库是对的」—— 那正是例外清单最容易退化成名字黑名单的地方。
+    "cmd_run": "用户明确要求写入(run 就是建工作区的正路),静默建库合理",
+    "cmd_monitor_add": "新增监控是写操作,用户明确要求写入,建库是副作用",
+    "cmd_monitor_remove": "删除监控是写操作;用户正要动数据,建库无信息损失",
+    "cmd_monitor_enable": "启停监控是写操作,改的是 enabled 标志位",
+    "cmd_monitor_prune": "清理过期监控是写操作,删的是本来就过期的行",
+    "cmd_watch_add": "新增 watch 是写操作,写的是 watch.json 而非工作区",
+    "cmd_watch_start": "启动 watch 调度器是写操作,状态落在 watch 目录",
+    "cmd_workspace_list": "列出工作区本就依赖建出 default(它就是入口命令)",
+    "cmd_workspace_create": "建工作区就是它该干的事,建库是本职",
+    "cmd_workspace_delete": "删工作区是写操作,而且它删的就是工作区本身",
+}
+
 
 def _run(argv, home):
     return subprocess.run(
@@ -74,7 +115,77 @@ def _workspaces_created(home) -> list:
     return sorted(d.name for d in root.iterdir()) if root.exists() else []
 
 
+def _workspace_partition() -> tuple:
+    """从源码推导:每个碰工作区的 cmd_ 属于「有守卫」还是「无守卫」。
+
+    判据看的是**调用顺序**而不是调用集合 —— 顺序即契约:
+    先 `_ensure_workspace_exists` 再 `Storage` 的是只读命令
+    (先确认工作区存在,再读它);先 `Storage` 的是写/建库命令。
+
+    为什么用顺序而不是「调没调」:两者都可能只调一次,顺序能区分
+    「先问再读」和「直接写」。实测这个信号把 20 个碰 Storage 的 cmd_
+    干净地分成 10 + 10,零交叉零遗漏。
+    """
+    src = CLI.read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    guarded, unguarded = set(), set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.FunctionDef) and node.name.startswith("cmd_")):
+            continue
+        first = None
+        for stmt in node.body:          # 只看顶层语句的顺序
+            for c in ast.walk(stmt):
+                if not isinstance(c, ast.Call):
+                    continue
+                nm = (c.func.id if isinstance(c.func, ast.Name)
+                      else getattr(c.func, "attr", None))
+                if nm in ("_ensure_workspace_exists", "Storage"):
+                    first = nm
+                    break
+            if first:
+                break
+        if first is None:
+            continue
+        (guarded if first == "_ensure_workspace_exists" else unguarded).add(node.name)
+    return guarded, unguarded
+
+
 # ---------------------------------------------------------------- 源码头
+
+
+def test_every_workspace_command_is_guarded_or_registered():
+    """r69 的守门人:碰工作区的命令,要么有守卫,要么在例外清单里并写了理由。
+
+    这条替代了 r68 那份手写 MUST_REJECT 的守门作用 ——
+    注入一个不在清单里的新只读命令时,这条会报红(实测注入时它确实红了,
+    而 r68 的 19 条全绿)。
+    """
+    guarded, unguarded = _workspace_partition()
+    assert guarded, "推导不出任何有守卫的命令 —— 推导逻辑坏了"
+    unregistered = sorted(unguarded - set(EXCEPTIONS))
+    assert not unregistered, (
+        "这些命令碰工作区却既没有 _ensure_workspace_exists 守卫、"
+        f"也没登记为例外:{unregistered}。"
+        "只读命令必须走守卫(否则零工作区下静默建库,用户分不清"
+        "数据是真没了还是被初始化了);写操作可以静默建库,但要在 "
+        "EXCEPTIONS 里写清理由。"
+    )
+    stale = sorted(set(EXCEPTIONS) - unguarded)
+    assert not stale, (
+        f"EXCEPTIONS 里这些条目已经不需要例外了(它们有守卫了):{stale}。"
+        "留着会让例外清单慢慢变成藏污纳垢的地方"
+    )
+
+
+def test_every_exception_states_why():
+    """例外清单的每一条都必须写清理由,不许只列名字。
+
+    没有这条,EXCEPTIONS 会退化成一张「名字黑名单」——
+    而 r63 立过「禁用词表这种写法本身就是洞」:没人知道为什么,
+    下一个进来的人只会照抄。判据要盯不变量,别盯名字列表。
+    """
+    for name, why in EXCEPTIONS.items():
+        assert len(why) >= 10, f"{name} 的例外理由太短({why!r}),看不出为什么"
 
 
 def test_the_readonly_list_matches_the_source():
@@ -203,4 +314,4 @@ def test_no_empty_or_passing_tests_in_this_file():
         if not body:
             empty.append(f"{node.name}:{node.lineno}")
     assert not empty, f"这些测试没有断言:{empty}"
-    assert len(seen) == 7, f"本文件应当有 7 个测试函数,实测 {len(seen)}:{sorted(seen)}"
+    assert len(seen) == 9, f"本文件应当有 9 个测试函数,实测 {len(seen)}:{sorted(seen)}"
