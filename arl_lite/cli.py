@@ -677,6 +677,9 @@ def _change_label(storage, row: dict, cache: dict | None = None) -> str:
     本身是稳定的,所以这不构成问题;真变了的话,变的是被报告的那个字段。
 
     查不到就往下退,三级都不抛 —— 展示层因为一条坏数据崩掉不值当。
+    但「退」不等于「闷着」:行不存在是正常的(资产可能已删),静默;
+    **SQL 报错**(标识列名写错 / 表没了)要 `log.warning` —— 实测过这条
+    退化路径,旧代码的 `except: pass` 让它零警告地退化成 hash。
     """
     h = row.get("asset_hash", "")
     at = row.get("asset_type", "")
@@ -697,13 +700,22 @@ def _change_label(storage, row: dict, cache: dict | None = None) -> str:
                 got = conn.execute(
                     f"SELECT {', '.join(fields)} FROM {table} WHERE hash = ?",
                     (h,)).fetchone()
-            if got:
-                for f in fields:
-                    v = got[f]
-                    if v not in (None, ""):
-                        return _found(v)
-        except Exception:       # noqa: BLE001 - 展示层,查不到就往下退
-            pass
+        except Exception as e:      # noqa: BLE001
+            # 静默降级比降级本身更坏。实测:标识列名写错 → SQL 抛
+            # OperationalError → 旧的 `except: pass` 全吞 → 输出退化成
+            # hash 前缀,全程零警告,用户只会以为「标识本来就长这样」。
+            # 注意这和「行不存在」(`got is None`)是两回事:后者是正常
+            # 的(资产可能已删),走下面的快照兜底,不算异常。
+            log.warning(
+                "monitor changes: 读 %s 的标识列 %s 失败(%s: %s),"
+                "标识回退到快照/hash —— 列名写错或表结构变了?",
+                table, ", ".join(fields), type(e).__name__, e)
+            got = None
+        if got:                      # None = 行不存在,正常,静默往下退
+            for f in fields:
+                v = got[f]
+                if v not in (None, ""):
+                    return _found(v)
     for src in ("after_value", "before_value"):
         payload = _row_json(row, src)
         for f in fields:
