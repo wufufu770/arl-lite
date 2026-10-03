@@ -2786,7 +2786,7 @@ def save_state(state: dict, path: str) -> None:
 | `arl-lite devloop round` | 跑一整轮并落盘;门禁红则记 `DONE_WITH_FAILURES`,退出码 3 |
 | `arl-lite devloop plan` | 只做规划,看下一步 |
 | `arl-lite devloop history -n 10` | 最近 N 轮的通过/失败明细 |
-| `arl-lite devloop add <id> "标题" -p 2` | 手动加待办 |
+| `arl-lite devloop add <id> "标题" --priority 2` | 手动加待办 |
 | `arl-lite devloop gate <name>` | 跑单个门禁并打印实测值 |
 | `arl-lite devloop accept <name> --reason "..."` | 门禁红了且确认可放宽时,显式提升 baseline(见 5.5) |
 | `arl-lite devloop promotions` | 看 baseline 提升历史(来自 `_promotions`) |
