@@ -445,6 +445,94 @@ class Loop:
         """
         return f"round-pid-{os.getpid()}"
 
+    def _git(self, *args: str):
+        """跑一条 git。**判断不了**(超时 / 系统错)时返回 `None`。
+
+        返回 `CompletedProcess` 时 `returncode` 才有意义,调用方必须自己
+        分开看:0 = 成功,非 0 = git 自己拒绝了(`_git_commits_between`
+        还要再分一次「拒绝」是哪种)。
+        """
+        try:
+            return subprocess.run(["git", *args], cwd=self.repo,
+                                  capture_output=True, text=True, timeout=5)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+
+    def _git_commits_between(self, start: float,
+                             end: float | None = None) -> bool | None:
+        """窗口 `[start, end]` 里仓库有没有提交过。**判断不了时返回 None**。
+
+        ## 为什么是三态
+
+        `None` 不是 `False`:非 git 仓库、git 超时,和「确实没有提交」
+        必须分得开。把「测不出」当成「没干活」,就是拿一次测量失败去
+        触发退路 —— r22 那条教训的同一个形状。
+
+        ## 为什么 `--since` 只当预筛
+
+        git 的 `--since` 只精确到**秒**。窗口起点正好压在某个提交所在的
+        那一秒时,取不取得到那个提交全看运气。所以预筛拉宽一秒,真正的
+        判定在 Python 里拿 `%ct` 的整秒时间戳做闭区间比较。预筛只可能
+        多拉,不可能漏拉。
+
+        ## 空仓库 vs 不是仓库
+
+        `git log` 在这两种情况下都返回 128(「尚无任何提交」/「不是
+        git 仓库」)。分错了就等于**给一个空仓库关掉退路这层保险** ——
+        而「一个从没提交过东西的仓库」恰恰是最该退路的情况。
+
+        审计(`audit_prev_round_commits`)和 barren 补判
+        (`judge_prev_round_barren`)共用这一个窗口、这一份查询,免得
+        两处的判据悄悄漂移。
+        """
+        end = time.time() if end is None else end
+        r = self._git("log", f"--since={int(start) - 1}", "--pretty=%ct")
+        if r is None:
+            return None
+        if r.returncode != 0:
+            probe = self._git("rev-parse", "--git-dir")
+            return False if probe is not None and probe.returncode == 0 else None
+        # 边界上宁可宽松:把同一秒的提交算进来 → 判成「有产出」→ 不退路;
+        # 反过来严一点就可能因为差一秒判成没产出,那正是本轮要修的误退路。
+        lo, hi = int(start), int(end)
+        return any(lo <= int(t) <= hi for t in r.stdout.split() if t.strip())
+
+    def judge_prev_round_barren(self, state: LoopState) -> tuple[int, bool, int]:
+        """给**上一轮**补判 barren,返回 `(barren_delta, barren_reset, judged_round)`。
+
+        ## 为什么必须延迟一轮判
+
+        窗口是在两轮**之间**闭合的,而 `devloop done-item` 交的活正好
+        发生在那个间隙里 —— 它落盘那一刻,本轮的窗口还开着。原来在
+        `commit_round` 里当场判(`result == NOOP 就 +1`),判的是
+        「`round()` 有没有领到条目」,不是 state.json 里注释承诺的
+        「连续无净增量的轮数」。
+
+        r43 用真实历史验过:44 轮里 8 个 NOOP 轮,**7 个窗口内是有提交的**
+        (`28ba6e3` / `d22e311` 那类),全被记成 barren。后果实测在 r42:
+        退路在有产出的连跑上触发,那一轮 0.0 秒返回,**门禁没跑、队列没播种**。
+
+        ## 判据
+
+        上一轮是 NOOP **且**它的窗口里仓库没动过 → barren(+1);
+        否则清零(reset)。判断不了时**不判**——宁可多干活,
+        也不因为测不出就退路。
+        """
+        hist = self.store.load().history
+        if not hist:
+            return 0, False, 0
+        prev = hist[-1]
+        if state.barren_judged_round >= prev.round:
+            return 0, False, 0        # 判过了,别重复计
+        if prev.result != RESULT_NOOP:
+            return 0, True, prev.round
+        barren = self._git_commits_between(prev.started_at)
+        if barren is None:        # 判断不了:不判,也不清零
+            return 0, False, prev.round
+        if barren:                # 窗口里有产出 → 连续计数清零
+            return 0, True, prev.round
+        return 1, False, prev.round
+
     def audit_prev_round_commits(self, now: float | None = None) -> str | None:
         """回看上一轮:它报完成之后,仓库里真的有过提交吗?
 
@@ -477,16 +565,9 @@ class Loop:
                 or not start):
             return None
         end = time.time() if now is None else now
-        try:
-            r = subprocess.run(
-                ["git", "log", "--since", str(int(start)), "--until", str(int(end)),
-                 "--pretty=%H"],
-                cwd=self.repo, capture_output=True, text=True, timeout=5,
-            )
-        except (subprocess.TimeoutExpired, OSError):
-            return None
-        # returncode 非 0 = 判断不了(非 git 仓库);有输出 = 有提交,没问题
-        if r.returncode != 0 or r.stdout.strip():
+        # 有提交 = 没问题;判断不了(非 git 仓库 / 超时)= 同样不报。
+        # 只有「确确实实一个提交都没有」才是问题。
+        if self._git_commits_between(start, end) is not False:
             return None
         return (f"第 {prev['round']} 轮报 {prev['result']},但从它开始"
                 f"({int(start)})到现在仓库没有任何提交")
@@ -532,6 +613,10 @@ class Loop:
         if audit := self.audit_prev_round_commits():
             messages.append(f"[audit] {audit}")
 
+        # r43:给上一轮补判 barren。必须在退路检查**之前** —— 退路读的就是
+        # 这个计数,而上一轮到底有没有产出,只有到这一轮开始才判得出来。
+        b_delta, b_reset, b_judged = self.judge_prev_round_barren(state)
+
         # 退路优先:已经 barren 到底了,这轮不干活先摊牌
         if state.barren_rounds >= RETREAT_THRESHOLD:
             r = self.phase_retreat(state)
@@ -540,7 +625,8 @@ class Loop:
             record.note = r.detail
             messages.append(r.detail)
             self.store.commit_round(state, record, done_delta=0, log_mark=log_mark,
-                                    retreat_delta=1)
+                                    retreat_delta=1, barren_reset=True,
+                                    barren_judged_round=b_judged)
             return RoundOutcome(record, retreated=True, messages=messages)
 
         # 1. 取待办
@@ -748,7 +834,9 @@ class Loop:
         nxt = q2.next()
         # 拿回锁内重放后的最新状态,否则 round 结束时 state.round 仍是
         # 旧值(commit_round 现在是在最新状态上 +1,不再回写调用方那份)
-        state = self.store.commit_round(state, record, done_delta, log_mark)
+        state = self.store.commit_round(state, record, done_delta, log_mark,
+                                       barren_delta=b_delta, barren_reset=b_reset,
+                                       barren_judged_round=b_judged)
 
         return RoundOutcome(
             record,

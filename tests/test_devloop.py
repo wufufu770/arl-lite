@@ -104,24 +104,40 @@ class TestBarrenAndRetreat(unittest.TestCase):
         self.lp = Loop(REPO, state_dir=self.d)
 
     def test_barren_accumulates_and_resets(self):
-        s = self.lp.status()
-        for _ in range(2):
-            rec = RoundRecord(started_at=1.0)
-            rec.result = RESULT_NOOP
-            self.lp.store.commit_round(s, rec)
-        self.assertEqual(s.barren_rounds, 2)
+        """r43:落盘不再当场判 barren,判定搬到了下一轮开始时
 
+        原来这里连着 `commit_round` 三次 NOOP 就期望 `barren_rounds`
+        往上涨 —— 验的其实是「`round()` 有没有领到条目」。可窗口在
+        落盘那一刻还没闭合,`devloop done-item` 交的活看不见,
+        于是 r42 在一段有产出的连跑上退了路(那一轮 0.0 秒,门禁没跑)。
+
+        这里只钉住「落盘不再自己判」—— 它不依赖 git,判定稳定。
+        计数怎么攒、怎么清零的判别力测试在
+        `tests/test_barren_counter_sees_done_item.py`,那里用临时
+        git 仓库:拿真仓库测的话,「这一秒有没有提交」取决于外面
+        有没有人在提交,那条测试就会变成永远绿的。
+        """
+        s = self.lp.status()
         rec = RoundRecord(started_at=1.0)
-        rec.result = RESULT_DONE
+        rec.result = RESULT_NOOP
         self.lp.store.commit_round(s, rec)
-        self.assertEqual(s.barren_rounds, 0, "有效轮次应重置 barren 计数")
+        self.assertEqual(
+            s.barren_rounds, 0,
+            "落盘不该再自己判 barren —— 窗口那时还没闭合")
 
     def test_retreat_triggers(self):
+        """连续空转到底要退路 —— 不变式 3,r43 不能把它改没
+
+        `barren_judged_round` 预置成最新一轮,是为了让补判**跳过**它们:
+        这条验的是「计数到顶就退路」这段接线,计数怎么攒的不归它管。
+        """
         s = self.lp.status()
         for _ in range(RETREAT_THRESHOLD):
             rec = RoundRecord(started_at=1.0)
             rec.result = RESULT_NOOP
-            self.lp.store.commit_round(s, rec)
+            s = self.lp.store.commit_round(s, rec, barren_delta=1,
+                                           barren_judged_round=s.round + 1)
+        self.assertEqual(s.barren_rounds, RETREAT_THRESHOLD)
 
         out = self.lp.round(only_gates=["no_import_cycle"])
         s2 = self.lp.status()

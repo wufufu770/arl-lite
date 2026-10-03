@@ -111,11 +111,23 @@
       "gate": "loc_budget",
       "reason": "r32 给 queue.py 里 5 个此前无锁的方法加 file_lock:add / seed_if_empty / repair_duplicates / drop / unmark。AST 审计(queue.py 全部类方法,判据=方法体同时有 self.load() 与 self.save() 且无 with self._locked)发现它们是裸 load→改→save 的整份写回;claim/release/finish/recover_stale 四个本就带锁。其中 drop 最要紧 —— r22 确立「人的显式指令被静默覆盖,比队列空掉更坏」,而人的显式指令正是走 devloop drop,它却在一个不互斥的临界区里,并发时人写的丢弃理由可能被整份覆盖抹掉。净增 68 行锁包装。",
       "round": 30
+    },
+    {
+      "at": "2026-10-03T12:04:06",
+      "changes": {
+        "devloop_code_loc": {
+          "from": 2800,
+          "to": 2900
+        }
+      },
+      "gate": "loc_budget",
+      "reason": "r43 修退路机制的误触发:barren 计数原本在 commit_round 里当场判(只数 round() 有没有领到条目),而窗口是在两轮之间闭合的,devloop done-item 交的活落盘那一刻还没发生。r42 实测 8 个 NOOP 轮里 7 个窗口内有提交,退路在有产出的连跑上触发,那一轮 0.0 秒返回、门禁没跑、队列没播种。判据改成下一轮开始时补判(judge_prev_round_barren),并抽出 _git/_git_commits_between 共用审计与补判的同一份三态查询(顺带修好 git log 对空仓库和非仓库都返回 128 导致退路这层保险被关掉的问题)。净增 33 行,含 40 余行判据说明的文档 —— 退路是协议最关键的一道保险,它的判据写清楚比省 33 行重要。",
+      "round": 44
     }
   ],
   "doc_freshness": 0,
   "loc_budget": {
-    "devloop_code_loc": 2800,
+    "devloop_code_loc": 2900,
     "devloop_loc": 2617,
     "total_loc": 14514
   },

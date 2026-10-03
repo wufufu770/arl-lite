@@ -122,6 +122,9 @@ class LoopState:
     # 退路机制:连续无净增量的轮数
     barren_rounds: int = 0
     retreats: int = 0
+    # r43:barren 改成下一轮开始时补判,这个字段记「已经补判到哪一轮」,
+    # 防止同一个轮次被重复计数(每轮都判一次的话计数会飞)。
+    barren_judged_round: int = 0
 
     # 累计指标
     total_gates_passed: int = 0
@@ -146,6 +149,7 @@ class LoopState:
             "started_at": self.started_at,
             "updated_at": self.updated_at,
             "barren_rounds": self.barren_rounds,
+            "barren_judged_round": self.barren_judged_round,
             "retreats": self.retreats,
             "total_gates_passed": self.total_gates_passed,
             "total_gates_failed": self.total_gates_failed,
@@ -296,7 +300,9 @@ class StateStore:
 
     def commit_round(self, state: LoopState, record: RoundRecord,
                      done_delta: int = 0, log_mark: int = 0,
-                     retreat_delta: int = 0) -> LoopState:
+                     retreat_delta: int = 0, barren_delta: int = 0,
+                     barren_reset: bool = False,
+                     barren_judged_round: int = 0) -> LoopState:
         """结束一轮:累加指标、记历史、判退路。
 
         ## r30:在**刚读到的**状态上重放,而不是写回调用方那份旧快照
@@ -324,6 +330,9 @@ class StateStore:
                 `state.gate_log[log_mark:]` 才是**本轮**新增的日志 ——
                 不划这一刀的话,连历史日志都会再追加一遍。
             retreat_delta: 本轮退路次数(0 或 1),同上。
+            barren_delta: 上一轮补判出的 barren 增量(r43 新增)。
+            barren_reset: 上一轮有产出,连续 barren 计数归零。
+            barren_judged_round: 已经补判过的最后一轮,防止每轮重复计。
         """
         record.finished_at = time.time()
         pending_log = list(state.gate_log[log_mark:])
@@ -337,11 +346,19 @@ class StateStore:
             st.items_done += done_delta
             st.retreats += retreat_delta
             st.history.append(record)
-            # 退路(RETREATED)不是 NOOP,这一行同时把 barren 归零,
-            # 正是 phase_retreat 原来手工做的 state.barren_rounds = 0
-            st.barren_rounds = (
-                st.barren_rounds + 1 if record.result == RESULT_NOOP else 0
-            )
+            # r43:barren 不在这里判了。
+            # 原来这一行是 `result == NOOP 就 +1`,可窗口是在两轮**之间**
+            # 闭合的 —— `devloop done-item` 交的活在落盘那一刻还没发生。
+            # r43 实测 44 轮里 8 个 NOOP 轮有 7 个窗口内是有提交的,全被
+            # 记成 barren,退路于是在有产出的连跑上触发(r42:那轮 0.0 秒,
+            # 门禁都没跑,队列还是空的)。判定改由调用方在**下一轮**开始时
+            # 补判,结果经这三个参数显式带进来 —— 和上面几个 delta 一样,
+            # 不能指望"反正都会存"。
+            if barren_reset:
+                st.barren_rounds = 0
+            else:
+                st.barren_rounds = max(0, st.barren_rounds + barren_delta)
+            st.barren_judged_round = max(st.barren_judged_round, barren_judged_round)
             st.phase = PHASE_IDLE
             st.gate_log = (st.gate_log + pending_log)[-MAX_GATE_LOG:]
 
