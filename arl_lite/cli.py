@@ -1195,8 +1195,56 @@ def cmd_tools_list(args) -> int:
     return 0
 
 
+def _resolve_bench_out(args, default_path: str) -> tuple:
+    """两个 bench 共用:决定报告往哪写,以及**要不要写**。
+
+    ## 为什么默认不写
+
+    默认路径 `docs/PERF_BASELINE.md` / `docs/FP_RATE.md` 是**版本库里已提交的
+    文件**(`git ls-files` 确认)。早先这里直接 `write_report(默认路径)`,
+    于是任何人跑一次 `arl-lite perf-bench --scale small` 就会把 medium 档的
+    基线整表换成 small 档 —— 退出码 0,一句提示都没有,而 `git diff` 出来是一张
+    看起来完全正常的表格。最要命的是 `core/perf_bench.py` 的用法段**自己**
+    写着「`arl-lite perf-bench --scale small` 快速冒烟」:照文档走就毁基线。
+
+    所以安全默认值取「什么都不做」:不写,说清为什么不写、怎么才能写,退出码非 0。
+    数字照样打在 stdout(测量本身没白做),毁的是文件不是信息。
+    写完再警告等于已经毁了 —— 和 r53 那次「max(0) 把丢失夹成 0」是同一个形状,
+    顺序不能反。
+
+    返回 (路径 or None, 旧档位 or None, 是否显式 --in-place)。
+    """
+    from pathlib import Path as _P
+
+    explicit = (getattr(args, "out", "") or "").strip()
+    if explicit:
+        return _P(explicit), None, False
+    if not getattr(args, "in_place", False):
+        return None, None, False
+    path = _P(default_path)
+    old_scale = None
+    if path.exists():
+        # 读旧基线记的档位,只在规模档这一层做对照 —— 别的行随实现演进会变,
+        # 拿它们做 diff 只会天天误报。
+        for line in path.read_text(encoding="utf-8").splitlines()[:8]:
+            if "规模档" in line:
+                parts = line.split("**")
+                if len(parts) >= 2:
+                    old_scale = parts[1]
+                break
+    return path, old_scale, True
+
+
+def _refuse_to_clobber(default_path: str) -> None:
+    print(f"[!] 未写入 {default_path} —— 那是版本库里已提交的基线,默认不覆盖。",
+          file=sys.stderr)
+    print("    要写到别处:  --out <路径>", file=sys.stderr)
+    print(f"    确定要覆盖它: --in-place", file=sys.stderr)
+    print("    (档位不同的覆盖会另外提示 —— 不同规模的数字不可比)", file=sys.stderr)
+
+
 def cmd_perf_bench(args) -> int:
-    """跑核心流水线性能基线,产出 docs/PERF_BASELINE.md
+    """跑核心流水线性能基线,默认只测不写;要写得显式说。
 
     全程离线且不碰网络:负载是按真实 schema 形状合成的数据,
     测的是存储写入 / 规则引擎 / 置信度 / 风险打分这四段。
@@ -1205,15 +1253,15 @@ def cmd_perf_bench(args) -> int:
     默认跑 3 次取中位数 —— 单次测量会被 GC 和磁盘缓存干扰,
     那种抖动画进趋势线只会误导下一个人。
     """
-    from pathlib import Path as _P
     from .core import perf_bench as pb
 
     scale = getattr(args, "scale", "medium") or "medium"
     repeat = int(getattr(args, "repeat", 3) or 3)
     rep = pb.run_repeated(scale=scale, repeat=repeat)
 
-    out = _P(args.out) if getattr(args, "out", "") else _P("docs/PERF_BASELINE.md")
-    pb.write_report(out, rep)
+    out, old_scale, in_place = _resolve_bench_out(args, "docs/PERF_BASELINE.md")
+    if out is None:
+        _refuse_to_clobber("docs/PERF_BASELINE.md")
 
     print(f"[i] scale={rep.scale}  repeat={repeat}  "
           f"{rep.total_rows} 行  {rep.total_seconds:.2f}s  "
@@ -1222,6 +1270,16 @@ def cmd_perf_bench(args) -> int:
     for p in sorted(rep.phases, key=lambda x: -x.seconds)[:5]:
         rps = f"{p.rows_per_sec:,.0f} 行/s" if p.rows_per_sec else "-"
         print(f"   {p.name:36s} {p.seconds:7.3f}s  {rps}")
+
+    if out is None:
+        return 2
+    if in_place and old_scale and old_scale != rep.scale:
+        # 只警告不拦:有人可能就是要换档重设基线(比如团队固定跑 small)。
+        # 拦死会逼人改去手写文件,那更糟。但必须喊出来 —— 规模不同的数字
+        # 和原基线不可比,这是基线存在的意义。
+        print(f"[!] 旧基线是 {old_scale} 档,这次是 {rep.scale} 档 —— "
+              f"两者不可比,趋势线会断。", file=sys.stderr)
+    pb.write_report(out, rep)
     print(f"[+] 报告已写入 {out}")
     return 0
 
@@ -1231,14 +1289,14 @@ def cmd_fp_bench(args) -> int:
 
     全程离线:样本是人工构造的受控数据,不需要真实目标、不需要网络。
     """
-    from pathlib import Path as _P
     from .core import fp_bench as fb
 
     results = fb.run_bench()
     rep = fb.analyze(results)
 
-    out = _P(args.out) if getattr(args, "out", "") else _P("docs/FP_RATE.md")
-    fb.write_report(out, rep)
+    out, _, _ = _resolve_bench_out(args, "docs/FP_RATE.md")
+    if out is None:
+        _refuse_to_clobber("docs/FP_RATE.md")
 
     print(f"[i] {len(results)} case(s) run, rules={len(rep.per_rule)}")
     print(f"[i] 误报率 {rep.fp_rate:.1%} ({rep.total_fp}/{rep.total_opportunities})"
@@ -1250,10 +1308,14 @@ def cmd_fp_bench(args) -> int:
             print(f"  FN {r.case.name}: {', '.join(sorted(r.false_negatives))}")
         if r.error:
             print(f"  !! {r.case.name}: {r.error}")
-    print(f"[+] report written to {out}")
     # 崩掉的样本必须让命令失败 —— 少跑几个样本却报 0% 误报率,
     # 比误报本身更危险
-    return 1 if any(r.error for r in results) else 0
+    failed = any(r.error for r in results)
+    if out is None:
+        return 1 if failed else 2
+    fb.write_report(out, rep)
+    print(f"[+] report written to {out}")
+    return 1 if failed else 0
 
 
 def cmd_notify_test(args) -> int:
@@ -1605,17 +1667,25 @@ def build_parser() -> argparse.ArgumentParser:
     # fp-bench(离线误报率基准)
     pfb = sub.add_parser(
         "fp-bench",
-        help="离线跑规则集误报率基准,产出 docs/FP_RATE.md",
+        help="离线跑规则集误报率基准(默认只测不写,加 --in-place 才写 docs/FP_RATE.md)",
     )
-    pfb.add_argument("--out", default="", help="报告输出路径(默认 docs/FP_RATE.md)")
+    pfb.add_argument("--out", default="", help="报告输出路径(不给就不写)")
+    pfb.add_argument(
+        "--in-place", action="store_true",
+        help="显式允许覆盖已提交的 docs/FP_RATE.md",
+    )
     pfb.set_defaults(func=cmd_fp_bench)
 
     # perf-bench(核心流水线性能基线)
     ppb = sub.add_parser(
         "perf-bench",
-        help="跑核心流水线性能基线,产出 docs/PERF_BASELINE.md",
+        help="跑核心流水线性能基线(默认只测不写,加 --in-place 才写 docs/PERF_BASELINE.md)",
     )
-    ppb.add_argument("--out", default="", help="报告输出路径(默认 docs/PERF_BASELINE.md)")
+    ppb.add_argument("--out", default="", help="报告输出路径(不给就不写)")
+    ppb.add_argument(
+        "--in-place", action="store_true",
+        help="显式允许覆盖已提交的 docs/PERF_BASELINE.md(档位不同会另外警告)",
+    )
     ppb.add_argument(
         "--scale", default="medium", choices=["small", "medium", "large"],
         help="数据规模档(默认 medium)",

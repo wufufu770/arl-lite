@@ -22,9 +22,14 @@
 
 ## 用法
 
-    arl-lite perf-bench                  # 跑标准规模,输出 markdown
+    arl-lite perf-bench                  # 跑标准规模,**只测不写**,数字打在 stdout
     arl-lite perf-bench --scale small   # 快速冒烟(档位是 small/medium/large)
     arl-lite perf-bench --repeat 3       # 取 3 次的中位数,抗抖动
+    arl-lite perf-bench --out /tmp/p.md  # 写到别处
+    arl-lite perf-bench --in-place       # 确定要覆盖已提交的性能基线时才用
+
+默认**不写** `docs/PERF_BASELINE.md`:那是版本库里已提交的基线,
+一次 `--scale small` 冒烟就足以把 medium 档的整表换掉,而且退出码是 0。
 """
 from __future__ import annotations
 
