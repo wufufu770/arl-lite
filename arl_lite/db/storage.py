@@ -179,6 +179,8 @@ class Storage:
     """
 
     def __init__(self, workspace: str = "default", workspace_root: Path | None = None):
+        # 「字段变了」回调,由 core 层注册(db 不认识 core,见分层规则)
+        self._on_field_change = None
         # 拒绝路径穿越 / 绝对路径
         if not workspace or not workspace.strip():
             raise ValueError("workspace name must not be empty")
@@ -651,8 +653,12 @@ class Storage:
         update_clause = ", ".join(sets)
 
         with self._conn() as conn:
+            # `SELECT *` 而不是 `SELECT 1`:这一行本来就是「看这个 hash 在不在」,
+            # 顺手把旧行取出来就够 —— **旧行就是上一轮扫描的状态**,字段级变更
+            # 检测的快照因此不需要新表(r44 实测:加 `SELECT *` 不增加往返次数,
+            # 同一句查询而已)。
             existing = conn.execute(
-                f"SELECT 1 FROM {table} WHERE hash = ?", (asset_hash,)
+                f"SELECT * FROM {table} WHERE hash = ?", (asset_hash,)
             ).fetchone()
             conn.execute(
                 f"""INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})
@@ -661,9 +667,57 @@ class Storage:
             )
             if existing:
                 log.debug(f"upsert: {table} hash={asset_hash} first_seen kept, refreshed")
+                changes = self._detect_field_changes(existing, fields,
+                                                    text_cols, plain_cols)
+                if changes and self._on_field_change is not None:
+                    try:
+                        self._on_field_change(table, existing["hash"], changes)
+                    except Exception as e:      # noqa: BLE001 - 旁路,不能拖垮入库
+                        log.warning("field change not recorded (%s): %s", table, e)
                 return False
             log.debug(f"upsert: {table} hash={asset_hash} (new insert)")
             return True
+
+    def _detect_field_changes(self, old, fields: dict,
+                              text_cols, plain_cols) -> dict:
+        """这次 upsert 真的改动了哪些字段 —— **只回答「变了什么」**
+
+        ## 判据必须和上面那句 UPDATE 一致
+
+        TEXT 类字段的 UPDATE 是 `COALESCE(NULLIF(new, ''), old)` ——
+        **空值不覆盖旧值**。所以新值为空时存着的值没变,不算。
+        判据若直接比新旧值,一次采集失败(模块超时、解析不出来)
+        就会刷出一整片「这个资产的 IP 被清空了」的假告警。
+
+        ## 比身份不比相等
+
+        `True == 1` 在 Python 里为真,`!=` 会把「布尔字段改成数字」
+        整条吞掉 —— 变更记了,却没人看得见。
+
+        ## 这个方法不知道「变了」意味着什么
+
+        哪个字段对应哪种变更类型、要不要算基线噪声,那是 core 层的
+        知识。`db` 不 import `core`(见 tests/test_architecture.py 的
+        分层规则),所以它只交出 diff,由 `set_field_change_sink`
+        注册进来的回调去解释。
+        """
+        out = {}
+        for k, new in fields.items():
+            if k not in plain_cols and k not in text_cols:
+                continue
+            old_v = old[k] if k in old.keys() else None
+            effective = new if (k in plain_cols or new) else old_v
+            if (type(effective).__name__, effective) != (type(old_v).__name__, old_v):
+                out[k] = {"before": old_v, "after": effective}
+        return out
+
+    def set_field_change_sink(self, fn) -> None:
+        """注册「字段变了」的回调(生产路径由 core.task_runner 接上)
+
+        没注册就只是不记变更,不会报错 —— 采集照常进行。字段级检测
+        是**旁路**:它挂了不能拖垮入库,没挂也不该拦住入库。
+        """
+        self._on_field_change = fn
 
     # ---------- 批量入库(Phase 7 性能优化)----------
 

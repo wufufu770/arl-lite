@@ -21,9 +21,46 @@ from datetime import datetime, timedelta
 
 log = logging.getLogger("arl_lite.core.monitor")
 
-# 变更类型。schema 注释里列了 6 种,目前实现 2 种——
-# 其余(TITLE_CHANGED 等)需要字段级快照对比,不在本轮范围内。
-CHANGE_TYPES = ("NEW_ASSET", "DISAPPEARED")
+# 变更类型 = **本模块产得出什么**(r42 起它不再是一份死文档)。
+# schema 注释里的 6 种是「这张表能存什么」,两者刻意不相等:
+# 按词表校验等于「注释里写过」就当「实现了」。
+#
+# `ADDRESS_CHANGED` 是 r44 加的第 7 种,schema 注释已同步更新 ——
+# 资产换了 IP 是资产监控最主要的变化之一,原先 6 种里没有任何一种
+# 能诚实地描述它(它是 STATUS_CHANGED?还是 TECH_CHANGED?都不对)。
+# 与其塞进一个勉强的类别,不如加一个真的。
+CHANGE_TYPES = (
+    "NEW_ASSET", "DISAPPEARED",
+    "ADDRESS_CHANGED", "TITLE_CHANGED", "TECH_CHANGED",
+    "FINGERPRINT_CHANGED", "STATUS_CHANGED",
+)
+
+# 字段 → 变更类型。**这张表就是契约**:没列在这里的可变字段,变了也不报。
+#
+# 为什么不给全部可变字段都配一个类型:
+# - `cert_expired` / `cert_days_left` 是**随时间算出来的**,不是资产变了。
+#   `cert_days_left` 每过一天就少 1,`cert_expired` 到期就翻面 —— 全报的话
+#   每轮扫描刷一条,那是拿噪音换覆盖面。
+# - `findings.*`(description / evidence / cve / reference_url / severity)
+#   基本是写入一次就不再变的产物字段,变了通常意味着换了数据源而不是
+#   资产变了。
+# 这两类都明写在这里,是为了让「为什么它不报」是个能查的决定,
+# 不是一条谁也看不见的静默。
+FIELD_CHANGE_TYPES = {
+    "ip": "ADDRESS_CHANGED",
+    "resolved_ip": "ADDRESS_CHANGED",
+    "title": "TITLE_CHANGED",
+    "tech": "TECH_CHANGED",
+    "server": "TECH_CHANGED",
+    "version": "TECH_CHANGED",
+    "banner": "TECH_CHANGED",
+    "state": "STATUS_CHANGED",
+    "service": "STATUS_CHANGED",
+    "protocol": "STATUS_CHANGED",
+    "status_code": "STATUS_CHANGED",
+    "cert_sha256": "FINGERPRINT_CHANGED",
+    "cert_not_after": "FINGERPRINT_CHANGED",
+}
 
 # DISAPPEARED 默认宽限期:48 小时。
 # 取 2× 常见监控周期(24h),意思是"容得下一次漏扫,拦得住真下线"。
@@ -436,6 +473,53 @@ def is_baseline_noise(storage, asset_hash: str, change_type: str,
         rows = conn.execute(sql, params).fetchall()
     n, came_back = _field_transitions(rows, field)
     return int(n) >= int(threshold) and came_back
+
+
+def attach_field_change_sink(storage) -> None:
+    """把「字段级变更记录」接到一个 Storage 上
+
+    ## 为什么是回调,而不是 db 直接 import core
+
+    `db` 层**不能**依赖 `core`(`tests/test_architecture.py` 的分层规则:
+    外层可以依赖内层,反之不行)。但检测本身又必须在 `db` 里做 ——
+    旧值和新值在同一条 `ON CONFLICT DO UPDATE` 里就没了,放到上面
+    任何一层都已经比不出来。
+
+    所以切成两半:`db` 只回答「哪些字段变了」(它本来就最清楚那句
+    UPDATE 的语义),`core` 回答「那意味着什么」(类型 + 基线噪声)。
+
+    ## 记不上不能影响入库
+
+    采集器只管把资产写进来,变更监控是搭在上面的。记录失败就中断入库,
+    等于让一个观察功能把被观察的东西弄没了。
+
+    ## 没注册就只是不记,不会报错
+
+    那是**旁路**该有的样子:没挂上不该拦住任何东西。
+    `tests/test_monitor_field_changes.py` 盯着生产入口确实挂了。
+    """
+    def _sink(table: str, asset_hash: str, changes: dict) -> None:
+        # 表名 → asset_type。**反转 `Monitor._ASSET_TABLES`,不另抄一份** ——
+        # 同一张契约表有两个来源,迟早会漂。
+        asset_type = next((t for t, tbl in Monitor._ASSET_TABLES.items()
+                           if tbl == table), None)
+        if asset_type is None:
+            # 拿不到就**不记**,不硬猜一个。asset_type 是 record_change
+            # 的第一等参数,猜错等于把别的表上的变更记成 host 的。
+            return
+        for field, ch in changes.items():
+            change_type = FIELD_CHANGE_TYPES.get(field)
+            if change_type is None:
+                continue      # 不在契约表里:明写的不报,不是漏报
+            try:
+                record_change(storage, asset_type, change_type, asset_hash,
+                              before={field: ch["before"]},
+                              after={field: ch["after"]})
+            except Exception as e:       # noqa: BLE001 - 旁路
+                log.warning("field change not recorded (%s.%s): %s",
+                            table, field, e)
+
+    storage.set_field_change_sink(_sink)
 
 
 def record_change(storage, asset_type: str, change_type: str,

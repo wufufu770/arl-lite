@@ -48,6 +48,11 @@ class TaskRunner:
     def __init__(self, storage: Storage, workspace_id: int):
         self.storage = storage
         self.workspace_id = workspace_id
+        # 字段级变更检测接在这里:所有扫描都经过 TaskRunner,是生产
+        # 摄入路径的唯一入口。`db` 层不认识 `core`,所以这根线只能
+        # 由上面接(见 core/monitor.py 的 attach_field_change_sink)。
+        from .monitor import attach_field_change_sink
+        attach_field_change_sink(storage)
         self.current_task_id: int = 0
         self._modules: list[BaseModule] = []
         self._stop_requested = threading.Event()

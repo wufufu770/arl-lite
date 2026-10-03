@@ -269,7 +269,11 @@ CREATE TABLE IF NOT EXISTS asset_changes (
     workspace_id INTEGER NOT NULL,
     asset_hash TEXT NOT NULL,
     asset_type TEXT NOT NULL,          -- domain/host/port/site/finding
-    change_type TEXT NOT NULL,         -- NEW_ASSET / DISAPPEARED / TITLE_CHANGED / TECH_CHANGED / FINGERPRINT_CHANGED / STATUS_CHANGED
+    -- change_type 的取值与 core/monitor.py 的 CHANGE_TYPES 一一对应。
+    -- 这行注释**是契约的一部分**,不是给人看的说明:tests/test_monitor_change_type_whitelist.py
+    -- 会把它读出来跟 CHANGE_TYPES 比,对不上就红。r42 时它是死文档(列 6 种、代码只产 2 种),
+    -- r44 补齐了字段级类型,两边才第一次对上。
+    change_type TEXT NOT NULL,         -- NEW_ASSET / DISAPPEARED / ADDRESS_CHANGED / TITLE_CHANGED / TECH_CHANGED / FINGERPRINT_CHANGED / STATUS_CHANGED
     before_value TEXT,                -- JSON,变更前快照
     after_value TEXT,                 -- JSON,变更后快照
     diff TEXT,                         -- JSON,字段级 diff
