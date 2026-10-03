@@ -44,11 +44,40 @@ def generate_html_report(storage: "Storage", workspace: str, title: str = "ARL-L
     from .core.risk_score import top_risks, risk_summary
 
     # 1. 统计(COUNT(*);旧版在这里全表载入 8 张表只为 len,且 ports/findings 各查了两次)
-    hosts = storage.query("hosts", limit=10000)
+    # r57:这四处过去都是 `storage.query(..., limit=10000)`,超了静默丢,
+    # 而报告照样生成、照样打印「written」。`fetch_all` 把真实行数一起
+    # 带回,报告里就能明写「这份报告的数据是不全的」。
+    hosts, _hosts_total = storage.fetch_all("hosts")
     stats = storage.get_stats()
     risk = risk_summary(storage)
     top = top_risks(storage, limit=20)
-    correlations = storage.query("correlations", limit=10000)
+    correlations, _corr_total = storage.fetch_all("correlations")
+    _monitors_rows, _monitors_total = storage.fetch_all("monitors")
+    findings, _findings_total = storage.fetch_all("findings")
+
+    # 把四处各自记下的真实行数汇总成一段警告。放在报告**顶部**而不是
+    # 塞进某个卡片里:被截断的表可能压根不出现在报告正文(比如空的
+    # correlations 卡片只印「暂无关联结果」),而那正是最需要提醒的场景。
+    _clipped = [
+        ("hosts", _hosts_total, len(hosts)),
+        ("correlations", _corr_total, len(correlations)),
+        ("monitors", _monitors_total, len(_monitors_rows)),
+        ("findings", _findings_total, len(findings)),
+    ]
+    _clipped = [(t, tot, got) for t, tot, got in _clipped if tot > got]
+    if _clipped:
+        _warn_html = (
+            '<div class="card" style="border-left:4px solid #d33">'
+            '<h2>⚠️ 这份报告的数据不完整</h2>'
+            '<p>下列表超过了导出行数上限(<code>EXPORT_ROW_CAP</code>),'
+            '报告只统计了前一部分。下面的统计和排行<b>不能</b>当成全集的结论:</p><ul>'
+            + "".join(
+                f"<li><code>{html.escape(t)}</code>:库里 {tot} 行,"
+                f"报告只用了 {got} 行(少了 {tot - got} 行)</li>"
+                for t, tot, got in _clipped)
+            + "</ul></div>\n")
+    else:
+        _warn_html = ""
     # ── 置信度分流(第 1 轮建的模型,到这一层才真正生效) ──
     #
     # 之前这里是 `correlations[:50]` 无条件截断 —— 插入顺序与置信度无关,
@@ -80,7 +109,7 @@ def generate_html_report(storage: "Storage", workspace: str, title: str = "ARL-L
     reported = [c for c in correlations if not is_discarded(c)]
     discarded = [c for c in correlations if is_discarded(c)]
     host_samples = [h.get("host", "?") for h in hosts[:20] if h.get("host")]
-    stats.setdefault("monitors", len(storage.query("monitors", limit=10000)))
+    stats.setdefault("monitors", len(_monitors_rows))
 
     # 2. 按 target_type 分组
     by_type: dict[str, list[dict]] = {}
@@ -154,6 +183,7 @@ def generate_html_report(storage: "Storage", workspace: str, title: str = "ARL-L
 <body>
 <div class="container">
   <h1>🛡️ {html.escape(title)}</h1>
+  {_warn_html}
   <div class="meta">
     workspace: <code>{html.escape(workspace)}</code>
     &nbsp;·&nbsp; 生成时间: {now}
@@ -322,8 +352,6 @@ def generate_html_report(storage: "Storage", workspace: str, title: str = "ARL-L
     else:
         parts.append('  <div class="card"><h2>🔍 关联分析(去重后)</h2><p class="muted">暂无关联结果(未跑过 correlate 或 0 命中)</p></div>\n')
 
-    # Findings
-    findings = storage.query("findings", limit=10000)
     if findings:
         parts.append("""
   <div class="card">

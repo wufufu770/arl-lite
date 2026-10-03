@@ -36,6 +36,15 @@ log = logging.getLogger("arl_lite.storage")
 # 取 120s 给 bulk_insert 这类长批量操作留足余量。
 _SQL_DEFAULT_BUDGET_SECONDS = 120.0
 
+# 「把整张表取出来」时的行数上限。它**不是** `Storage.query` 的上限
+# (那仍是硬 10000,见 `query` 自己的校验),而是「导出/报告这类要全表
+# 的场景」用的那一份 —— 过去这个 10000 直接写死在 `cmd_export` 里,
+# 超了静默丢数据还报成功(r57)。
+#
+# 上限本身不是问题,**超了不说**才是。`fetch_all` 强制把「一共多少行」
+# 一起返回,让调用方不可能无意间丢掉这个数。
+EXPORT_ROW_CAP = 10000
+
 # 默认 schema 路径
 DEFAULT_SCHEMA = Path(__file__).parent / "schema.sql"
 # 默认 workspace 根目录
@@ -1293,6 +1302,34 @@ class Storage:
             check_filter_sql(filter_sql)
             sql += f" AND ({filter_sql})"
         return sql
+
+    def fetch_all(self, table: str, cap: int | None = None) -> tuple[list[dict], int]:
+        """取这个表的行,并**同时**告诉你库里一共多少行
+
+        返回 `(rows, total)`。`rows` 最多 `cap` 行(`EXPORT_ROW_CAP`),
+        `total` 是这张表在当前工作区里真实的行数。
+
+        ## 为什么要这么别扭地返回两个数(r57)
+
+        因为 `rows` **看不出自己是不是完整的**。r57 之前 `cmd_export`
+        写的是 `storage.query(table, limit=10000)`,拿 12000 行去导,
+        导出文件里静静躺着 10000 行,命令还打印「exported to ...」、
+        退出码 0 —— 用户拿到一个**不完整的文件**去做分析/迁移/归档,
+        推导出的结论是错的,而工具说一切正常。
+
+        `limit` 是数据访问的正常参数,不该被顺手用来「导出全部」。
+        把「取」和「一共多少」绑在一个返回值里,调用方**不可能**在
+        无意间丢掉第二个数 —— 而丢掉它正是 r57 那个 bug 的全部。
+
+        同 `count_rows` 一样走 `QUERY_TABLES` 白名单,表名不接受外部拼接。
+        """
+        if table not in self.QUERY_TABLES:
+            raise ValueError(
+                f"table '{table}' not in whitelist: {sorted(self.QUERY_TABLES)}")
+        n = EXPORT_ROW_CAP if cap is None else int(cap)
+        if n < 0:
+            raise ValueError(f"cap must be >= 0, got {cap!r}")
+        return self.query(table, limit=n), self.count_rows(table)
 
     def count_rows(
         self,

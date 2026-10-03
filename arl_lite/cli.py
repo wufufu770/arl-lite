@@ -27,7 +27,7 @@ from typing import Any
 
 # 让 from arl_lite import ... 能用
 from . import __version__
-from .db.storage import Storage, get_default_workspace_root
+from .db.storage import EXPORT_ROW_CAP, Storage, get_default_workspace_root
 from .core.task_runner import TaskRunner
 from .core.signal_handler import GracefulShutdown
 # 词表只此一份:CLI 的 choices 从这里派生,不手写(见 build_parser 里
@@ -341,13 +341,28 @@ def cmd_search(args) -> int:
     return 0
 
 
+# `export` 要导哪些表。这是**一份清单**,r57 之前它是个字面量列表,
+# 写死在这行 `for` 里 —— 加表和「这张表有没有被截断」不在同一个地方。
+_EXPORT_TABLES = ("domains", "hosts", "ports", "sites", "findings",
+                  "tasks", "source_status", "correlations")
+
+
 def cmd_export(args) -> int:
     if _ensure_workspace_exists(args.workspace):
         return 1
     storage = Storage(workspace=args.workspace)
     data: dict = {}
-    for table in ["domains", "hosts", "ports", "sites", "findings", "tasks", "source_status", "correlations"]:
-        data[table] = storage.query(table, limit=10000)
+    # r57:每张表的真实行数。`query` 只给得出「取到多少」,而 rows
+    # 看不出自己是不是完整的 —— 过去 `limit=10000` 硬写在这里,
+    # 12000 行只导出 10000 行,命令还打印「exported to ...」退出 0。
+    # `fetch_all` 把「一共多少」绑进返回值,这里就不可能漏掉它。
+    totals: dict[str, int] = {}
+    for table in _EXPORT_TABLES:
+        rows, total = storage.fetch_all(table)
+        data[table] = rows
+        totals[table] = total
+    clipped = {t: (totals[t], len(data[t])) for t in _EXPORT_TABLES
+               if totals[t] > len(data[t])}
     fmt = getattr(args, "format", "json")
     output = getattr(args, "output", None)
     if output:
@@ -405,6 +420,27 @@ def cmd_export(args) -> int:
 
     if output:
         print(f"[+] {fmt} exported to {output}")
+
+    # r57:数据不全要说出来,而且**退出码非 0**。
+    #
+    # 为什么不因为截断就拒绝导出:文件已经写了一半,硬失败等于让用户
+    # 什么都拿不到,还得自己想办法重来 —— 那是替用户做了决定。
+    #
+    # 为什么退出码必须非 0:`export` 会被 CI 和定时任务调用,退出码 0
+    # 意味着脚本认为一切正常,这个不完整的文件会流进下游分析/迁移/归档,
+    # 结论是错的而没人知道。人和自动化都得看见,所以是「导 + 说 + 报失败」。
+    if clipped:
+        print(f"[!] 导出的数据**不完整** —— 以下表超过了 "
+              f"{EXPORT_ROW_CAP} 行上限,只取到了前 {EXPORT_ROW_CAP} 行:",
+              file=sys.stderr)
+        for table in sorted(clipped):
+            total, got = clipped[table]
+            print(f"      {table}: 库里 {total} 行,只导出 {got} 行"
+                  f"(少了 {total - got} 行)", file=sys.stderr)
+        print(f"[!] 文件已写出,但**不要**当成完整数据集用。要导全就分表分批:"
+              f"arl-lite query <table> --limit 10000(逐段导出),"
+              f"或调高 db.storage.EXPORT_ROW_CAP。", file=sys.stderr)
+        return 1
     return 0
 
 
