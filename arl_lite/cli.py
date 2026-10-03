@@ -427,27 +427,48 @@ def cmd_stats(args) -> int:
     return 0
 
 
+def _parse_since(value: str) -> str:
+    """`7d` / `24h` / ISO 时间 → ISO 起点串
+
+    ## 为什么要抽成函数(r51)
+
+    它原先内联在 `cmd_diff` 里。r51 要给 `monitor changes --since` 和
+    `monitor prune --older-than` 用同一个语义,而**复制第二份**就是
+    r45 那条教训的重演(同一张表两个来源迟早漂)。所以一份就够,三处共用。
+
+    ## 「能 parse 就当时间」那种写法为什么不要
+
+    原实现的 ISO 分支把原串原样传下去,不自己校验。实测那样**也是**安全的
+    —— 下游 `diff_new_since` 会拒(`--since garbage` 返回 exit 2)。但那是
+    碰巧下游记得校验:一个自己不校验的解析器,安全完全挂在「每个下游都记得」
+    上。所以这里自己先过一道 `parse_ts`,拒绝不了就地报错,给的是这一条
+    命令自己的话。
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("must be a non-empty string")
+    from .core.monitor import parse_ts
+    if value.endswith("d") or value.endswith("h"):
+        unit = "days" if value.endswith("d") else "hours"
+        n = int(value[:-1])
+        if n < 0:
+            raise ValueError(f"{unit} must be >= 0, got {n}")
+        delta = timedelta(days=n) if unit == "days" else timedelta(hours=n)
+        return (datetime.utcnow() - delta).isoformat()
+    dt = parse_ts(value)
+    if dt is None:
+        raise ValueError(f"not a recognised window or timestamp: {value!r}")
+    return dt.isoformat()
+
+
 def cmd_diff(args) -> int:
     if _ensure_workspace_exists(args.workspace):
         return 1
     storage = Storage(workspace=args.workspace)
     # 解析 since:7d / 24h / ISO 时间
-    since_raw = args.since
     try:
-        if since_raw.endswith("d"):
-            days = int(since_raw[:-1])
-            if days < 0:
-                raise ValueError(f"days must be >= 0, got {days}")
-            since = (datetime.utcnow() - timedelta(days=days)).isoformat()
-        elif since_raw.endswith("h"):
-            hours = int(since_raw[:-1])
-            if hours < 0:
-                raise ValueError(f"hours must be >= 0, got {hours}")
-            since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
-        else:
-            since = since_raw
+        since = _parse_since(args.since)
     except ValueError as e:
-        print(f"[!] invalid --since '{since_raw}': {e}", file=sys.stderr)
+        print(f"[!] invalid --since '{args.since}': {e}", file=sys.stderr)
         print(f"    valid: '7d' / '24h' / '2026-09-01'", file=sys.stderr)
         return 2
 
@@ -833,9 +854,20 @@ def cmd_monitor_changes(args) -> int:
         except ValueError as e:
             print(f"[!] {e}", file=sys.stderr)
             return 2
+    since = None
+    # `is not None` 而不是真值判断:`--since ''` 看着像「用户要求了个时间窗」,
+    # 而真值判断会把它当成「没给」,于是**静默返回全部** —— 用户以为筛过了。
+    # 空串该被 _parse_since 当成非法值拒掉,而不是悄悄放宽。
+    if getattr(args, "since", None) is not None:
+        try:
+            since = _parse_since(args.since)
+        except ValueError as e:
+            print(f"[!] invalid --since '{args.since}': {e}", file=sys.stderr)
+            print("    valid: '7d' / '24h' / '2026-10-01'", file=sys.stderr)
+            return 2
     rows = list_changes(storage, asset_type=args.type,
                         change_type=args.change_type, limit=args.limit,
-                        asset_hash=asset_hash)
+                        asset_hash=asset_hash, since=since)
     if getattr(args, "json", False):
         # 机器消费:payload 原样带出去,不经过给人看的那些渲染/截断。
         # 想要 diff 就自己 parse,想要标签就自己取。
@@ -860,6 +892,51 @@ def cmd_monitor_changes(args) -> int:
               f"{_change_label(storage, r, cache):32} {r.get('detected_at', '')}")
         for line in _change_lines(r):
             print(f"      {line}")
+    return 0
+
+
+def cmd_monitor_prune(args) -> int:
+    """删掉过期���变更记录
+
+    ## 为什么默认不删
+
+    删除的安全默认值是「什么都不做」。给删除命令加一个 `--dry-run` 标志,
+    等于**默认就删** —— 少打一个字母就没了。所以这里是反过来的:默认只数,
+    真删必须显式加 `--yes`。
+
+    ## 为什么必须把「基线判据会变」说出来
+
+    `is_baseline_noise` 读的就是这张表,而且读**全部历史**。删掉旧行等于
+    把它的输入截短:很久以前抖过几次的资产,清理之后就不再被当成抖动。
+    这大概率是好事(那本来就是记着的局限),但它意味着**同一批数据在清理
+    前后会得到不同的答案** —— 「误报率实测」这类测量因此在某天悄悄失去
+    可比性。所以这里明说,而不是让用户自己发现。
+    """
+    from .core.monitor import prune_changes
+    storage = Storage(workspace=args.workspace)
+    try:
+        cutoff = _parse_since(args.older_than)
+    except ValueError as e:
+        print(f"[!] invalid --older-than '{args.older_than}': {e}",
+              file=sys.stderr)
+        print("    valid: '90d' / '720h' / '2026-07-01'", file=sys.stderr)
+        return 2
+    dry = not args.yes
+    try:
+        r = prune_changes(storage, cutoff, dry_run=dry)
+    except ValueError as e:
+        print(f"[!] {e}", file=sys.stderr)
+        return 2
+    verb = "会删掉" if dry else "已删掉"
+    print(f"[i] {verb} {r['matched']} 条早于 {r['cutoff']} 的变更记录"
+          f"(workspace={args.workspace})")
+    if dry:
+        print(f"[i] 这是试算,什么都没删。要真删请加 --yes")
+    if r["matched"]:
+        print(f"[!] 注意:这会**改变基线判据的输入**。`is_baseline_noise` 读的是"
+              f"这张表的全部历史,清理掉 {r['deleted'] if not dry else r['matched']} "
+              f"条之后,很久以前抖过几次的资产可能不再被当成抖动 ——"
+              f"「误报率实测」这类测量在清理前后不可直接比较。")
     return 0
 
 
@@ -1416,9 +1493,20 @@ def build_parser() -> argparse.ArgumentParser:
     pmc.add_argument("--asset", help="只看这一个资产的变更。给名字要配 --type"
                                     "(如 --type host --asset web.example.com);"
                                     "不给 --type 时只接受 16 位 hash")
+    pmc.add_argument("--since", help="只看这个时间点之后的变更,如 7d / 24h / 2026-10-01")
     pmc.add_argument("--json", action="store_true",
                     help="输出 JSON(payload 原样,供机器消费)")
     pmc.add_argument("-w", "--workspace", help="工作空间名", default="default")
+
+    # 清理:默认只数不删(见 cmd_monitor_prune 的文档)
+    pmp = pm_sub.add_parser(
+        "prune", help="删掉过期的变更记录(默认只试算,加 --yes 才真删)")
+    pmp.add_argument("--older-than", required=True,
+                     help="删掉早于这个时间点的记录,如 90d / 720h / 2026-07-01")
+    pmp.add_argument("--yes", action="store_true",
+                     help="真的要删(不加就是试算)")
+    pmp.add_argument("-w", "--workspace", help="工作空间名", default="default")
+    pmp.set_defaults(func=cmd_monitor_prune)
     pmc.set_defaults(func=cmd_monitor_changes)
 
     # tui(交互式终端)

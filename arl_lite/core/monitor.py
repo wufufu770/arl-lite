@@ -120,6 +120,68 @@ def parse_ts(value) -> datetime | None:
     return dt.replace(tzinfo=None)
 
 
+# 比较时间戳时用的 SQL 表达式:把 SQLite `CURRENT_TIMESTAMP` 的空格换成 `T`,
+# 于是两种格式的字符串在字典序上可比。
+#
+# ## 为什么不能直接 `detected_at >= ?`
+#
+# 上面 `parse_ts` 的文档已经说过:空格(0x20)排在 `T`(0x54)**前面**。
+# 实测(r51):库里有一行 `detected_at='2026-10-03 07:19:23'`(走列的
+# `DEFAULT CURRENT_TIMESTAMP`,也就是任何直接 INSERT 都会得到的形状),
+# 而窗口起点是 `'2026-10-03T00:00:00'`(今天零点)——
+#
+#     朴素字符串比较: 命中 0 行    ← 07:19 明明在零点之后
+#     REPLACE 归一后: 命中 1 行
+#
+# `record_change` 总是显式写 `datetime.utcnow().isoformat()`,所以今天生产里
+# 全是 T 格式、这个洞碰不到。但**一旦拿它去做删除**,方向就反了:
+# 该删的行永远删不掉,表就永远缩不下去。所以这里不靠「现在碰不到」。
+#
+# 注意:归一只统一分隔符,**不统一微秒**。T 格式带微秒、SQLite 格式不带,
+# 同一秒内 `...T07:19:09` 比 `...T07:19:09.000000` 小。这对「今天零点」
+# 这种粗窗口无影响,但如果将来要做「精确到秒的滚动窗口」,得用 julianday()
+# 或者干脆统一写入格式 —— 别拿字符串比较当精确时间。
+_DETECTED_AT_SQL = "REPLACE(detected_at, ' ', 'T')"
+
+
+def _normalized(column: str) -> str:
+    """把某一列的时间戳归一成字典序可比的形状(见 `_DETECTED_AT_SQL`)"""
+    return f"REPLACE({column}, ' ', 'T')"
+
+
+def _since_clause(column: str, since_iso: str) -> tuple[str, str]:
+    """造出「这一列 >= 起点」的 SQL 片段和参数 —— 用于**取**较新的
+
+    `column` 由调用方给,而且必须是代码里的字面量 —— 这里不做白名单,
+    因为片段会拼进 SQL。调用方(本文件内的几处)传的都是自己写死的列名。
+    """
+    dt = parse_ts(since_iso)
+    if dt is None:
+        raise ValueError(
+            f"since must be a parseable timestamp, got {since_iso!r}")
+    return (f"{_normalized(column)} >= ?", dt.isoformat())
+
+
+def _older_than_clause(column: str, older_than_iso: str) -> tuple[str, str]:
+    """造出「这一列 < 起点」的 SQL 片段和参数 —— 用于**删**较旧的
+
+    ## 为什么单独一个函数,而不是给 `_since_clause` 加个方向参数
+
+    因为 r51 第一版就是把「删较旧」也用了 `>=` —— 方向反了,`monitor prune
+    --yes` 删掉的是**最新**那几条,旧的全留着。实测抓到的。
+
+    这类错误特别阴险:命令不报错、退出码 0、而且**看起来删成功了**(行数确实
+    少了),只是删错了方向。所以两个方向必须是两个**名字**,让用错方向这件事
+    在 code review 里就看得出来 —— `prune` 里出现 `_since_clause` 应该是
+    一眼能发现的错。
+    """
+    dt = parse_ts(older_than_iso)
+    if dt is None:
+        raise ValueError(
+            f"older_than must be a parseable timestamp, got {older_than_iso!r}")
+    return (f"{_normalized(column)} < ?", dt.isoformat())
+
+
 class Monitor:
     """资产监控管理"""
 
@@ -618,12 +680,17 @@ def record_change(storage, asset_type: str, change_type: str,
 
 def list_changes(storage, asset_type: str | None = None,
                  change_type: str | None = None, limit: int = 50,
-                 asset_hash: str | None = None) -> list[dict]:
+                 asset_hash: str | None = None,
+                 since: str | None = None) -> list[dict]:
     """列变更事件
 
     `asset_hash` 是**单个**资产 —— `asset_changes` 表只存 hash 不存标识,
     所以按名字过滤得先由调用方把名字算成 hash(`db.storage.compute_asset_hash`),
     这里只管按算好的值筛。
+
+    `since` 是时间窗口起点。比较走 `REPLACE(detected_at, ' ', 'T')`,理由见
+    `_DETECTED_AT_SQL` 的文档:两种时间戳格式的字典序不可比,而按同一段
+    比较去做删除时,漏掉的行就是永远删不掉的行。
     """
     sql = "SELECT * FROM asset_changes WHERE workspace_id = ?"
     params: list = [storage.workspace_id]
@@ -636,8 +703,68 @@ def list_changes(storage, asset_type: str | None = None,
     if asset_hash:
         sql += " AND asset_hash = ?"
         params.append(asset_hash)
+    if since:
+        frag, val = _since_clause("detected_at", since)
+        sql += f" AND {frag}"
+        params.append(val)
     sql += " ORDER BY id DESC LIMIT ?"
     params.append(int(limit))
     with storage._conn() as conn:
         rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
+
+
+def count_changes_older_than(storage, older_than: str) -> int:
+    """有多少条变更早于 `older_than` —— 清理前的 dry-run 计数
+
+    和 `prune_changes` 共用 `_older_than_clause`,免得「数出来的」和
+    「删掉的」用两套判据 —— 那是最典型的 dry-run 骗人:说删 10 条,真删 8 条。
+    """
+    frag, val = _older_than_clause("detected_at", older_than)
+    sql = (f"SELECT COUNT(*) FROM asset_changes "
+           f"WHERE workspace_id = ? AND {frag}")
+    with storage._conn() as conn:
+        return int(conn.execute(sql, [storage.workspace_id, val])
+                   .fetchone()[0])
+
+
+def prune_changes(storage, older_than: str, dry_run: bool = True) -> dict:
+    """删掉早于 `older_than` 的变更,返回实际删了多少
+
+    ## `dry_run` 默认 True,而不是加一个 `--dry-run` 开关
+
+    删除操作的安全默认值应该是「什么都不做」。给一个删除命令加
+    `--dry-run` 标志,等于**默认就删** —— 少打一个字母就没了。
+    所以这里反过来:默认只数,要真删必须显式传 `dry_run=False`。
+
+    ## 方向:用 `_older_than_clause`(`<`),不是 `_since_clause`(>=)
+
+    r51 第一版用了 `>=`,于是 `prune --yes` 删掉的是**最新**的几条、
+    旧的原封不动。命令不报错、退出码 0、行数确实少了 —— 看起来完全成功。
+    所以判据的方向由函数名承担,见那两个函数的文档。
+
+    ## 它会影响基线判据,这件事必须由调用方说出来
+
+    `is_baseline_noise` 读的就是这张表,而且**读全部历史**。删掉旧行等于
+    把基线判据的输入截短:一个很久以前抖过几次的资产,清理之后就不再被
+    当成抖动。这大概率是好事(那本来就是 `parse_ts` 文档里记着的局限),
+    但它意味着**同一批数据在清理前后会得到不同的答案** —— 「误报率实测」
+    这类测量因此在某天悄悄失去可比性。所以本函数不替调用方隐瞒这件事,
+    返回值里带上被删的行数,由 CLI 明说出来。
+    """
+    if not isinstance(older_than, str) or not older_than.strip():
+        raise ValueError("older_than must be a non-empty timestamp string")
+    frag, val = _older_than_clause("detected_at", older_than)
+    with storage._conn() as conn:
+        affected = int(conn.execute(
+            f"SELECT COUNT(*) FROM asset_changes "
+            f"WHERE workspace_id = ? AND {frag}",
+            [storage.workspace_id, val]).fetchone()[0])
+        if dry_run:
+            return {"matched": affected, "deleted": 0,
+                    "cutoff": val, "dry_run": True}
+        cur = conn.execute(
+            f"DELETE FROM asset_changes WHERE workspace_id = ? AND {frag}",
+            [storage.workspace_id, val])
+        return {"matched": affected, "deleted": int(cur.rowcount),
+                "cutoff": val, "dry_run": False}
