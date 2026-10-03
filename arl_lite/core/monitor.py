@@ -311,10 +311,77 @@ class Monitor:
         return out
 
 
+DEFAULT_BASELINE_LEARN = 3
+
+
+def is_baseline_noise(storage, asset_hash: str, change_type: str,
+                      field: str | None = None,
+                      threshold: int = DEFAULT_BASELINE_LEARN) -> bool:
+    """这个变更是不是"这个资产本来就这样"的基线噪声
+
+    ## 判据
+
+    同一 workspace 里,同一 `asset_hash` + 同一 `change_type` 已经出现过
+    **至少 `threshold` 次**(field 非 None 时再加字段判据),就判为基线 ——
+    这个资产反复变这一项,说明它平时的样子就是会变,再报一次只是噪音。
+
+    前 `threshold - 1` 次照常上报:刚开始抖的时候没人知道它是抖动,
+    这正是"学习"的含义 —— 连着变够多次才敢下结论。
+
+    ## 为什么不新增存储字段
+
+    `asset_changes` 表自己就是历史:它记了每一次变更的 asset_hash /
+    change_type / diff / detected_at。用它当基线库,schema 一个字不用动,
+    而基线随历史自然演化 —— 资产稳定久了,下次再变就会重新计次。
+
+    ## 局限(说在前面)
+
+    - **它只认"变过几次",不认"变回过"。** 一个资产连着 3 次从 A 变到 B,
+      和连着 3 次在 A/B 之间来回,这里判成同一件事。前者其实是真变化。
+    - **阈值是全局的,不 per-asset 学习。** 真正按资产各自的历史长度调
+      阈值要一张新表,那超出这一步的范围。
+    - **只看历史条数,不看时间。** 一年前变过 3 次的资产,今天再变第 4 次
+      仍会被当基线噪声 —— 除非它的 `asset_hash` 变了(那通常意味着重建)。
+    """
+    if threshold <= 0:
+        return False
+    sql = ("SELECT COUNT(*) FROM asset_changes "
+           "WHERE workspace_id = ? AND asset_hash = ? AND change_type = ?")
+    params: list = [storage.workspace_id, asset_hash, change_type]
+    if field is not None:
+        sql += " AND diff LIKE ?"
+        params.append(f'%"{field}"%')
+    with storage._conn() as conn:
+        n = conn.execute(sql, params).fetchone()[0]
+    return int(n) >= int(threshold)
+
+
 def record_change(storage, asset_type: str, change_type: str,
                   asset_hash: str, before: dict | None = None,
-                  after: dict | None = None, task_id: int | None = None) -> None:
-    """记录一个变更事件到 asset_changes 表"""
+                  after: dict | None = None, task_id: int | None = None,
+                  baseline_threshold: int = DEFAULT_BASELINE_LEARN) -> bool:
+    """记录一个变更事件到 asset_changes 表。返回这条是否**被记下来**。
+
+    ## 返回 False = 被基线判为噪声,没记
+
+    判据见 `is_baseline_noise`。返回 bool 而不是 None,是为了让调用方
+    知道"这条没报出去"—— 而不返回的话,调用方无法区分"记了"和"被挡了",
+    报表上就会出现"报了 0 条",看起来像没检测到,其实是被去噪了。
+    """
+    # 逐字段判基线:只要**有一个**变动字段已达阈值,整条就是噪声。
+    # 用任一而不是全部 —— 一个资产天天变的往往就那一项(比如 geo 漂移),
+    # 拿它当基线不代表整条记录都不值得看,但足以说明这一条会持续刷屏。
+    if before and after and baseline_threshold > 0:
+        for k in set(before) | set(after):
+            if before.get(k) == after.get(k):
+                continue
+            if is_baseline_noise(storage, asset_hash, change_type, k,
+                                 baseline_threshold):
+                log.info(
+                    "record_change: %s/%s 的 %s 已变 %d 次,判为基线噪声,不记",
+                    asset_hash[:12], change_type, k, baseline_threshold)
+                return False
+
     diff = None
     if before and after:
         # 字段级 diff
@@ -340,6 +407,8 @@ def record_change(storage, asset_type: str, change_type: str,
             )
     except Exception as e:
         log.warning(f"record_change failed: {e}")
+        return False
+    return True
 
 
 def list_changes(storage, asset_type: str | None = None,

@@ -55,7 +55,7 @@ kind 取值：`change` / `test` / `doc` / `research` / `refactor`
 
 - [P1] change: 记账审计:报完成的轮次背后有没有提交(窗口要取对) | ✅ r39 完成 · 窗口改成「上一轮 started_at → 现在」,延迟一轮回看;只报告不拦(上一轮的账不该由这一轮来拒);拿不到 git 仓库时保持沉默而不是报「没有提交」;`tests/test_round_commit_audit.py` 7 条 —— r38 实测,在 round **之内**比对 `head_before/head_after` 是**错的窗口**:34 个报完成的轮次里,提交落在 round 内的只有 **4** 个,落在 round 结束之后 1 小时内的有 **29** 个 —— 工作流本来就是「先跑 round 验门禁,再提交」。按轮内窗口做的闸门会拒掉 29/34 个合法轮次,28 条既有测试当场红,已撤回(见 docs 7.29)。**正确窗口是「本轮 started_at → 下一轮 started_at」**:按这个窗口重测 35 轮,零可疑轮次,每个 DONE 背后都有提交。所以这条该做成**延迟审计**(下一轮开始时回看上一轮),而不是轮内闸门 —— 轮内它只会误伤。r37 的一次性抽查正是用这个窗口做的,结果干净 | python3 -m pytest tests/test_round_commit_audit.py
 
-- [P1] change: 变更监控去抖 + 基线学习 | backlog 里的长期候选,r39 查实 `core/monitor.py`(360 行)只有`filter_newly_disappeared` 这一层去重(按状态转移判,已经比水位检测准),**没有基线学习**:一个反复上下线的资产会一直被判成"变化",而系统并不知道它平时就是这个样子。做法:维护一个 per-asset 的稳定基线 —— 连续 N 次观测到同一状态就判为基线,只有偏离基线的变化才上报;资产稳定后重新学习。N 取 3(和现有 `detect_disappeared` 的 first_seen/last_seen 判据同一套时间数据,不新增存储字段) | python3 -m pytest tests/test_monitor_baseline.py
+- [P1] change: 变更监控去抖 + 基线学习 | ✅ r40 完成 · 同一资产同一字段连变 3 次判为基线,之后不再上报;前 2 次照报(学习期,少一次新抖动就永远学不出来);用 `asset_changes` 表自己当历史,零新增存储字段;`record_change` 改返回 bool,调用方能区分「记了」和「被挡了」;`tests/test_monitor_baseline.py` 11 条 —— backlog 里的长期候选,r39 查实 `core/monitor.py`(360 行)只有`filter_newly_disappeared` 这一层去重(按状态转移判,已经比水位检测准),**没有基线学习**:一个反复上下线的资产会一直被判成"变化",而系统并不知道它平时就是这个样子。做法:维护一个 per-asset 的稳定基线 —— 连续 N 次观测到同一状态就判为基线,只有偏离基线的变化才上报;资产稳定后重新学习。N 取 3(和现有 `detect_disappeared` 的 first_seen/last_seen 判据同一套时间数据,不新增存储字段) | python3 -m pytest tests/test_monitor_baseline.py
 
 ## 候选（待细化）
 
