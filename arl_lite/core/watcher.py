@@ -121,9 +121,13 @@ class WatchTarget:
         interval_seconds: 重跑间隔秒
         last_run: 上次跑时间戳
         next_run: 下次跑时间戳
-        last_count: 上次资产数
+        last_count: 上次跑完后的**全部资产**数 —— `Monitor._ASSET_TABLES`
+            里每张资产表的行数之和。r52 之前它只加 `hosts` + `domains`
+            两张表,而字段名承诺的是「资产数」,承载的却是「其中两种」——
+            字段名和语义对不上就是 bug(决策 #5)。清单从契约表派生,
+            不手写。
         run_count: 总跑次数
-        new_count: 新资产数(累计)
+        new_count: 新资产数(累计)。同样覆盖全部 5 种资产表。
         dropped_change_count: 因为触到写入上限而**没能记进**
             `asset_changes` 的变更条数(累计)。和 `new_count` 分开是因为
             两者不是一回事:`new_count` 是资产表里真实多出来的行数,
@@ -400,9 +404,17 @@ class Watcher:
             self._current_runner = None
 
         after = self._count_assets()
+        # 资产表清单**从 `Monitor._ASSET_TABLES` 派生**,不另抄一份(决策 #9)。
+        #
+        # 不能从 `get_stats()` 的键派生:它的键里还有 `tasks` 和
+        # `correlations`(storage.py:get_stats),那两张表不是资产 ——
+        # 把它们的行数算进「新增资产」是同一个错的镜像(该加的没加、
+        # 不该加的加了),一样让报告总数失真。判据是「什么是资产」,
+        # 而那个答案只有契约表里有。
+        asset_tables = tuple(Monitor._ASSET_TABLES.values())
         # max(0):资产被删/并发清库时差值可为负,通知语义只关心"新增"
         new_by_type = {t: max(0, after.get(t, 0) - before.get(t, 0))
-                       for t in ("hosts", "domains", "findings")}
+                       for t in asset_tables}
         new_total = sum(new_by_type.values())
 
         # 更新 target 状态
@@ -410,16 +422,18 @@ class Watcher:
         wt.next_run = datetime.fromtimestamp(
             time.time() + wt.interval_seconds
         ).isoformat()
-        wt.last_count = after.get("hosts", 0) + after.get("domains", 0)
+        # 和 `new_total` 用同一份清单 —— 两处各自数一遍,迟早有一处漏
+        wt.last_count = sum(after.get(t, 0) for t in asset_tables)
         wt.run_count += 1
         wt.new_count += new_total
 
         duration = time.time() - start
+        # 逐类型打,不手写三个:手写的清单和上面的差值不是同一份,
+        # 加了新资产种类就会只在这里漏(那正是 r52 的形状)。
         log.info(
             f"watch: target={wt.target} done in {duration:.1f}s, "
             f"new={new_total} "
-            f"(hosts={new_by_type['hosts']} domains={new_by_type['domains']} "
-            f"findings={new_by_type['findings']})"
+            f"({' '.join(f'{t}={new_by_type[t]}' for t in asset_tables)})"
         )
 
         # 变更检测接线:本次新增的资产逐条写 asset_changes(之前 detect_changes
@@ -432,9 +446,10 @@ class Watcher:
         disappeared_total = 0
         recorded_total = 0
         detected_total = 0
-        for asset_type, table in (("domain", "domains"), ("host", "hosts"),
-                                  ("port", "ports"), ("site", "sites"),
-                                  ("finding", "findings")):
+        # 同样从契约表派生:上面数「新增」用的是它,这里逐类做检测也得是
+        # 同一份 —— 两份手抄的清单(r52 之前的三元组和五元组)必然漂移,
+        # 而漂移的方向正是「少算」。
+        for asset_type, table in Monitor._ASSET_TABLES.items():
             mon = Monitor(self.storage)
             try:
                 new_rows = mon.detect_changes(asset_type, start_iso)
