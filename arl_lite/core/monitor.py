@@ -678,21 +678,25 @@ def record_change(storage, asset_type: str, change_type: str,
     return True
 
 
-def list_changes(storage, asset_type: str | None = None,
-                 change_type: str | None = None, limit: int = 50,
-                 asset_hash: str | None = None,
-                 since: str | None = None) -> list[dict]:
-    """列变更事件
+def _changes_where(storage, asset_type: str | None,
+                   change_type: str | None,
+                   asset_hash: str | None,
+                   since: str | None) -> tuple[str, list]:
+    """`asset_changes` 的过滤条件。**只此一份**,`list_changes` 和
+    `count_changes` 都走它。
 
-    `asset_hash` 是**单个**资产 —— `asset_changes` 表只存 hash 不存标识,
-    所以按名字过滤得先由调用方把名字算成 hash(`db.storage.compute_asset_hash`),
-    这里只管按算好的值筛。
+    ## 为什么抽出来
 
-    `since` 是时间窗口起点。比较走 `REPLACE(detected_at, ' ', 'T')`,理由见
-    `_DETECTED_AT_SQL` 的文档:两种时间戳格式的字典序不可比,而按同一段
-    比较去做删除时,漏掉的行就是永远删不掉的行。
+    r55:命令要报「共 N 条,只显示了 M 条」。那个 N 如果单独写一条
+    `COUNT(*)`,一旦两边的过滤条件漂了,就会说出「共 200 条」而实际
+    只有 50 条属于当前筛选 —— **比不报更坏**,因为它是个看起来精确的
+    假数字。r51 的 dry-run 骗人是同一个教训:「数出来的」和
+    「删掉的」用两套判据,于是说删 10 条真删 8 条。
+
+    所以条件共用一份,漂不了。返回的片段**自带前导 `WHERE`**,
+    两边拼的时候不用各自记得写连接词(少一个 `AND` 就是一个静默少筛)。
     """
-    sql = "SELECT * FROM asset_changes WHERE workspace_id = ?"
+    sql = " WHERE workspace_id = ?"
     params: list = [storage.workspace_id]
     if asset_type:
         sql += " AND asset_type = ?"
@@ -707,11 +711,52 @@ def list_changes(storage, asset_type: str | None = None,
         frag, val = _since_clause("detected_at", since)
         sql += f" AND {frag}"
         params.append(val)
-    sql += " ORDER BY id DESC LIMIT ?"
+    return sql, params
+
+
+def list_changes(storage, asset_type: str | None = None,
+                 change_type: str | None = None, limit: int = 50,
+                 asset_hash: str | None = None,
+                 since: str | None = None) -> list[dict]:
+    """列变更事件
+
+    `asset_hash` 是**单个**资产 —— `asset_changes` 表只存 hash 不存标识,
+    所以按名字过滤得先由调用方把名字算成 hash(`db.storage.compute_asset_hash`),
+    这里只管按算好的值筛。
+
+    `since` 是时间窗口起点。比较走 `REPLACE(detected_at, ' ', 'T')`,理由见
+    `_DETECTED_AT_SQL` 的文档:两种时间戳格式的字典序不可比,而按同一段
+    比较去做删除时,漏掉的行就是永远删不掉的行。
+
+    ## `limit` 截掉的部分**要有人说出来**
+
+    `limit` 是默认值(CLI 给 50),而这一层**不知道**自己截掉了多少 ——
+    那是 `count_changes` 的活。调用方拿 `len(rows)` 当总数就会印出
+    「50 change(s)」这种话,而库里可能有两百条。r55 的实测就是这个。
+    """
+    where, params = _changes_where(storage, asset_type, change_type,
+                                   asset_hash, since)
+    sql = f"SELECT * FROM asset_changes{where} ORDER BY id DESC LIMIT ?"
     params.append(int(limit))
     with storage._conn() as conn:
         rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
+
+
+def count_changes(storage, asset_type: str | None = None,
+                  change_type: str | None = None,
+                  asset_hash: str | None = None,
+                  since: str | None = None) -> int:
+    """当前筛选条件下**一共**有多少条变更 —— `list_changes` 截断前的真实条数
+
+    过滤条件走 `_changes_where`,和 `list_changes` **同一份**。r55 的
+    要害就在这里:数字分开写,漂了就会报出一个看起来精确的假总数。
+    """
+    where, params = _changes_where(storage, asset_type, change_type,
+                                   asset_hash, since)
+    with storage._conn() as conn:
+        return int(conn.execute(
+            f"SELECT COUNT(*) FROM asset_changes{where}", params).fetchone()[0])
 
 
 def count_changes_older_than(storage, older_than: str) -> int:

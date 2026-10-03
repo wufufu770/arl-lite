@@ -856,7 +856,7 @@ def _resolve_asset_hash(storage, value: str, asset_type: str | None) -> str:
 
 
 def cmd_monitor_changes(args) -> int:
-    from .core.monitor import list_changes
+    from .core.monitor import count_changes, list_changes
     if args.limit is not None and args.limit <= 0:
         print(f"[!] --limit must be > 0 (got {args.limit})", file=sys.stderr)
         return 2
@@ -899,7 +899,27 @@ def cmd_monitor_changes(args) -> int:
     if not rows:
         print("[i] no changes")
         return 0
-    print(f"[i] {len(rows)} change(s):")
+    # `len(rows)` 只是**显示了多少**,不是一共有多少。r55 之前首行直接印
+    # `len(rows)`,于是库里 200 条时它说「50 change(s)」—— 一个字都没提
+    # 还有 150 条没显示。用户拿它当总数,尤其是配 `--since` 时,会得出
+    # 「这周只有 50 个变更」的错误结论,而 50 只是 `--limit` 的默认值。
+    #
+    # 只有**真的可能**被截断时才多查一次 COUNT:行数没顶到 limit 时
+    # 显然没截断,没必要付这次查询。`--json` 那条路在上面就 return 了 ——
+    # 机器消费要 payload 原样,加一句话反而破坏可解析性。
+    shown = len(rows)
+    if shown < (args.limit or shown):
+        print(f"[i] {shown} change(s):")
+    else:
+        total = count_changes(storage, asset_type=args.type,
+                              change_type=args.change_type,
+                              asset_hash=asset_hash, since=since)
+        if total > shown:
+            print(f"[i] {shown} of {total} change(s) "
+                  f"(只显示了最新 {shown} 条;--limit {args.limit}。"
+                  f"要全看就调大 --limit,机器消费用 --json)")
+        else:
+            print(f"[i] {shown} change(s):")
     cache: dict = {}
     for r in rows:
         print(f"  [{r['change_type']:18}] {r['asset_type']:10} "
