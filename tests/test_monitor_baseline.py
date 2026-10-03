@@ -48,6 +48,20 @@ DNS 切机房**全都是单向的** —— 静默掉的恰恰是真正值得看�
 
 现在多一条判据:除了"变够 `threshold` 次",还要求**变回过**
 (某个取值出现过不止一次)。见下面 `test_one_way_*` 那组。
+
+## r42:这套机制在生产路径上够不着(能力缺失,不是测试的错觉)
+
+r42 给 `record_change` 的 `change_type` 加了白名单(按能力,不按 schema
+注释里那 6 种词表),合法值只剩 `NEW_ASSET` / `DISAPPEARED`。而判基线
+必须有**双边**快照,生产里唯一的两处调用 —— watcher 的 `NEW_ASSET` 只传
+`after`、`DISAPPEARED` 只传 `before` —— 都是单边的。
+
+所以:**本文件里所有 `record_change` 调用都传双边快照,是在构造一种
+生产中还不存在的情况。** 这是如实反映现状,不是测试在绕开实现。
+资产自身的属性变了(换 IP、换标题、换证书),系统现在根本看不见 ——
+那是能力缺失,要等一种带字段快照的变更类型落地。
+
+`_CT` 是个合法取值,不代表"NEW_ASSET 真的会有双边快照"。
 """
 from __future__ import annotations
 
@@ -63,13 +77,19 @@ from arl_lite.core.monitor import (
 )
 from arl_lite.db.storage import Storage
 
+# r42:一个**合法**的 change_type。判基线要双边快照,而本模块能产出的
+# 两种类型在生产里都是单边的(见文件头),所以这里传的是一个
+# 「合法但生产中还没发生」的组合 —— 如实反映,不是替实现圆场。
+_CT = "NEW_ASSET"
+_OTHER_CT = "DISAPPEARED"
+
 
 @pytest.fixture
 def st(tmp_path):
     return Storage(workspace="t", workspace_root=tmp_path)
 
 
-def _flip(st, h, field, n, ctype="TITLE_CHANGED", threshold=None):
+def _flip(st, h, field, n, ctype=_CT, threshold=None):
     """让某资产某字段在两个取值之间来回变 n 次,返回每次有没有被记下来
 
     `threshold` 默认走 `record_change` 的默认值,**不**在 helper 里写死 ——
@@ -94,7 +114,7 @@ def _flip(st, h, field, n, ctype="TITLE_CHANGED", threshold=None):
             for i in range(n)]
 
 
-def _evolve(st, h, field, n, ctype="TITLE_CHANGED", threshold=None):
+def _evolve(st, h, field, n, ctype=_CT, threshold=None):
     """让某资产某字段**一路换新值**变 n 次(v0→v1→v2→…),永不回头
 
     这是单向演进:证书到期日一路往后推、IP 段迁移、DNS 切机房。
@@ -137,7 +157,7 @@ def test_flap_beyond_threshold_is_suppressed(st):
 def test_other_assets_are_unaffected(st):
     """一个资产判了基线,不能把别的资产也一起静默"""
     _flip(st, "noisy", "title", DEFAULT_BASELINE_LEARN + 1)
-    assert not is_baseline_noise(st, "quiet", "TITLE_CHANGED", "title"), (
+    assert not is_baseline_noise(st, "quiet", _CT, "title"), (
         "别的资产被牵连判成了基线"
     )
 
@@ -149,15 +169,24 @@ def test_other_fields_are_unaffected(st):
     是常态;反过来把整条记录静默掉,真发生的 ip 变化也就被吞了。
     """
     _flip(st, "h1", "title", DEFAULT_BASELINE_LEARN + 1)
-    assert not is_baseline_noise(st, "h1", "TITLE_CHANGED", "ip"), (
+    assert not is_baseline_noise(st, "h1", _CT, "ip"), (
         "title 的基线牵连到了 ip"
     )
 
 
 def test_other_change_types_are_unaffected(st):
-    """TITLE_CHANGED 的基线不牵连 STATUS_CHANGED"""
+    """一个 change_type 的基线不牵连另一个
+
+    r42 之前这条用的是 `TITLE_CHANGED` / `STATUS_CHANGED` 两个假类型
+    —— 两者都不在白名单里,`record_change` 也不校验,于是"隔离生效"
+    只需要两个字符串不同,和真实取值无关。收紧白名单后合法值只剩
+    `NEW_ASSET` / `DISAPPEARED` 两种,这条反而更真了:**它隔离的
+    是仅有的另一个合法类型**。
+    """
     _flip(st, "h1", "title", DEFAULT_BASELINE_LEARN + 1)
-    assert not is_baseline_noise(st, "h1", "STATUS_CHANGED", "title")
+    assert not is_baseline_noise(st, "h1", _OTHER_CT, "title"), (
+        f"{_CT} 的基线牵连到了 {_OTHER_CT}"
+    )
 
 
 # ── 阈值可调,且 0 关掉这个机制 ──
@@ -175,13 +204,13 @@ def test_threshold_is_configurable(st):
     都不该被静默,否则把阈值调小就等于把真变化一起关掉。压不压得住
     抖动,得先真的抖起来(见下一条 `test_low_threshold_...`)。
     """
-    assert record_change(st, "host", "C", "t1",
+    assert record_change(st, "host", _CT, "t1",
                          before={"a": 1}, after={"a": 2},
                          baseline_threshold=1) is True
-    assert record_change(st, "host", "C", "t1",
+    assert record_change(st, "host", _CT, "t1",
                          before={"a": 2}, after={"a": 1},
                          baseline_threshold=1) is True
-    assert record_change(st, "host", "C", "t1",
+    assert record_change(st, "host", _CT, "t1",
                          before={"a": 1}, after={"a": 2},
                          baseline_threshold=1) is False
 
@@ -202,9 +231,9 @@ def test_low_threshold_still_suppresses_a_flap(st):
 def test_threshold_zero_makes_is_baseline_noise_false(st):
     """threshold<=0 时 `is_baseline_noise` 直接 False,不查库"""
     _flip(st, "h1", "title", 10)
-    assert is_baseline_noise(st, "h1", "TITLE_CHANGED", "title",
+    assert is_baseline_noise(st, "h1", _CT, "title",
                              threshold=0) is False
-    assert is_baseline_noise(st, "h1", "TITLE_CHANGED", "title",
+    assert is_baseline_noise(st, "h1", _CT, "title",
                              threshold=-1) is False
 
 
@@ -222,7 +251,7 @@ def test_suppressed_change_is_not_written_to_the_table(st):
     """
     from arl_lite.core.monitor import list_changes
     kept = _flip(st, "h1", "title", DEFAULT_BASELINE_LEARN + 2)
-    rows = [c for c in list_changes(st, "host", "TITLE_CHANGED")
+    rows = [c for c in list_changes(st, "host", _CT)
             if c["asset_hash"] == "h1"]
     assert len(rows) == sum(kept), (
         f"表里有 {len(rows)} 条,实际记下来 {sum(kept)} 条 —— "
@@ -237,7 +266,7 @@ def test_first_change_is_still_written(st):
     """反证:没达阈值的那些确实在表里,否则上面那条也可能是"一条都没写" """
     from arl_lite.core.monitor import list_changes
     _flip(st, "h1", "title", 1)
-    rows = [c for c in list_changes(st, "host", "TITLE_CHANGED")
+    rows = [c for c in list_changes(st, "host", _CT)
             if c["asset_hash"] == "h1"]
     assert len(rows) == 1
 
@@ -259,10 +288,10 @@ def test_change_without_before_after_is_never_suppressed(st):
 def test_diff_is_still_computed_for_recorded_changes(st):
     """基线机制不能顺手把字段级 diff 弄坏"""
     from arl_lite.core.monitor import list_changes
-    record_change(st, "host", "TITLE_CHANGED", "hd",
+    record_change(st, "host", _CT, "hd",
                   before={"title": "a", "ip": "1.1.1.1"},
                   after={"title": "b", "ip": "1.1.1.1"})
-    row = next(c for c in list_changes(st, "host", "TITLE_CHANGED")
+    row = next(c for c in list_changes(st, "host", _CT)
                if c["asset_hash"] == "hd")
     import json
     d = json.loads(row["diff"])
@@ -298,7 +327,7 @@ def test_one_way_evolution_is_not_baseline_noise(st):
     绕过去 —— 门面的行为对了、被测判据本身坏了,前者一样会绿。
     """
     _evolve(st, "h1", "ip", 10)
-    assert is_baseline_noise(st, "h1", "TITLE_CHANGED", "ip") is False, (
+    assert is_baseline_noise(st, "h1", _CT, "ip") is False, (
         "变过 10 次但从不回头的演进,被判成了基线噪声"
     )
 
@@ -311,7 +340,7 @@ def test_one_way_evolution_is_actually_stored(st):
     from arl_lite.core.monitor import list_changes
     n = DEFAULT_BASELINE_LEARN + 5
     _evolve(st, "h1", "title", n)
-    rows = [c for c in list_changes(st, "host", "TITLE_CHANGED")
+    rows = [c for c in list_changes(st, "host", _CT)
             if c["asset_hash"] == "h1"]
     assert len(rows) == n, f"表里有 {len(rows)} 条,应该是 {n}"
 
@@ -334,7 +363,7 @@ def test_value_cycle_of_three_is_still_treated_as_noise(st):
     第 4 次才第一次出现重复取值 —— 序列 A,B,C 里还没有任何值回来过。
     """
     vals = ["A", "B", "C"]
-    kept = [record_change(st, "host", "TITLE_CHANGED", "h1",
+    kept = [record_change(st, "host", _CT, "h1",
                           before={"t": vals[i % 3]},
                           after={"t": vals[(i + 1) % 3]})
             for i in range(6)]
@@ -352,10 +381,10 @@ def test_nested_key_with_same_name_is_not_evidence(st):
     这条防的是"拿文本子串当结构判据"—— 也就是本项目反复栽的那种坑。
     """
     for i in range(DEFAULT_BASELINE_LEARN + 2):
-        record_change(st, "host", "TECH_CHANGED", "hn",
+        record_change(st, "host", _CT, "hn",
                       before={"geo": {"ip": f"10.0.0.{i}"}},
                       after={"geo": {"ip": f"10.0.1.{i}"}})
-    assert is_baseline_noise(st, "hn", "TECH_CHANGED", "ip") is False, (
+    assert is_baseline_noise(st, "hn", _CT, "ip") is False, (
         "geo 里的嵌套 ip 被当成了顶层 ip 字段的抖动证据"
     )
 
@@ -376,8 +405,8 @@ def test_unreadable_diff_row_is_not_evidence(st):
             """INSERT INTO asset_changes
                (workspace_id, asset_hash, asset_type, change_type, diff)
                VALUES (?, ?, ?, ?, ?)""",
-            (st.workspace_id, "h1", "host", "TITLE_CHANGED", '{"title": '))
-    assert is_baseline_noise(st, "h1", "TITLE_CHANGED", "title") is False, (
+            (st.workspace_id, "h1", "host", _CT, '{"title": '))
+    assert is_baseline_noise(st, "h1", _CT, "title") is False, (
         "坏 diff 的一行被当成了有效证据,把阈值凑够了"
     )
 
@@ -391,9 +420,9 @@ def test_type_change_still_produces_a_field_diff(st):
     """
     import json
     from arl_lite.core.monitor import list_changes
-    record_change(st, "host", "STATUS_CHANGED", "hb",
+    record_change(st, "host", _CT, "hb",
                   before={"ok": True}, after={"ok": 1})
-    row = next(c for c in list_changes(st, "host", "STATUS_CHANGED")
+    row = next(c for c in list_changes(st, "host", _CT)
                if c["asset_hash"] == "hb")
     assert row["diff"], "true→1 的字段级 diff 是空的,变更等于没记"
     d = json.loads(row["diff"])
@@ -406,11 +435,11 @@ def test_bool_and_one_are_different_values(st):
     `True == 1` 在 Python 里为真。不带类型名的话,序列 `True → 1 → 2`
     会被读成"1 出现了两次"= 回来过,把一次正常的类型收敛当抖动。
     """
-    record_change(st, "host", "STATUS_CHANGED", "hb",
+    record_change(st, "host", _CT, "hb",
                   before={"ok": True}, after={"ok": 1})
-    record_change(st, "host", "STATUS_CHANGED", "hb",
+    record_change(st, "host", _CT, "hb",
                   before={"ok": 1}, after={"ok": 2})
-    assert is_baseline_noise(st, "hb", "STATUS_CHANGED", "ok",
+    assert is_baseline_noise(st, "hb", _CT, "ok",
                              threshold=2) is False, (
         "true 和 1 被当成了同一个取值"
     )
@@ -423,7 +452,7 @@ def test_field_none_is_never_noise(st):
     更不构成噪声结论。
     """
     _flip(st, "h1", "title", 10)
-    assert is_baseline_noise(st, "h1", "TITLE_CHANGED", None) is False
+    assert is_baseline_noise(st, "h1", _CT, None) is False
 
 
 def test_flap_after_a_long_one_way_run_is_still_detected(st):
@@ -433,7 +462,7 @@ def test_flap_after_a_long_one_way_run_is_still_detected(st):
     历史,后面真的开始抖了也不该被放过。
     """
     _evolve(st, "h1", "ttl", 4)  # v0→v1→v2→v3→v4,四次演进
-    kept = [record_change(st, "host", "TITLE_CHANGED", "h1",
+    kept = [record_change(st, "host", _CT, "h1",
                           before={"ttl": "A" if i % 2 == 0 else "B"},
                           after={"ttl": "B" if i % 2 == 0 else "A"})
             for i in range(4)]

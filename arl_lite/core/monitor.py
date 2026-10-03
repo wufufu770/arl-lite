@@ -449,7 +449,42 @@ def record_change(storage, asset_type: str, change_type: str,
     判据见 `is_baseline_noise`。返回 bool 而不是 None,是为了让调用方
     知道"这条没报出去"—— 而不返回的话,调用方无法区分"记了"和"被挡了",
     报表上就会出现"报了 0 条",看起来像没检测到,其实是被去噪了。
+
+    ## `change_type` 必须在 `CHANGE_TYPES` 里,否则 raise
+
+    和 `Monitor.detect_changes` 对 `asset_type` 用 `_ASSET_TABLES` 白名单
+    是同一套纪律。**报错,不静默改写** —— 静默改写等于把一个拼错换成
+    另一个拼错,错得一模一样但更难查。
+
+    ## 为什么按「能力」而不是按 schema 注释里的「词表」
+
+    schema 的注释列了 6 种可能的取值(NEW_ASSET / DISAPPEARED /
+    TITLE_CHANGED / TECH_CHANGED / FINGERPRINT_CHANGED / STATUS_CHANGED),
+    那是**这张表能存什么**。`CHANGE_TYPES` 只有 2 种,是**本模块产得出
+    什么**。按词表校验的话,"注释里写过"就等于"实现了" —— 而事实是
+    `TITLE_CHANGED` 这类字段级变更**根本没有实现**:它们需要一个
+    「上一轮的字段快照」来对比,而资产表是原地 upsert 的,不留历史,
+    `asset_changes` 里也只有变更本身。r42 实测(白名单收紧前):
+    传 `'随便编的'` 或 `''` 都能入库并返回 True,拼错一个字母就是一条
+    永久静默的记录 —— 入库了,却没有任何代码路径会生成它。
+
+    ## r42 收紧白名单的直接后果,说在前面
+
+    **基线机制在生产路径上够不着了。** `record_change` 要判基线必须有
+    双边快照,而生产里唯一的两处调用(watcher 的 NEW_ASSET 只传 `after`、
+    DISAPPEARED 只传 `before`)都是单边的。所以 r40/r41 那套判据目前
+    只能靠直接构造历史行来验证,真实的 watcher 跑一次也不会走到它。
+
+    这是**能力缺失(做不了)**,不是这次修掉的 bug:资产自身的属性变了
+    (换 IP、换标题、换证书)系统本来就看不见。r42 只做的是把「看不见」
+    从静默变成报错。要真正用上基线,先得实现一种带字段快照的变更类型,
+    那是另一件事,已单独立项。
     """
+    if change_type not in CHANGE_TYPES:
+        raise ValueError(
+            f"unknown change_type: {change_type!r} "
+            f"(choose from {list(CHANGE_TYPES)})")
+
     # 逐字段判基线:只要**有一个**变动字段已达阈值,整条就是噪声。
     # 用任一而不是全部 —— 一个资产天天变的往往就那一项(比如 geo 漂移),
     # 拿它当基线不代表整条记录都不值得看,但足以说明这一条会持续刷屏。
