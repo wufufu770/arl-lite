@@ -5,7 +5,7 @@ Phase 1 命令(纯 argparse,零外部依赖):
     arl-lite query domains
     arl-lite query sites --filter "title like '%admin%'"
     arl-lite search sites "admin"
-    arl-lite export json --workspace example.com
+    arl-lite export --format json --workspace example.com
     arl-lite workspace list
     arl-lite workspace create foo
     arl-lite stats

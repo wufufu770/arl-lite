@@ -203,9 +203,9 @@ arl-lite ai config set ollama --base-url http://localhost:11434
 # 5 个 boundary commands
 arl-lite ai ask "解释这个关联分析"
 arl-lite ai report -w default
-arl-lite ai explain --finding-id 123
-arl-lite ai suggest --target example.com
-arl-lite ai fix --rule-id dev_port_public
+arl-lite ai explain 123
+arl-lite ai suggest -w default
+arl-lite ai fix 42
 ```
 
 ## 17 modules
