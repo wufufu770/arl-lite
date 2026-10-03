@@ -1,10 +1,12 @@
-"""r60/r61:面向用户的建议里不能混着跑不通的 arl-lite 命令。
+"""r60/r61/r63:面向用户的建议里不能混着跑不通的 arl-lite 命令。
 
 背景(实测,不是推演):`arl-lite correlate first`、`arl-lite export json`、
 README 里 `ai explain --finding-id` / `ai suggest --target` / `ai fix --rule-id`、
-`arl-lite perf-bench --scale 0.2` 共 6 处死路。跑不通的报错和真正原因毫无
-关系——用户看到「没关联分析」,照着提示敲 `correlate first`,撞上的是 argparse
-的「unrecognized arguments」。给用户一条走不通的路,比不给更坏(r59 立的规矩)。
+`arl-lite perf-bench --scale 0.2`、两处光秃秃的 `arl-lite run`、
+`arl-lite devloop done-item` 缺 `item_id` 共 8 处死路。跑不通的报错和真正
+原因毫无关系——用户看到「没关联分析」,照着提示敲 `correlate first`,撞上的
+是 argparse 的「unrecognized arguments」。给用户一条走不通的路,比不给更坏
+(r59 立的规矩)。
 
 ## r61 修的是判据自己的两个洞,不是新增第 7 处死路
 
@@ -60,16 +62,29 @@ README 里 `ai explain --finding-id` / `ai suggest --target` / `ai fix --rule-id
 不扫 `tests/`(里面故意有畸形输入)、不扫顶层 `devloop/`(变异脚本的字符串里全是
 故意的坏命令)、不扫 `devloop/backlog.md`(任务队列,引的都是片段)。
 
+## 缺参数这一支:先问「尾巴里有没有值」,不是「尾巴空不空」
+
+r61 的规则是反向的 —— 尾巴非空就放过。r63 把它改成正向的
+(`_tail_carries_a_value`),因为反向规则把第 8 处死路放过了整整两轮:
+`docs/devloop-protocol.md` 写 `arl-lite devloop done-item`,而 `done-item`
+必填 `item_id`,它后面跟的是散文 `直接调 q.finish(...) 而不传 note` ——
+**非空,但不是值**。散文、注释、表格说明列都救不了缺失的参数。
+f-string 槽、引号值、反引号值、`<占位符>` 才算值。
+
 ## 三类判定,不是两类
 
 r60 只有「跑得通 / 查不动」两类,靠「有没有 SystemExit」分。r61 拆成三类
 (`_verdict`):干净 / 死路 / 查不动。分法是**看 argparse 具体抱怨什么**,加上
-**命令后面还有没有原文**:
+**尾巴里有没有值**:
 
 * `invalid choice` 且抱怨的值不是占位符 → **死路**。值错不是缺值。
 * 抱怨的值本身是占位符(`<subcmd>`、`...`)→ 查不动,那本来就是「填这里」。
-* 抱怨缺参数/缺值 → 看尾巴。尾巴里还有东西就是提取器够不着
-  (`arl-lite ai ask "解释这个关联分析"` 里明明有 question),尾巴空了才是建议没给。
+* 抱怨缺参数/缺值,且尾巴里**有值**(中文引号值、f-string 槽)→ 查不动,
+  是提取器够不着(`arl-lite ai ask "解释这个关联分析"` 里明明有 question)。
+* 抱怨缺参数/缺值,但尾巴里**没值** → **死路**,建议真的没给。
+
+r63 之后实测:102 条建议 / 91 干净 / 0 死路 / 10 查不动(提取截断 8 + 占位符 2)。
+打标本身的判据在 `tests/test_advice_unchecked_are_classified.py`。
 
 放过不等于不查:`test_criterion_actually_checks_enough_commands` 钉住「真验条数」
 下限,`test_the_unchecked_ones_stay_unchecked` 钉住「查不动条数」下界 —— 两头
@@ -292,19 +307,75 @@ def _verdict(cmd: str, tail: str) -> str:
       尾巴空了才是建议真的没给。
     * 没抱怨但 parse_known_args 剩了东西 → 死路(A2 管的那些)。
     """
+def _complained_value(says: str) -> str:
+    """从 `invalid choice: '0.2' (choose from ...)` 里把值抠出来。"""
+    return says.split("invalid choice:")[-1].split("(")[0].strip().strip("'\"")
+
+
+def _is_placeholder(tok: str) -> bool:
+    return tok[:1] in "<{" or tok == "..."
+
+
+def _tail_carries_a_value(tail: str) -> bool:
+    """尾巴里有没有一个**能补上缺失参数**的 token。
+
+    这是 r63 的核心规则,方向是**正向**的:先问「有没有值」,而不是
+    「有没有可疑内容」。r61 用的是反向 —— 尾巴非空就放过 —— 而 r63 实测
+    逮到第 8 处死路(`arl-lite devloop done-item` 后面跟的是散文
+    `直接调 q.finish(...) 而不传 note`,不是 item_id),反向规则把它放过了。
+
+    什么算「值」:引号包住的(`"标题"`)、反引号包住的、f-string 槽(`\\x00`)。
+    什么**不**算:裸散文、注释(`# 说明`)、表格的说明列。
+    注释那条是判据自己的合成输入先逮到的,现在被这条正向规则统一掉了 ——
+    注释本来就只是散文的一种。
+    """
+    if not tail:
+        return False
+    first = tail.split()[0] if tail.split() else ""
+    return first[:1] in ('"', "'", "`", "\x00") or _is_placeholder(first)
+
+
+def _why_unchecked(cmd: str, tail: str) -> str:
+    """「查不动」的进一步归类 —— 机器可判,不是人肉归类。
+
+    四类,穷尽且互斥:
+    * `占位符`   —— argparse 抱怨的值本身就是 `<subcmd>` / `...`,那本来就是「填这里」
+    * `提取截断` —— 尾巴里**有**值,是提取器吃不下(引号值 / f-string 槽)
+    * `散文收尾` —— 尾巴里**没有**值,后面是给人看的说明
+    * `没给`     —— 尾巴是空的
+    """
+    says = _argparse_says(cmd)
+    if "invalid choice" in says and _is_placeholder(_complained_value(says)):
+        return "占位符"
+    if not tail:
+        return "没给"
+    return "提取截断" if _tail_carries_a_value(tail) else "散文收尾"
+
+
+def _verdict(cmd: str, tail: str) -> str:
+    """这条建议是「干净」「死路」还是「查不动」。
+
+    r60 用「有没有 SystemExit」一刀切,把 argparse 的四类抱怨混成一句,
+    于是 r61 实测到的第 6、7 处死路被放过了一整轮。这一版按抱怨类型分开:
+
+    * `invalid choice` 且抱怨的值**不是**占位符 → 死路。值是**错的**不是缺的,
+      后面补什么都救不回来(`--scale 0.2` 只收 {small,medium,large})。
+    * 抱怨的值本身就是占位符 → 查不动,那本来就是「填这里」。
+    * 抱怨「缺参数 / 缺值」→ 看尾巴**有没有值**(`_tail_carries_a_value`)。
+      有,是提取器够不着(`arl-lite ai ask "解释这个关联分析"` 里明明有
+      question);没有 —— 散文、注释、空尾巴 —— 建议真的没给,判死路。
+    * 没抱怨但 parse_known_args 剩了东西 → 死路(A2 管的那些)。
+    """
     says = _argparse_says(cmd)
     if not says:
         extra = _leftovers(cmd)
         return "clean" if not extra else f"deadend:多余参数 {extra}"
     if "invalid choice" in says:
-        value = says.split("invalid choice:")[-1].split("(")[0].strip().strip("'\"")
-        if value[:1] in "<{" or value == "...":
+        value = _complained_value(says)
+        if _is_placeholder(value):
             return f"unchecked:占位符 {value}"
         return f"deadend:值不合法 {value}"
-    if not tail or tail.startswith("#"):
-        # 尾巴是注释(命令后面跟 `# 说明`)也算「没给」:注释不可能是参数值。
-        # 这条不是洁癖 —— 判据自己第一版就靠合成输入逮到了:说缺 `gate_name`
-        # 而尾巴是 `# 跑单个门禁并打印实测值`,那是表格的说明列,不是参数。
+    if not _tail_carries_a_value(tail):
         return f"deadend:{says}"
     return f"unchecked:提取到 {tail[:20]}"
 

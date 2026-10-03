@@ -2344,7 +2344,7 @@ backlog,而 r36 让那个函数合法地过滤掉已完成行 —— 于是它**
 ## 补记:`devloop done-item` 这扇门也漏了 provenance
 
 补记那两条时一眼看见 note 全空 —— r34 只把 provenance 接在了 `round()` 上,
-`arl-lite devloop done-item` 直接调 `q.finish(...)` 而**不传 note**。
+`arl-lite devloop done-item <id>` 直接调 `q.finish(...)` 而**不传 note**。
 
 而手工交活正是最需要凭据的场景:agent 独立干活,交活发生在两次 `round`
 之间,没有 `round()` 替它写任何东西。空 note 的危害不是"少个字段" ——
