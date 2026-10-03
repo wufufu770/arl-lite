@@ -777,6 +777,8 @@ def cmd_monitor_add(args) -> int:
 
 def cmd_monitor_list(args) -> int:
     from .core.monitor import Monitor
+    if _ensure_workspace_exists(args.workspace):
+        return 1
     storage = Storage(workspace=args.workspace)
     monitors = Monitor(storage).list()
     if not monitors:
@@ -1035,6 +1037,8 @@ def cmd_monitor_changes(args) -> int:
     if args.limit is not None and args.limit <= 0:
         print(f"[!] --limit must be > 0 (got {args.limit})", file=sys.stderr)
         return 2
+    if _ensure_workspace_exists(args.workspace):
+        return 1
     storage = Storage(workspace=args.workspace)
     asset_hash = None
     if getattr(args, "asset", None):
@@ -1146,6 +1150,13 @@ def cmd_tui(args) -> int:
 
 def cmd_risk_summary(args) -> int:
     from .core.risk_score import risk_summary
+    # 与同族的 cmd_risk_top 保持一致:只读命令不静默建工作区。
+    # 实测零工作区下 `risk top` rc=1 报 workspace not found,
+    # 而 `risk summary` 却 rc=0、静默建出 default、并打印一份
+    # 「全 0 概览」—— 同一份数据、同一个 workspace 名下两条路
+    # 给出互相矛盾的答案,用户没法判断自己的数据是不是真没了。
+    if _ensure_workspace_exists(args.workspace):
+        return 1
     storage = Storage(workspace=args.workspace)
     s = risk_summary(storage)
     print(f"[+] workspace '{args.workspace}' 风险概览")

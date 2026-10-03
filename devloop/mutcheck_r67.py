@@ -44,10 +44,10 @@ WAYOUT_END = "    return 1"
 WAYOUT_CMD = '        print(f"        arl-lite run -t <target>", file=sys.stderr)'
 
 # 端到端判据那段的起止标记(按标记切,不按行号切)
-# 起点只锚**首行** —— 首版把 `failed = []` 和 `for cmd in cmds:` 写死成
-# 相邻两行,而 r67 判据中途在两者之间插了一行 `net_blocked = []`,
-# 锚点当场断裂。标记要锚在不会被人随手插东西的地方。
-C2_FROM = "    failed = []\n"
+# r68 期间判据重构过一次(「出路 rc=0」这个错指标被换成
+# 「出路达成目的」,那套网络 skip 机制一起删了),锚点随之失效。
+# 教训又是一次:锚点要锚在**语义稳定**的地方,别锚在会被重构掉的中间步骤上。
+C2_FROM = "    for cmd in cmds:\n"
 C2_TO = "def test_the_way_out_does_not_point_at_workspace_create"
 
 
@@ -106,11 +106,16 @@ MUTANTS = [
 # ---- 覆盖变异:改坏判据自己,期望**存活**(真实现已经是对的)
 
 COVERAGE_MUTANTS = [
-    # C1: 端到端放宽到接受 rc=1 —— 实测被负向判据
-    # 「出路不许指向 workspace create」兜住
+    # C1: 放宽端到端唯一那个断言 —— 期望存活(真实实现本来就通过),
+    #     而「出路指向 workspace create」那类真问题由负向判据独立逮住。
+    # 锚点随 r68 的判据重构改过一次:首版锚的是循环里那句
+    # `if rr.returncode != 0:`,重构把它整个删掉了,脚本当场报
+    # 「锚点没命中」并中止(幸而 finally 复原了文件,判据没被改坏 ——
+    # 但这已经是 r66/r67 各一次的同类事故:锚点锚在了会被重构掉的中间步骤上)。
+    # 现在锚的是**契约本身**,它在重构后仍然存在,而且语义稳定。
     ("C1-端到端接受rc1", lambda p: _apply(
-        p, "        if rr.returncode != 0:",
-        "        if rr.returncode not in (0, 1):"), True),
+        p, "    assert after.returncode == 0, (",
+        "    assert after.returncode in (0, 1), ("), True),
 
     # C2 前两版都**被杀**,两次原因不同,如实记着:
     #  v1「把抠出路的正则退回跨行版」→ 跨行抠出不存在的东西,

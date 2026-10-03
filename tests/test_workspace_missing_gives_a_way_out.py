@@ -44,8 +44,6 @@ import re
 import subprocess
 import sys
 
-import pytest
-
 REPO = pathlib.Path(__file__).resolve().parent.parent
 
 # 走 _ensure_workspace_exists 的全部只读子命令 —— 实测逐条确认过。
@@ -81,22 +79,12 @@ def _run(argv, home, timeout=180):
 # **会偶发失败**的步骤:网络抖动 / 被墙 / 全量负载下超时,都会让它
 # 非零退出,而那跟本轮要守的东西没关系。
 #
-# 判据必须能区分「出路是死的」和「网络此刻不通」—— 否则它就成了
-# 随机红/绿的信号,而恒真或恒假的断言都比没有断言更糟。
-# 判据:网络类症状(超时 / 连不上 / 解析失败)一律 skip,
-# 其余非零退出照常判死路。
-_NET_MARKERS = (
-    "timeout", "timed out", "Connection", "connection",
-    "Temporary failure", "Name or service not known", "network",
-    "Max retries exceeded", "SSLError", "ProxyError",
-)
-
-
-def _looks_like_network(tr: subprocess.CompletedProcess) -> bool:
-    out = (tr.stdout + tr.stderr)
-    if isinstance(tr, subprocess.TimeoutExpired):
-        return True
-    return any(m in out for m in _NET_MARKERS)
+# 这里曾经有一整套「网络症状识别 + 条件 skip」的机制(_NET_MARKERS /
+# _looks_like_network)。**已删**,理由记在 test_the_way_out_actually_works
+# 的 docstring 里:出路 `arl-lite run -t <target>` 必然出网,网络不通时
+# 它整体 rc=1,却照样建出了工作区 —— 也就是说「出路自身 rc=0」根本不是
+# 这条路要兑现的契约。按退出码判死活是判错了指标,于是整套 skip 机制
+# 一起成了没用的东西。留着没人调的 helper 就是噪声。
 
 
 def _fresh_home(tmp_path, name):
@@ -157,11 +145,21 @@ def test_missing_workspace_error_always_gives_a_way_out(tmp_path):
 
 
 def test_the_way_out_actually_works(tmp_path):
-    """出路必须**照着敲真能跑通** —— 本轮最硬的一条。
+    """出路必须**照着敲能达成它的目的** —— 本轮最硬的一条。
 
     实测过:`workspace create default` 在空环境下报
     「already exists」rc=1(Storage 先静默建了库),
     所以那条最像样的出路本身就是条错路。只有端到端跑一遍才发现得了。
+
+    **判据看的是「出路达成了目的」,不是「出路自己 rc=0」** ——
+    这条是踩出来的:首版断言出路命令自身必须 rc=0,结果全量下红了两次
+    (`test_baseline` 门禁两次点名它)。真因实测:出路是
+    `arl-lite run -t <target>`,而所有 recon 模块都要出网,
+    网络不通时 `run` 整体 rc=1 —— 但它**照样建出了 default 工作区**
+    (实测:把 HTTP(S)_PROXY 指向黑洞端口 127.0.0.1:9,
+    `run` rc=1,而 `default` 目录在,随后 `stats` rc=0)。
+    也就是说「rc=0」从来就不是这条路要兑现的承诺,
+    「让 stats 能跑」才是。按契约判,而不是按退出码猜。
     """
     home = _fresh_home(tmp_path, "e2e")
     r = _run(["stats"], home)
@@ -169,41 +167,22 @@ def test_the_way_out_actually_works(tmp_path):
     cmds = _way_out_commands(combined)
     assert cmds, f"没抓到出路:{combined[-300:]}"
 
-    failed = []
-    net_blocked = []
     for cmd in cmds:
         argv = cmd.split()[1:]
         # `<target>` / `<name>` 是占位符,换成真值再跑
         argv = ["example.com" if a == "<target>" else a for a in argv]
         try:
-            rr = _run(argv, home, timeout=300)
-        except subprocess.TimeoutExpired as e:
-            net_blocked.append(f"  `{cmd}` 超时")
-            continue
-        if _looks_like_network(rr):
-            net_blocked.append(f"  `{cmd}` 像是网络不通:{(rr.stdout + rr.stderr)[-120:]}")
-            continue
-        if rr.returncode != 0:
-            failed.append(f"  `{cmd}` rc={rr.returncode}: "
-                          f"{(rr.stdout + rr.stderr).strip()[-200:]}")
-    assert not failed, "报错里给出的出路照着敲跑不通:\n" + "\n".join(failed)
+            _run(argv, home, timeout=300)
+        except subprocess.TimeoutExpired:
+            # 超时不算失败 —— 只要工作区建出来了,目的就达成了。
+            # 真死路是「敲完了 stats 仍然跑不了」,那在下面验。
+            pass
 
-    # 照着敲完之后,原本报错的命令必须真的能跑了。
-    # 网络不通时这一步无从谈起(出路里的 run 没能建出工作区),
-    # 那就如实 skip —— 但**要先确认网络真的是原因**,不能把
-    # 「出路根本没建出工作区」这个真问题也一起 skip 掉。
-    if net_blocked:
-        ws_root = home / ".arl-lite" / "workspaces"
-        made = [d.name for d in ws_root.iterdir()] if ws_root.exists() else []
-        assert "default" in made, (
-            f"网络不通可以 skip,但工作区压根没建出来 —— "
-            f"那不是网络的问题,是出路的问题。net_blocked={net_blocked},made={made}"
-        )
-        pytest.skip(f"网络不可用,跳过后半截:{net_blocked}")
-
+    # 唯一该断言的:照着敲完,原本报错的命令必须真的能跑了。
     after = _run(["stats"], home)
     assert after.returncode == 0, (
-        f"照出路敲完,{after.stdout + after.stderr}[-300:]"
+        f"照出路敲完,stats 仍跑不通(rc={after.returncode}):"
+        f"{(after.stdout + after.stderr)[-300:]}"
     )
 
 
