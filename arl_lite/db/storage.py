@@ -53,29 +53,50 @@ def compute_hash(*parts: str) -> str:
     return hashlib.sha256(joined.encode()).hexdigest()[:16]
 
 
-# 资产的「身份」= 拿哪几段拼成去重键。词表只此一份:入库(`add_*` → `_upsert_asset`)
-# 和按名字反查(CLI 的 `monitor changes --asset`)都必须走 `compute_asset_hash`。
-# 手写第二份的后果不是「多几行代码」,是**两处各自漂**:r45 清掉过 CLI 的
-# choices 硬编码词表,下一轮我自己又写了份 `_ASSET_LABEL_FIELDS`,同一个毛病。
+# 段的**默认值**:对应 `add_*` 形参的默认值,不是一个新概念。`add_finding` 的
+# `title` 形参默认就是 `""`,所以那一段有默认值 —— 批量入库省略它时必须落到
+# 和 `add_finding` 同一个 hash 上,否则同一批资产从两条路进来会变成两个。
+# (r49 实测:一开始这里没默认值,`bulk_insert` 省略 title 会直接报错,而
+#  `add_finding` 省略它没事 —— 两条路对同一条数据的答案不一致。)
+_REQUIRED = object()
+
+# 资产的「身份」= 拿哪几段拼成去重键。词表只此一份:入库(`add_*` → `_upsert_asset`)、
+# 批量入库(`bulk_insert`)和按名字反查(CLI 的 `monitor changes --asset`)
+# 都必须走 `compute_asset_hash`。手写第二份的后果不是「多几行代码」,
+# 是**两处各自漂**:r45 清掉过 CLI 的 choices 硬编码词表,下一轮我自己又写了份
+# `_ASSET_LABEL_FIELDS`,同一个毛病。
 #
 # 键是**表名**(复数),不是 asset_type(单数),和 `_MUTABLE_TEXT` / `_MUTABLE_PLAIN`
 # 保持一致 —— `db` 不 import `core`,所以 asset_type↔表名的映射归
 # `Monitor._ASSET_TABLES` 所有,本模块只按表名说话。两侧的键集合由
 # tests/test_monitor_changes_filter.py 双向钉住。
 #
-# 值的形状是 `(段名..., 分隔符)`。单段用空分隔符 —— 那不是「占位的空串」,
-# 是「只有一段,不需要拼」;写成显式空分隔符好过再开一个分支。
-_ASSET_IDENTITY: dict[str, tuple[tuple[str, ...], str]] = {
-    "domains": (("domain",), ""),
-    "hosts": (("host",), ""),
-    "ports": (("host", "port"), ":"),
-    "sites": (("url",), ""),
-    "findings": (("target", "finding_type", "title"), "|"),
+# 值的形状是 `(列名..., 分隔符, 默认值...)`。**列名指的是「这一段的值在表行的
+# 哪一列」**,不是 `add_*` 的形参名 —— ports 的形参叫 `host`,但列名是 `ip`
+# (`add_port` 写的就是 `fields={"ip": host}`)。这么定是为了让 `bulk_insert`
+# 能**按名字**从一行里把身份取出来,不用再写一份 if-else。
+#
+# 传参仍是**按位置**的,所以列名只用于「段数对不对」的检查和批量入库时按列取值,
+# 不参与计算 —— `compute_asset_hash(1, "ports", "1.1.1.1", 443)` 和
+# `compute_asset_hash(1, "ports", "1.1.1.1", "443")` 等价。
+_ASSET_IDENTITY: dict[str, tuple[tuple[str, ...], str, tuple]] = {
+    "domains": (("domain",), "", (_REQUIRED,)),
+    "hosts": (("host",), "", (_REQUIRED,)),
+    "ports": (("ip", "port"), ":", (_REQUIRED, _REQUIRED)),
+    "sites": (("url",), "", (_REQUIRED,)),
+    "findings": (("target", "finding_type", "title"), "|",
+                 (_REQUIRED, _REQUIRED, "")),
 }
 
 
 def compute_asset_hash(workspace_id: int, table: str, *identity) -> str:
     """这个资产的 hash。`table` 是表名(`domains`/`hosts`/…),不是 asset_type。
+
+    ## 段可以为空,但不能是 `None`
+
+    `add_finding` 的 `title` 默认就是 `""`,所以空值是合法身份的一部分。
+    但 `None` 表示**调用方根本没给这一段** —— 少一段照样能算出一个 16 位
+    hash,于是资产被静默存成另一个身份。`None` 报错,`""` 放行。
 
     ## 关于 workspace_id:它在 hash 里,但**今天恒等于 1**
 
@@ -89,24 +110,58 @@ def compute_asset_hash(workspace_id: int, table: str, *identity) -> str:
     一个库放多个工作区,`workspace_id` 才会真的开始变,而那时任何漏掉它的
     「按名字算 hash」会静默算出对不上的值。`db` 不该替这个布局变化买单,
     所以参数留着,注释说清现状。
-
-    ## 段数不对要报错,不要凑
-
-    少给一段照样能算出一个 16 位 hash,于是资产被静默存成另一个身份。
-    宁可 `ValueError`(和 `add_domain` 拒绝空域名同一纪律)。
     """
     spec = _ASSET_IDENTITY.get(table)
     if spec is None:
         raise ValueError(
             f"unknown asset table: {table!r} "
             f"(known: {', '.join(sorted(_ASSET_IDENTITY))})")
-    names, sep = spec
+    names, sep, _defaults = spec
     if len(identity) != len(names):
         raise ValueError(
             f"{table} 的身份是 {len(names)} 段"
             f"({' + '.join(names)}),给了 {len(identity)} 段:"
             f" {', '.join(str(i) for i in identity)}")
+    for name, v in zip(names, identity):
+        if v is None:
+            raise ValueError(
+                f"{table} 的身份段 {name!r} 是 None —— 调用方没给这一段。"
+                f"想用默认值请显式传(见 _ASSET_IDENTITY),"
+                f"空串和 None 不是一回事。")
     return compute_hash(str(workspace_id), sep.join(str(p) for p in identity))
+
+
+def asset_identity_of_row(workspace_id: int, table: str, row: dict) -> str:
+    """从一行**表数据**里算资产 hash —— 身份按列名从 row 里取,缺的用默认值
+
+    给 `bulk_insert` 用:那里的输入是 dict 而不是形参,只能按列名取。
+    列名和默认值都住在 `_ASSET_IDENTITY` 里,所以这和 `add_*` 走的是**同一份**
+    定义,不再是第二份 if-else。
+
+    ## 缺列为什么不能用 `''` 一律顶上
+
+    那样一个真的漏了身份列的行会算出一个「看起来很正常」的 hash,然后被存成
+    某个别的资产。`title` 这种**本来就有默认值**的段才允许缺,其余的段缺了
+    就是调用方漏了,报错(`NOT NULL` 约束最后也会拦,但那时报的是约束名,
+    不是「你少了 host 这一段」)。
+    """
+    spec = _ASSET_IDENTITY.get(table)
+    if spec is None:
+        raise ValueError(
+            f"{table!r} 不在 _ASSET_IDENTITY 里,没法按行算身份。"
+            f"要么它不是资产表(那就别给它算 hash),要么该往表里补一份定义。")
+    names, _sep, defaults = spec
+    parts = []
+    for name, default in zip(names, defaults):
+        if name in row:
+            parts.append(row[name])
+        elif default is _REQUIRED:
+            raise ValueError(
+                f"{table} 的行缺身份列 {name!r} —— 这一段没有默认值,"
+                f"补上它,或者调用方是漏传了。")
+        else:
+            parts.append(default)
+    return compute_asset_hash(workspace_id, table, *parts)
 
 
 # 用户提供的 SQL 片段(WHERE 子句)里禁止出现的写操作关键字。
@@ -860,19 +915,15 @@ class Storage:
                         if ts_col in valid_cols:
                             row.setdefault(ts_col, now)
                     if "hash" in valid_cols and "hash" not in row:
-                        # 自动用表典型 unique key 算 hash
-                        # 注意:列名 alias 已生效,ports 表此时键是 ip(不是 host)
-                        if table == "findings":
-                            unique = f"{row.get('target', '')}|{row.get('finding_type', '')}|{row.get('title', '')}"
-                        elif table == "ports":
-                            unique = f"{row.get('ip', '')}:{row.get('port', '')}"
-                        elif table == "sites":
-                            unique = row.get("url", "")
-                        elif table == "correlations":
-                            unique = f"{row.get('rule_name', '')}|{row.get('target', '')}"
-                        else:
-                            unique = row.get("host") or row.get("domain") or row.get("name") or str(i)
-                        row["hash"] = compute_hash(str(self.workspace_id), unique)
+                        # 身份怎么拼归 `_ASSET_IDENTITY` 一家(和 `add_*` 用的
+                        # 是同一份),按**列名**从这一行里取,不再是本文件里
+                        # 第二份 if-else。
+                        #
+                        # 白名单里 correlations 没有 hash 列,压根到不了这里
+                        # —— 原来那个 `elif table == "correlations"` 分支
+                        # 是死代码,和 r48 删掉的 `hash_key` 死参数同一类。
+                        row["hash"] = asset_identity_of_row(
+                            self.workspace_id, table, row)
 
                     if on_conflict == "ignore":
                         cols = list(row.keys())
