@@ -1264,6 +1264,56 @@ class Storage:
     # 查询
     # =========================
 
+    # 能被 `query` / `count_rows` 查的表。**和 `bulk_insert` 里那个局部
+    # `ALLOWED_TABLES` 不是一回事,故意不同名**:那边是「能批量写入的表」,
+    # 这边是「能读的表」—— 集合确实不同(这边多 tasks / monitors /
+    # asset_changes 等),合起来会让两个白名单慢慢漂成同一个。
+    QUERY_TABLES = frozenset({
+        "domains", "hosts", "ports", "sites", "findings",
+        "tasks", "source_status", "correlations", "asset_changes",
+        "workspaces", "monitors", "schedules",
+    })
+
+    @staticmethod
+    def _query_where(table: str, ws: int, filter_sql: str | None) -> str:
+        """`query` 的 WHERE 片段。**只此一份**,`query` 和 `count_rows` 共用
+
+        ## 为什么抽出来(r56)
+
+        CLI 要报「共 N 条,只显示了 M 条」。那个 N 如果自己再拼一遍
+        WHERE,一旦两边漂了就会说出「共 200 条」而当前筛选下其实只有
+        50 条 —— **比不报更坏**,那是个看起来精确的假数字。r55 在
+        `asset_changes` 上栽过一次(r51 的 dry-run 骗人同源),这里不重复。
+
+        `filter_sql` 是**用户传的** SQL 子句,所以共用尤其要紧:一条
+        `--filter "status='down'"` 的总数,必须和列表数的是同一批行。
+        """
+        sql = " WHERE workspace_id = ?"
+        if filter_sql:
+            check_filter_sql(filter_sql)
+            sql += f" AND ({filter_sql})"
+        return sql
+
+    def count_rows(
+        self,
+        table: str,
+        filter_sql: str | None = None,
+        workspace_id: int | None = None,
+    ) -> int:
+        """这张表在当前筛选下**一共**有多少行 —— `query` 截断前的真实条数
+
+        走 `_query_where`,和 `query` 同一份条件(含 `check_filter_sql`
+        的白名单校验),所以两边不会漂。表名白名单也共用同一份。
+        """
+        if table not in self.QUERY_TABLES:
+            raise ValueError(
+                f"table '{table}' not in whitelist: {sorted(self.QUERY_TABLES)}")
+        ws = workspace_id or self.workspace_id
+        where = self._query_where(table, ws, filter_sql)
+        with self._conn() as conn:
+            return int(conn.execute(
+                f"SELECT COUNT(*) FROM {table}{where}", [ws]).fetchone()[0])
+
     def query(
         self,
         table: str,
@@ -1278,21 +1328,16 @@ class Storage:
             filter_sql: 可选 WHERE 子句(不含 WHERE 关键字)
             limit: 最大行数
         """
-        ALLOWED = {"domains", "hosts", "ports", "sites", "findings",
-                   "tasks", "source_status", "correlations", "asset_changes",
-                   "workspaces", "monitors", "schedules"}
-        if table not in ALLOWED:
-            raise ValueError(f"table '{table}' not in whitelist: {sorted(ALLOWED)}")
+        if table not in self.QUERY_TABLES:
+            raise ValueError(
+                f"table '{table}' not in whitelist: {sorted(self.QUERY_TABLES)}")
 
         ws = workspace_id or self.workspace_id
         if not isinstance(limit, int) or limit < 0 or limit > 10000:
             raise ValueError(f"limit must be int 0..10000, got {limit!r}")
-        sql = f"SELECT * FROM {table} WHERE workspace_id = ?"
+        where = self._query_where(table, ws, filter_sql)
+        sql = f"SELECT * FROM {table}{where} ORDER BY id DESC LIMIT {int(limit)}"
         params: list = [ws]
-        if filter_sql:
-            check_filter_sql(filter_sql)
-            sql += f" AND ({filter_sql})"
-        sql += f" ORDER BY id DESC LIMIT {int(limit)}"
         with self._conn() as conn:
             try:
                 rows = conn.execute(sql, params).fetchall()
@@ -1304,30 +1349,76 @@ class Storage:
 
     # ---------- 全文搜索(FTS5)----------
 
+    FTS_TABLES = {"sites": "sites_fts", "domains": "domains_fts",
+                  "findings": "findings_fts"}
+
+    def _search_where(self, table: str, keyword: str) -> tuple[str, str, list]:
+        """FTS 搜索的 FROM/JOIN/WHERE 片段 + 参数。**只此一份**,
+        `search` 和 `count_search` 共用。
+
+        关键词的双引号包裹和转义在这里做一次 —— 那是安全边界的一部分,
+        两处各写一遍就等于两处各漏一次。r56 的理由同 `_query_where`:
+        「数出来的」和「查出来的」必须是同一批行,否则报出的是个
+        看起来精确的假总数。
+        """
+        if table not in self.FTS_TABLES:
+            raise ValueError(f"FTS not available for {table}")
+        fts_table = self.FTS_TABLES[table]
+        # FTS5 特殊字符: . , : ; ! ? * " ( ) [ ] { } ^ $ - + |
+        # 用双引号包整个 phrase,FTS5 双引号内特殊字符视为字面量
+        # 内部双引号转义为 ""
+        if not keyword or not keyword.strip():
+            return "", "", []
+        safe = keyword.strip().replace('"', '""')
+        fts_query = f'"{safe}"'
+        frag = (f"FROM {table} JOIN {fts_table} "
+                f"ON {fts_table}.rowid = {table}.id "
+                f"WHERE {fts_table} MATCH ? AND {table}.workspace_id = ?")
+        return frag, fts_table, [fts_query, self.workspace_id]
+
+    def count_search(self, table: str, keyword: str) -> int | None:
+        """FTS 搜索在当前关键词下**一共**命中多少条 —— `search` 截断前的真实条数
+
+        走 `_search_where`,和 `search` 同一份 FROM/JOIN/WHERE 与转义。
+
+        ## 查不出来时返回 `None`,不是 0
+
+        `search` 在 FTS5 出错时会**退回 LIKE 搜索**继续给结果。那种情况下
+        本方法数的是 FTS 的条数,而列表给的是 LIKE 的条数 —— 两个不同的
+        集合,拿 FTS 的数当总数就是**报一个看起来精确的假数字**。
+
+        更糟的是把它当 0:`0` 的含义是「确实一条都没命中」,而真实情况是
+        「没查出来」。那正是 r47 在 `_ASSET_LABEL_FIELDS` 上栽过的
+        (列名写错 → 静默降级 → 什么都不报),这里同理 —— **静默比错更坏**。
+
+        所以查不出来就说查不出来:调用方拿 `None` 时不显示总数,或者
+        明说「总数未知」。返回类型是可空,int 才是「数出来了」。
+        """
+        frag, _, params = self._search_where(table, keyword)
+        if not frag:                      # 空关键词:`search` 返回 [],这里也是 0
+            return 0
+        with self._conn() as conn:
+            try:
+                return int(conn.execute(
+                    f"SELECT COUNT(*) {frag}", params).fetchone()[0])
+            except Exception as e:
+                # 不 raise:统计是旁路,不该让整条命令挂掉。但也不能假装数到了。
+                log.warning(f"FTS5 count failed for keyword {keyword!r}: {e}")
+                return None
+
     def search(
         self,
         table: str,        # "sites" | "domains" | "findings"
         keyword: str,
         limit: int = 50,
     ) -> list[dict]:
-        FTS_TABLES = {"sites": "sites_fts", "domains": "domains_fts", "findings": "findings_fts"}
-        if table not in FTS_TABLES:
-            raise ValueError(f"FTS not available for {table}")
-        fts_table = FTS_TABLES[table]
-        # FTS5 特殊字符: . , : ; ! ? * " ( ) [ ] { } ^ $ - + |
-        # 用双引号包整个 phrase,FTS5 双引号内特殊字符视为字面量
-        # 内部双引号转义为 ""
-        if not keyword or not keyword.strip():
+        frag, _, params = self._search_where(table, keyword)
+        if not frag:                      # 空关键词
             return []
-        safe = keyword.strip().replace('"', '""')
-        fts_query = f'"{safe}"'
-        sql = f"""SELECT {table}.* FROM {table}
-                  JOIN {fts_table} ON {fts_table}.rowid = {table}.id
-                  WHERE {fts_table} MATCH ? AND {table}.workspace_id = ?
-                  ORDER BY rank LIMIT {int(limit)}"""
+        sql = f"SELECT {table}.* {frag} ORDER BY rank LIMIT {int(limit)}"
         with self._conn() as conn:
             try:
-                rows = conn.execute(sql, (fts_query, self.workspace_id)).fetchall()
+                rows = conn.execute(sql, params).fetchall()
             except Exception as e:
                 log.warning(f"FTS5 search failed for keyword {keyword!r}: {e}")
                 # fallback: 退到 LIKE 搜索(各表实际存在的列,别再引用不存在的列)

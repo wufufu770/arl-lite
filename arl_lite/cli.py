@@ -88,6 +88,74 @@ def _ensure_workspace_exists(name: str) -> int:
     return 1
 
 
+def _needs_total(shown: int, limit: int) -> bool:
+    """行数顶到 `--limit` 才**可能**被截断 —— 没顶到就不用付 COUNT 的钱
+
+    这条判定被 `query` / `search` / `monitor changes` 三处共用,理由同
+    `_limit_notice_text`:三处各写一遍,早晚会有一处忘了。
+    """
+    return shown >= limit
+
+
+def _limit_notice_text(shown: int, total: int | None, limit: int,
+                       noun: str = "row") -> str:
+    """被 `--limit` 截断时的说明。没截断时返回空串。
+
+    `noun` 是给用户看的量词(`change` / `row` / `rule`):模板共用,但
+    「200 个什么」得和命令的语境对得上 —— `monitor changes` 说 row
+    会让人以为是资产行。
+
+    ## 为什么要有这么一个共用函数(r56)
+
+    `--limit` 是一类横切问题:`query` / `search` / `monitor changes` /
+    `correlate` 全都默认截到 50 条,而它们原本**一个提示都不给** ——
+    `search` 连「显示了 50 条」都不说。r55 先在 `monitor changes` 上
+    手写了一份,本轮把另外两条也接进来,那份手写必须收掉:
+    **两处手抄同一段提示,迟早漂**(决策 #9)。
+
+    ## `total` 可以是 `None`
+
+    `None` 的意思是「**没数出来**」,不是「零条」。`Storage.count_search`
+    在 FTS5 出错时返回 `None`,因为那时 `search` 会退回 LIKE 搜索 ——
+    两个集合不同,拿不出一个诚实的总数。这时明说「总数未知」。
+    把「查不到」说成「是 0」,等于把一次查询失败伪装成空结果
+    (r47 的 `_ASSET_LABEL_FIELDS` 同一个病)。
+
+    ## 没截断时不啰嗦
+
+    每次都喊「只显示了最新 50 条」,等到真被截断时这句话就不值钱了。
+    """
+    if total is None:
+        return (f"[i] {shown} {noun}(s) shown; total UNKNOWN "
+                f"(计数查询失败,不猜 —— 见上面的 warning)")
+    if total > shown:
+        return (f"[i] {shown} of {total} {noun}(s) (只显示了最新 {shown} 条;"
+                f"--limit {limit}。要全看就调大 --limit,机器消费用 --json)")
+    # 没截断时**也**说总数:「200 条,以下是全部」是有用信息,
+    # 而「静默地给全了」让用户分不清「这就是全部」和「恰好没超 limit」。
+    return f"[i] {total} {noun}(s)"
+
+
+def _print_table_limited(rows: list[dict], total: int | None, limit: int,
+                         cols: list[str] | None = None,
+                         noun: str = "row") -> None:
+    """印表格 + 被 `--limit` 截断时的说明。判定和文案都走上面那两个共用函数。"""
+    if not rows:
+        print("(empty)")
+        return
+    if cols is None:
+        cols = list(rows[0].keys())
+    widths = {c: max(len(c), max(len(str(r.get(c, ""))) for r in rows)) for c in cols}
+    sep = "  "
+    print(sep.join(c.ljust(widths[c]) for c in cols))
+    print(sep.join("-" * widths[c] for c in cols))
+    for r in rows:
+        print(sep.join(str(r.get(c, "")).ljust(widths[c]) for c in cols))
+    notice = _limit_notice_text(len(rows), total, limit, noun)
+    if notice:
+        print(notice)
+
+
 def _print_table(rows: list[dict], cols: list[str] | None = None) -> None:
     """简单表格输出(无 rich 降级)"""
     if not rows:
@@ -249,7 +317,12 @@ def cmd_query(args) -> int:
     if args.format == "json":
         _print_json(rows)
     else:
-        _print_table(rows)
+        # `count_rows` 走 `_query_where`,和 `query` 同一份条件 ——
+        # `--filter` 是**用户传的** SQL,所以共用尤其要紧:总数必须是
+        # 同一个筛选下的条数,否则报出的是个看起来精确的假数字(r56)。
+        total = (storage.count_rows(args.table, filter_sql=args.filter)
+                 if _needs_total(len(rows), args.limit) else len(rows))
+        _print_table_limited(rows, total, args.limit)
     return 0
 
 
@@ -261,7 +334,10 @@ def cmd_search(args) -> int:
     if args.format == "json":
         _print_json(rows)
     else:
-        _print_table(rows)
+        # 只有行数顶到 limit 时才去数总数 —— 没顶到显然没截断(r56)
+        total = (storage.count_search(args.table, args.keyword)
+                 if _needs_total(len(rows), args.limit) else len(rows))
+        _print_table_limited(rows, total, args.limit)
     return 0
 
 
@@ -899,27 +975,16 @@ def cmd_monitor_changes(args) -> int:
     if not rows:
         print("[i] no changes")
         return 0
-    # `len(rows)` 只是**显示了多少**,不是一共有多少。r55 之前首行直接印
-    # `len(rows)`,于是库里 200 条时它说「50 change(s)」—— 一个字都没提
-    # 还有 150 条没显示。用户拿它当总数,尤其是配 `--since` 时,会得出
-    # 「这周只有 50 个变更」的错误结论,而 50 只是 `--limit` 的默认值。
-    #
-    # 只有**真的可能**被截断时才多查一次 COUNT:行数没顶到 limit 时
-    # 显然没截断,没必要付这次查询。`--json` 那条路在上面就 return 了 ——
-    # 机器消费要 payload 原样,加一句话反而破坏可解析性。
-    shown = len(rows)
-    if shown < (args.limit or shown):
-        print(f"[i] {shown} change(s):")
-    else:
+    # 文案和判定都走共用函数(r56):r55 刚在��里手写了一份同样的提示,
+    # 而 `--limit` 截断是一类横切问题 —— 两处手抄同一段话,迟早漂(决策 #9)。
+    total = len(rows)
+    if _needs_total(len(rows), args.limit):
         total = count_changes(storage, asset_type=args.type,
                               change_type=args.change_type,
                               asset_hash=asset_hash, since=since)
-        if total > shown:
-            print(f"[i] {shown} of {total} change(s) "
-                  f"(只显示了最新 {shown} 条;--limit {args.limit}。"
-                  f"要全看就调大 --limit,机器消费用 --json)")
-        else:
-            print(f"[i] {shown} change(s):")
+    notice = _limit_notice_text(len(rows), total, args.limit, "change")
+    if notice:
+        print(notice)
     cache: dict = {}
     for r in rows:
         print(f"  [{r['change_type']:18}] {r['asset_type']:10} "
