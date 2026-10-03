@@ -610,7 +610,21 @@ def cmd_monitor_list(args) -> int:
     print(f"[i] {len(monitors)} monitor(s):")
     for m in monitors:
         status = "✓" if m.get("enabled") else "✗"
-        print(f"  [{status}] #{m['id']} {m['target']:30} type={m['monitor_type']:10} interval={m['interval_seconds']}s last_run={m.get('last_run_at') or 'never'}")
+        # `last_change_count` 一起显示:r54 之前它被写进去了却**零消费点**
+        # (全项目只在 schema 和那条 UPDATE 里出现过),所以既没人能确认它
+        # 写对了,也没人能发现它写错了。r50 的教训是「只进日志不够,要落在
+        # 用户下次还会看的地方」—— 这一列本来就存在,只是没人看。
+        #
+        # 没跑过的显示 `never` 而不是 0:那一列的 schema DEFAULT 是 0,
+        # 而「从没跑过」和「跑了、这轮没变更」是两回事,都印 0 就把前者
+        # 伪装成了后者 —— 用户会以为这个 target 已经监控过了。
+        if m.get("last_run_at") is None:
+            changes_txt = "never"
+        else:
+            changes_txt = str(m.get("last_change_count") or 0)
+        print(f"  [{status}] #{m['id']} {m['target']:30} type={m['monitor_type']:10} "
+              f"interval={m['interval_seconds']}s last_run={m.get('last_run_at') or 'never'} "
+              f"changes={changes_txt}")
     return 0
 
 

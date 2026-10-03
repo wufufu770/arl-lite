@@ -539,7 +539,14 @@ class Watcher:
         try:
             for m in Monitor(self.storage).list():
                 if m.get("target") == wt.target:
-                    Monitor(self.storage).record_run(m["id"], new_total)
+                    # 传 `detected_total`,不是 `new_total`:那一列叫
+                    # `last_change_count`,承诺的是**变更**数。而 `new_total`
+                    # 数的是「资产表里多出来的行」,只认新增 —— 实测 7 个
+                    # 资产消失、0 个新增时,`asset_changes` 里记了 7 条
+                    # DISAPPEARED,而那一列写的是 0。字段名承诺的语义和
+                    # 承载的对不上就是 bug(决策 #5),r53 之后
+                    # `detected_total` 才是真的「本轮检出几条变更」。
+                    Monitor(self.storage).record_run(m["id"], detected_total)
         except Exception as e:
             log.debug(f"watch: monitor record_run failed: {e}")
 
