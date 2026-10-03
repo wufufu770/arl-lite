@@ -35,6 +35,36 @@ from .. import __version__
 
 log = logging.getLogger("arl_lite.tui.app")
 
+# TUI 起不来时给用户的替代路径。**单一来源** —— 两处报错共用它,
+# 手抄两份必然漂(r60-r64 修的正是这类漂移出来的死路)。
+#
+# 三条实测得来的约束,每条都对应一个真跑出来的坑:
+#
+# 1) 必须带 `arl-lite` 前缀。判据 tests/test_cli_advice_commandable.py
+#    靠字面量前缀提取建议,写裸子命令(`query`)它一条都看不见 ——
+#    那正是这处死路能一路躲过 r60-r64 四轮的原因。
+#
+# 2) 必须能真跑。`arl-lite query` 缺必填的 table,rc=2 报
+#    "the following arguments are required: table",所以这里写具体表名。
+#
+# 3) 必须先有工作区。这条是全量测试时才逮到的:`arl-lite stats` 在
+#    **全新 HOME** 下 rc=1 报 "workspace not found: 'default'" ——
+#    而「装完还没跑过任何任务」正是新用户的默认处境。
+#    修法不是删掉建议(那是拿删建议掩盖能力缺失,r63 的规矩),
+#    是把出路一起给出来:`workspace list` 会自动建出 default。
+_NON_TUI_ALTERNATIVES = (
+    "改用这些子命令(均已实测可直接运行):\n"
+    "  arl-lite workspace list              # 首次使用先跑这条,会自动建出 default 工作区\n"
+    "  arl-lite stats                       # 资产概览\n"
+    "  arl-lite query domains               # 域名列表\n"
+    "  arl-lite query ports                 # 端口列表\n"
+    "  arl-lite query sites                 # 站点列表\n"
+    "  arl-lite query findings              # 指纹列表\n"
+    "  arl-lite query correlations          # 关联分析结果\n"
+    "  arl-lite query tasks                 # 任务历史\n"
+    "  arl-lite export                      # 导出现状"
+)
+
 
 # =========================
 # ANSI 控制
@@ -459,12 +489,12 @@ def run_tui(workspace: str = "default") -> None:
     from ..db.storage import Storage
 
     if termios is None or tty is None:
-        print("[!] TUI 仅支持 Unix/Linux(需要 termios)。"
-              "Windows 请用 query / stats / export 子命令。", file=sys.stderr)
+        print("[!] TUI 仅支持 Unix/Linux(需要 termios)。" + _NON_TUI_ALTERNATIVES,
+              file=sys.stderr)
         sys.exit(2)
     if not (hasattr(sys.stdin, "isatty") and sys.stdin.isatty()):
-        print("[!] TUI 需要交互终端(cron/管道下不可用)。"
-              "请用 query / stats / export 子命令。", file=sys.stderr)
+        print("[!] TUI 需要交互终端(cron/管道下不可用)。" + _NON_TUI_ALTERNATIVES,
+              file=sys.stderr)
         sys.exit(2)
 
     storage = Storage(workspace=workspace)
