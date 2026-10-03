@@ -45,6 +45,16 @@ _SQL_DEFAULT_BUDGET_SECONDS = 120.0
 # 一起返回,让调用方不可能无意间丢掉这个数。
 EXPORT_ROW_CAP = 10000
 
+# `Storage.query` 的单次行数护栏。这**不是**语义约束,是内存护栏 ——
+# 它防的是「误传一个巨大 limit 把整张表 list 化」。docstring 里只写了
+# 「最大行数」,没说为什么是这个数,而 r59 查实了这个数当年**没有任何
+# 文档**支撑:它和 `EXPORT_ROW_CAP` 各自硬编码了一遍 10000,耦合却不同源,
+# 于是「调高 EXPORT_ROW_CAP」这条建议一执行就撞死(见 `fetch_all`)。
+#
+# 所以护栏留一个**名字**,而「要全表」的需求由 `fetch_all` **分页**满足:
+# 每页仍在护栏内,页数随便 —— 内存占用是单页的量级,不是全表的量级。
+_QUERY_PAGE_LIMIT = 10000
+
 # 默认 schema 路径
 DEFAULT_SCHEMA = Path(__file__).parent / "schema.sql"
 # 默认 workspace 根目录
@@ -1322,6 +1332,25 @@ class Storage:
         无意间丢掉第二个数 —— 而丢掉它正是 r57 那个 bug 的全部。
 
         同 `count_rows` 一样走 `QUERY_TABLES` 白名单,表名不接受外部拼接。
+
+        ## 为什么分页,而不是一次 `query(limit=n)`(r59)
+
+        `query` 有个单次行数护栏 `_QUERY_PAGE_LIMIT`。r57 第一版这里直接
+        `query(limit=n)`,于是 `n` 一旦被调大(比如把 `EXPORT_ROW_CAP` 提到
+        20000)就撞死:
+
+            ValueError: limit must be int 0..10000, got 20000
+
+        而 r57 给用户的警告里恰恰写着「或调高 EXPORT_ROW_CAP」——
+        **给用户一条走不通的建议,比不给更坏**:他照做,然后撞上一个和真正
+        原因毫无关系的崩溃。(这和 r58 那个「推荐了 correlate 没有的 --json」
+        是同一个错。)
+
+        护栏本身是合理的(防误传巨大 limit 把整表 list 化),所以不拆它,
+        改成**分页**:每页都在护栏内,页数不限,内存占用是单页量级而不是
+        全表量级。`query` 的 `ORDER BY id DESC` 让分页结果保持原顺序。
+        这样一个真正需要「一次导全」的人调大 `EXPORT_ROW_CAP` 就**能用**,
+        而提示里那句话不再是空头支票。
         """
         if table not in self.QUERY_TABLES:
             raise ValueError(
@@ -1329,7 +1358,20 @@ class Storage:
         n = EXPORT_ROW_CAP if cap is None else int(cap)
         if n < 0:
             raise ValueError(f"cap must be >= 0, got {cap!r}")
-        return self.query(table, limit=n), self.count_rows(table)
+        total = self.count_rows(table)
+        want = min(n, total)
+        rows: list[dict] = []
+        while len(rows) < want:
+            # `offset=len(rows)` 不是可有可无的:没有它,每页都取回**同样**
+            # 的前 N 行。r59 第一版就是漏了它,而 r59 的判据当场逮到
+            # (20500 行分三页,只拿到 10000 个不同的 id,10500 条重复)。
+            page = self.query(table, limit=min(_QUERY_PAGE_LIMIT,
+                                                want - len(rows)),
+                              offset=len(rows))
+            if not page:            # 期间被并发删了:少拿的就少拿,但 total 已经说了真相
+                break
+            rows.extend(page)
+        return rows, total
 
     def count_rows(
         self,
@@ -1357,6 +1399,7 @@ class Storage:
         filter_sql: str | None = None,
         limit: int = 50,
         workspace_id: int | None = None,
+        offset: int = 0,
     ) -> list[dict]:
         """通用查询(带白名单,禁止 DROP/DELETE/UPDATE)
 
@@ -1364,16 +1407,23 @@ class Storage:
             table: 表名(白名单:domains/hosts/ports/sites/findings/tasks/source_status/correlations)
             filter_sql: 可选 WHERE 子句(不含 WHERE 关键字)
             limit: 最大行数
+            offset: 跳过前多少行。r59 加的 —— `fetch_all` 分页要靠它,
+                否则每页都取回**同样**的前 N 行(判据实测逮到过:
+                20500 行分三页取,只拿到 10000 个不同的 id,10500 条重复)。
         """
         if table not in self.QUERY_TABLES:
             raise ValueError(
                 f"table '{table}' not in whitelist: {sorted(self.QUERY_TABLES)}")
 
         ws = workspace_id or self.workspace_id
-        if not isinstance(limit, int) or limit < 0 or limit > 10000:
-            raise ValueError(f"limit must be int 0..10000, got {limit!r}")
+        if not isinstance(limit, int) or limit < 0 or limit > _QUERY_PAGE_LIMIT:
+            raise ValueError(
+                f"limit must be int 0..{_QUERY_PAGE_LIMIT}, got {limit!r}")
+        if not isinstance(offset, int) or offset < 0:
+            raise ValueError(f"offset must be int >= 0, got {offset!r}")
         where = self._query_where(table, ws, filter_sql)
-        sql = f"SELECT * FROM {table}{where} ORDER BY id DESC LIMIT {int(limit)}"
+        sql = (f"SELECT * FROM {table}{where} "
+               f"ORDER BY id DESC LIMIT {int(limit)} OFFSET {int(offset)}")
         params: list = [ws]
         with self._conn() as conn:
             try:

@@ -446,9 +446,10 @@ def cmd_export(args) -> int:
             total, got = clipped[table]
             print(f"      {table}: 库里 {total} 行,只导出 {got} 行"
                   f"(少了 {total - got} 行)", file=sys.stderr)
-        print(f"[!] 文件已写出,但**不要**当成完整数据集用。要导全就分表分批:"
-              f"arl-lite query <table> --limit 10000(逐段导出),"
-              f"或调高 db.storage.EXPORT_ROW_CAP。", file=sys.stderr)
+        print(f"[!] 文件已写出,但**不要**当成完整数据集用。两种拿全量的办法:"
+              f"(1) 分表分批 —— arl-lite query {sorted(clipped)[0]} --limit 10000 "
+              f"逐段导出;(2) 把 db.storage.EXPORT_ROW_CAP 调到够大,再导一次 "
+              f"(fetch_all 会分页取,内存占用不会跟着涨)。", file=sys.stderr)
         return 1
     return 0
 
