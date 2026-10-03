@@ -92,13 +92,25 @@ arl-lite
 
 ### 安装
 
-```bash
-# 零依赖,直接拷走用
-tar -xzf arl-lite-v0.7.1.tar.gz
-cd arl-lite
+零第三方依赖,Python 3.10+ 即可运行。**三种方式任选,都不需要打包好的 tarball**
+(本仓库不产出发行包,`git clone` 或直接拷目录即可):
 
-# 或者 pip install -e . (但其实不需要,stdlib 就够)
+```bash
+# 方式 1:克隆后直接用,什么都不装(推荐)
+git clone <repo-url> arl-lite
+cd arl-lite
+PYTHONPATH=. python3 -m arl_lite version
+
+# 方式 2:装成 arl-lite 命令,之后就能直接敲 arl-lite
+./install.sh            # 等价于 make install
+
+# 方式 3:手动装(需要能写 site-packages)
+python3 -m pip install -e .
 ```
+
+> PEP 668 环境(Debian/Ubuntu 的 `python3`、Homebrew 的部分版本)会拒绝
+> `pip install -e .`,报 `externally-managed-environment`。改用方式 1,
+> 或按提示加 `--break-system-packages`。`install.sh` 会自动尝试该参数。
 
 ### 跑一个任务
 
