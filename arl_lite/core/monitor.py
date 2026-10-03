@@ -617,8 +617,14 @@ def record_change(storage, asset_type: str, change_type: str,
 
 
 def list_changes(storage, asset_type: str | None = None,
-                 change_type: str | None = None, limit: int = 50) -> list[dict]:
-    """列变更事件"""
+                 change_type: str | None = None, limit: int = 50,
+                 asset_hash: str | None = None) -> list[dict]:
+    """列变更事件
+
+    `asset_hash` 是**单个**资产 —— `asset_changes` 表只存 hash 不存标识,
+    所以按名字过滤得先由调用方把名字算成 hash(`db.storage.compute_asset_hash`),
+    这里只管按算好的值筛。
+    """
     sql = "SELECT * FROM asset_changes WHERE workspace_id = ?"
     params: list = [storage.workspace_id]
     if asset_type:
@@ -627,6 +633,9 @@ def list_changes(storage, asset_type: str | None = None,
     if change_type:
         sql += " AND change_type = ?"
         params.append(change_type)
+    if asset_hash:
+        sql += " AND asset_hash = ?"
+        params.append(asset_hash)
     sql += " ORDER BY id DESC LIMIT ?"
     params.append(int(limit))
     with storage._conn() as conn:

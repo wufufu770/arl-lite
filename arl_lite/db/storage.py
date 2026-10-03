@@ -53,6 +53,62 @@ def compute_hash(*parts: str) -> str:
     return hashlib.sha256(joined.encode()).hexdigest()[:16]
 
 
+# 资产的「身份」= 拿哪几段拼成去重键。词表只此一份:入库(`add_*` → `_upsert_asset`)
+# 和按名字反查(CLI 的 `monitor changes --asset`)都必须走 `compute_asset_hash`。
+# 手写第二份的后果不是「多几行代码」,是**两处各自漂**:r45 清掉过 CLI 的
+# choices 硬编码词表,下一轮我自己又写了份 `_ASSET_LABEL_FIELDS`,同一个毛病。
+#
+# 键是**表名**(复数),不是 asset_type(单数),和 `_MUTABLE_TEXT` / `_MUTABLE_PLAIN`
+# 保持一致 —— `db` 不 import `core`,所以 asset_type↔表名的映射归
+# `Monitor._ASSET_TABLES` 所有,本模块只按表名说话。两侧的键集合由
+# tests/test_monitor_changes_filter.py 双向钉住。
+#
+# 值的形状是 `(段名..., 分隔符)`。单段用空分隔符 —— 那不是「占位的空串」,
+# 是「只有一段,不需要拼」;写成显式空分隔符好过再开一个分支。
+_ASSET_IDENTITY: dict[str, tuple[tuple[str, ...], str]] = {
+    "domains": (("domain",), ""),
+    "hosts": (("host",), ""),
+    "ports": (("host", "port"), ":"),
+    "sites": (("url",), ""),
+    "findings": (("target", "finding_type", "title"), "|"),
+}
+
+
+def compute_asset_hash(workspace_id: int, table: str, *identity) -> str:
+    """这个资产的 hash。`table` 是表名(`domains`/`hosts`/…),不是 asset_type。
+
+    ## 关于 workspace_id:它在 hash 里,但**今天恒等于 1**
+
+    写法是 `compute_hash(str(workspace_id), 去重键)`,看着像「hash 是工作区
+    作用域的」。实测不是:每个工作区是**独立的 db 文件**(`<root>/<name>/data.db`),
+    每个文件里的 `workspaces` 表只有自己那一行,所以 `workspace_id` 永远是 1。
+    后果:同一个域名在两个工作区**算出来是同一个 hash**。
+
+    这不构成问题 —— `UNIQUE(workspace_id, hash)` 约束也是**按文件**的,
+    两边本来就碰不到一起。但别把「工作区作用域」当保证写进别处:哪天改成
+    一个库放多个工作区,`workspace_id` 才会真的开始变,而那时任何漏掉它的
+    「按名字算 hash」会静默算出对不上的值。`db` 不该替这个布局变化买单,
+    所以参数留着,注释说清现状。
+
+    ## 段数不对要报错,不要凑
+
+    少给一段照样能算出一个 16 位 hash,于是资产被静默存成另一个身份。
+    宁可 `ValueError`(和 `add_domain` 拒绝空域名同一纪律)。
+    """
+    spec = _ASSET_IDENTITY.get(table)
+    if spec is None:
+        raise ValueError(
+            f"unknown asset table: {table!r} "
+            f"(known: {', '.join(sorted(_ASSET_IDENTITY))})")
+    names, sep = spec
+    if len(identity) != len(names):
+        raise ValueError(
+            f"{table} 的身份是 {len(names)} 段"
+            f"({' + '.join(names)}),给了 {len(identity)} 段:"
+            f" {', '.join(str(i) for i in identity)}")
+    return compute_hash(str(workspace_id), sep.join(str(p) for p in identity))
+
+
 # 用户提供的 SQL 片段(WHERE 子句)里禁止出现的写操作关键字。
 # 检查在"剥离字符串字面量之后"的残留上做词边界匹配:
 # 这样 `domain LIKE '%update%'` 不再误拦,而裸的 `drop table x` 仍然拦截。
@@ -614,8 +670,7 @@ class Storage:
         table: str,
         workspace_id: int,
         task_id: int,
-        unique_key: str,
-        hash_key: str,
+        identity: tuple,
         fields: dict,
         module: str,
         confidence: int = 50,
@@ -627,11 +682,17 @@ class Storage:
         - 修复并发 TOCTOU(两线程同时插同一新资产撞 UNIQUE)
         - 修复重扫不刷新业务字段(端口永 open / resolved_ip 永 None)
 
+        `identity` 是**分段**的身份(ports 传 `(host, port)`),怎么拼由
+        `compute_asset_hash` 独占。以前这里是 `unique_key` + `hash_key` 两个
+        参数,后者在函数体里**从来没被读过**(r48 实测:5 个调用点传了,零引用),
+        而且 5 处传的还都和 `unique_key` 同值 —— 纯冗余。现在一个参数就够,
+        而且段的形状和 CLI 的 `monitor changes --asset` 共用同一份定义。
+
         Returns:
             True=新插入, False=已存在(仅刷新)
         """
         now = datetime.utcnow().isoformat()
-        asset_hash = compute_hash(str(workspace_id), unique_key)
+        asset_hash = compute_asset_hash(workspace_id, table, *identity)
 
         cols = ["workspace_id", "task_id", "hash", "confidence", "risk",
                 "module", "first_seen", "last_seen", "discovered_at"]
@@ -887,8 +948,7 @@ class Storage:
         workspace_id = self.workspace_id
         return self._upsert_asset(
             "domains", workspace_id, task_id,
-            unique_key=domain,
-            hash_key=domain,
+            identity=(domain,),
             fields={
                 "domain": domain,
                 "source": source,
@@ -923,8 +983,7 @@ class Storage:
         workspace_id = self.workspace_id
         return self._upsert_asset(
             "hosts", workspace_id, task_id,
-            unique_key=host,
-            hash_key=host,
+            identity=(host,),
             fields={
                 "host": host,
                 "ip": ip,
@@ -965,8 +1024,7 @@ class Storage:
         workspace_id = self.workspace_id
         return self._upsert_asset(
             "ports", workspace_id, task_id,
-            unique_key=f"{host}:{port}",
-            hash_key=f"{host}:{port}",
+            identity=(host, port),
             fields={
                 "ip": host,  # schema 字段是 ip,但接受域名也行
                 "port": port,
@@ -1045,11 +1103,9 @@ class Storage:
         if severity not in KNOWN_SEVERITY:
             severity = "info"
         workspace_id = self.workspace_id
-        unique = f"{target}|{finding_type}|{title}"
         return self._upsert_asset(
             "findings", workspace_id, task_id,
-            unique_key=unique,
-            hash_key=unique,
+            identity=(target, finding_type, title),
             fields={
                 "module": source,
                 "finding_type": finding_type,
@@ -1098,8 +1154,7 @@ class Storage:
         workspace_id = self.workspace_id
         return self._upsert_asset(
             "sites", workspace_id, task_id,
-            unique_key=url,
-            hash_key=url,
+            identity=(url,),
             fields={
                 "url": url,
                 "host": host,

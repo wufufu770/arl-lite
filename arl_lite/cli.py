@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import logging
+import string
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -764,13 +765,77 @@ def _fmt(v) -> str:
     return s if len(s) <= 60 else s[:57] + "..."
 
 
+def _split_identity(asset_type: str, value: str) -> tuple:
+    """`--asset` 给的名字 → `_ASSET_IDENTITY` 要的分段身份
+
+    ## 为什么不「看着像 hash 就当 hash」
+
+    那是个启发式,而启发式猜错时**不报错**:一个恰好是 16 位十六进制的域名
+    会被当成 hash,于是查出来是空的,用户以为「它没变过」。所以规则写成
+    无歧义的两条:给了 `--type` 就一定按名字解释;没给就只接受 16 位 hash,
+    不是就报错并告诉人加 `--type`。
+
+    ## port 为什么要 rsplit
+
+    用户的写法是 `1.1.1.1:443` 或 `web.example.com:443`,而 IPv6 是
+    `2001:db8::1:443` —— 从左边切第一个冒号会把地址切烂。从**右边**切
+    最后一段才是端口,这也是唯一对三种写法都成立的位置。
+
+    ## findings 为什么直接拒绝
+
+    它的身份是 target、finding_type、title 三段用竖线拼的,而用户心里的
+    「这个 finding」是 `target`。要用户背内部格式才能过滤一个功能,那不叫
+    功能 —— 宁可明说「这条不支持按名字,给裸 hash」。
+    """
+    if asset_type in ("domain", "host", "site"):
+        return (value,)
+    if asset_type == "port":
+        host, sep, port = value.rpartition(":")
+        if not sep or not host or not port.isdigit():
+            raise ValueError(
+                f"port 的 --asset 写法是 host:port(比如 1.1.1.1:443),"
+                f"给的是 {value!r}")
+        return (host, port)
+    raise ValueError(
+        f"--type {asset_type} 不支持按名字过滤(身份是多段复合的),"
+        f"请直接给 16 位资产 hash")
+
+
+def _resolve_asset_hash(storage, value: str, asset_type: str | None) -> str:
+    """`--asset` 的取值 → 资产 hash
+
+    算 hash 的形状归 `db.storage._ASSET_IDENTITY` 一家,这里只负责把
+    **用户写的一个字符串**拆成它要的那几段 —— 拆错了报出来,不猜。
+    """
+    if not asset_type:
+        v = value.strip().lower()
+        if len(v) == 16 and all(c in string.hexdigits for c in v):
+            return v
+        raise ValueError(
+            f"--asset {value!r} 不带 --type 时只能是 16 位资产 hash;"
+            f"要按名字过滤请加 --type(如 --type host)")
+    from .db.storage import compute_asset_hash
+    table = _ASSET_TYPES_TO_TABLE[asset_type]
+    parts = _split_identity(asset_type, value)
+    return compute_asset_hash(storage.workspace_id, table, *parts)
+
+
 def cmd_monitor_changes(args) -> int:
     from .core.monitor import list_changes
     if args.limit is not None and args.limit <= 0:
         print(f"[!] --limit must be > 0 (got {args.limit})", file=sys.stderr)
         return 2
     storage = Storage(workspace=args.workspace)
-    rows = list_changes(storage, asset_type=args.type, change_type=args.change_type, limit=args.limit)
+    asset_hash = None
+    if getattr(args, "asset", None):
+        try:
+            asset_hash = _resolve_asset_hash(storage, args.asset, args.type)
+        except ValueError as e:
+            print(f"[!] {e}", file=sys.stderr)
+            return 2
+    rows = list_changes(storage, asset_type=args.type,
+                        change_type=args.change_type, limit=args.limit,
+                        asset_hash=asset_hash)
     if getattr(args, "json", False):
         # 机器消费:payload 原样带出去,不经过给人看的那些渲染/截断。
         # 想要 diff 就自己 parse,想要标签就自己取。
@@ -1339,6 +1404,9 @@ def build_parser() -> argparse.ArgumentParser:
     pmc.add_argument("-c", "--change-type", choices=list(CHANGE_TYPES),
                     help="变更类型")
     pmc.add_argument("-l", "--limit", type=int, default=50, help="最多显示多少条")
+    pmc.add_argument("--asset", help="只看这一个资产的变更。给名字要配 --type"
+                                    "(如 --type host --asset web.example.com);"
+                                    "不给 --type 时只接受 16 位 hash")
     pmc.add_argument("--json", action="store_true",
                     help="输出 JSON(payload 原样,供机器消费)")
     pmc.add_argument("-w", "--workspace", help="工作空间名", default="default")
