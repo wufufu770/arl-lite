@@ -89,6 +89,40 @@ def record_change_capped(storage, asset_type: str, change_type: str,
     return len(rows) - len(keep)
 
 
+def account_detected_and_recorded(
+    detected: int, recorded: int, found: int, dropped: int,
+) -> tuple[int, int]:
+    """把一次 `record_change_capped` 的结果并进本轮的两个计数口径
+
+    返回 `(detected, recorded)`,两个数都加同一次变更的份。
+
+    ## 为什么必须走这一个函数(r53)
+
+    两个口径曾经**不对称**:`detected` 只在新增分支加,`recorded`
+    新增和消失都加。于是只要那一轮检出了消失资产,`detected < recorded`
+    就恒成立,`account_change_recording` 的 `max(0, ...)` 把丢弃数夹成 0。
+    实测(210 新增,`CHANGE_RECORD_CAP`=200,新增侧丢 10 条):
+
+        无消失资产  -> detected=210 recorded=200 -> 报丢弃 10 条 ✓
+        另有 20 消失 -> detected=210 recorded=220 -> 报丢弃  0 条 ✗
+
+    **同样丢 10 条,只因多了一批消失就归零。** r50 建的「截断必须可见」
+    在有消失资产的轮次里静默失效 —— 而消失检测是 watcher 的常规功能,
+    几乎每轮都有东西在消失。
+
+    口径对称这件事没法靠「两处都记得加」来保证:两处各写一行,迟早有一处
+    忘了。所以收成一个函数,新增和消失都调它 —— 少加一处就少调一次,
+    调用点数能数,也能测。
+
+    ## 为什么参数是 `found` 和 `dropped` 而不是 `recorded_this_call`
+
+    `dropped` 是 `record_change_capped` 的返回值,`found` 是它那一批的行数,
+    两个都已经在手上了。让调用方自己算 `found - dropped` 再传进来,
+    就等于把「记入数」这个减法复制一份到两处调用点 —— 同一个坑。
+    """
+    return detected + int(found), recorded + (int(found) - int(dropped))
+
+
 def account_change_recording(wt, detected: int, recorded: int) -> int:
     """把本轮的截断情况记到 watch target 上,**返回本轮丢了几条**
 
@@ -459,8 +493,9 @@ class Watcher:
             dropped_new = record_change_capped(
                 self.storage, asset_type, "NEW_ASSET", new_rows,
                 snapshot="after")
-            detected_total += len(new_rows)
-            recorded_total += len(new_rows) - dropped_new
+            # 检出和记入**成对**并进本轮口径 —— 见 account_detected_and_recorded
+            detected_total, recorded_total = account_detected_and_recorded(
+                detected_total, recorded_total, len(new_rows), dropped_new)
             if dropped_new:
                 log.warning(
                     f"watch: {asset_type} 本轮检出 {len(new_rows)} 个新资产,"
@@ -485,7 +520,11 @@ class Watcher:
                 self.storage, asset_type, "DISAPPEARED", gone,
                 snapshot="before")
             disappeared_total += len(gone)
-            recorded_total += len(gone) - dropped_gone
+            # 消失**也要**并进 detected —— r53:以前只有 recorded 加它,
+            # 于是「检出」和「记入」成了两个口径,只要这轮有消失,
+            # `max(0, detected - recorded)` 就恒为 0,截断丢失被吞掉。
+            detected_total, recorded_total = account_detected_and_recorded(
+                detected_total, recorded_total, len(gone), dropped_gone)
             if dropped_gone:
                 log.warning(
                     f"watch: {asset_type} 本轮检出 {len(gone)} 个消失资产,"
