@@ -88,12 +88,17 @@ EXCEPTIONS = {
     # 理由长度下限 10 字符这条判据当场逮到了我自己的敷衍:
     # 「删除监控是写操作」只有 8 个字,说清了「是什么」却没说清
     # 「为什么建库是对的」—— 那正是例外清单最容易退化成名字黑名单的地方。
+    #
+    # r70 移除了 cmd_watch_add:它原来有一行 `storage = Storage(...)`,
+    # 但那个变量**创建了根本没用**(后面全走 watch.json 文件路径)。
+    # 删掉之后它压根不碰工作区,自然也不再是例外。
+    # 是本文件那条 stale 检测(`EXCEPTIONS 里已不需要例外了就报红`)
+    # 把它逮住的 —— 少一行死代码,判据自动跟上。
     "cmd_run": "用户明确要求写入(run 就是建工作区的正路),静默建库合理",
     "cmd_monitor_add": "新增监控是写操作,用户明确要求写入,建库是副作用",
     "cmd_monitor_remove": "删除监控是写操作;用户正要动数据,建库无信息损失",
     "cmd_monitor_enable": "启停监控是写操作,改的是 enabled 标志位",
     "cmd_monitor_prune": "清理过期监控是写操作,删的是本来就过期的行",
-    "cmd_watch_add": "新增 watch 是写操作,写的是 watch.json 而非工作区",
     "cmd_watch_start": "启动 watch 调度器是写操作,状态落在 watch 目录",
     "cmd_workspace_list": "列出工作区本就依赖建出 default(它就是入口命令)",
     "cmd_workspace_create": "建工作区就是它该干的事,建库是本职",

@@ -1388,6 +1388,49 @@ def cmd_notify_test(args) -> int:
     return 1
 
 
+def _watch_state_file(workspace: str) -> Path:
+    """watch 目标清单的落盘路径 —— **按工作区分目录**。
+
+    原来 4 个 cmd_watch_* 各自硬编码 `~/.arl-lite/watch/watch.json`,
+    两处手抄必然漂(契约只能有一个来源)。r70 之后按工作区切分:
+        ~/.arl-lite/watch/<workspace>/watch.json
+
+    为什么必须切分:目标清单原本是全局的、结果却写进工作区。
+    两个工作区并存时,`watch list` 把所有目标混在一起列(实测),
+    而 `watch start` 把它们**全部**写进 default ——
+    用户没法让 A 工作区的目标只跑在 A 上,那比没有工作区更糟。
+    `Watcher` 本身接受任意 storage(arl_lite/core/watcher.py),
+    能力一直都在,缺的只是 CLI 这层参数与路径。
+
+    迁移按 r62 的规矩:**什么都不做**。旧路径还在就不动它,
+    用户显式跑 `watch add` 时才写新路径 —— 不静默搬数据,
+    免得搬错了用户连原来那份都找不回来。
+    """
+    return Path.home() / ".arl-lite" / "watch" / workspace / "watch.json"
+
+
+def _legacy_watch_state_file() -> Path:
+    """r70 之前那一份全局 watch.json —— 只用来提示,不再读写。"""
+    return Path.home() / ".arl-lite" / "watch" / "watch.json"
+
+
+def _warn_about_legacy_watch_state(workspace: str) -> None:
+    """旧格式还在就提醒一次,但**不自动迁移**(r62:默认什么都不做)。"""
+    legacy = _legacy_watch_state_file()
+    if not legacy.exists():
+        return
+    try:
+        if json.loads(legacy.read_text(encoding="utf-8")):
+            print(f"[i] 检测到旧格式的 watch 清单 {legacy}。", file=sys.stderr)
+            print(f"    watch 现在按工作区存,本工作区({workspace})的清单是:",
+                  file=sys.stderr)
+            print(f"        {_watch_state_file(workspace)}", file=sys.stderr)
+            print("    旧文件不会自动迁移(免得搬错后连原来那份都找不回来)。"
+                  "想沿用它请自行拷贝。", file=sys.stderr)
+    except Exception:
+        pass
+
+
 def cmd_watch_add(args) -> int:
     """添加 watch target"""
 
@@ -1399,11 +1442,9 @@ def cmd_watch_add(args) -> int:
         print(f"[!] watch target too long: {len(args.target)} > 1000", file=sys.stderr)
         return 2
 
-    storage = Storage(workspace=args.workspace if hasattr(args, "workspace") else "default")
-    # 单进程内:复用全局 watcher 状态(简化)
-    state_dir = Path.home() / ".arl-lite" / "watch"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    state_file = state_dir / "watch.json"
+    _warn_about_legacy_watch_state(args.workspace)
+    state_file = _watch_state_file(args.workspace)
+    state_file.parent.mkdir(parents=True, exist_ok=True)
 
     targets = []
     if state_file.exists():
@@ -1438,8 +1479,8 @@ def cmd_watch_add(args) -> int:
 
 def cmd_watch_remove(args) -> int:
     """移除 watch target"""
-    state_dir = Path.home() / ".arl-lite" / "watch"
-    state_file = state_dir / "watch.json"
+    _warn_about_legacy_watch_state(args.workspace)
+    state_file = _watch_state_file(args.workspace)
     if not state_file.exists():
         print("[!] no watch state")
         return 1
@@ -1458,10 +1499,19 @@ def cmd_watch_remove(args) -> int:
 
 def cmd_watch_list(args) -> int:
     """列出 watch targets"""
-    state_dir = Path.home() / ".arl-lite" / "watch"
-    state_file = state_dir / "watch.json"
+    _warn_about_legacy_watch_state(args.workspace)
+    state_file = _watch_state_file(args.workspace)
     if not state_file.exists():
-        print("[i] no watch targets (use `arl-lite watch add` first)")
+        # 「占位符 + 真实值」混排会拼出一条根本不存在的命令:
+        # 建议判据(test_cli_advice_commandable.py)会抠出
+        # `arl-lite watch add <target> -w <workspace>` 并拿占位符去重建,
+        # 拼出 `watch add first -w ...`,argparse 报「多余参数 ['first']」。
+        # 那不是判据的毛病 —— 是这条文案本来就不可执行。
+        # 拆成两步写清楚:先说做什么,再说带哪个参数。
+        print(f"[i] 工作区 {args.workspace!r} 下没有 watch target", file=sys.stderr)
+        print("    先添加一个(两步):", file=sys.stderr)
+        print("        arl-lite watch add <目标域名>", file=sys.stderr)
+        print(f"        arl-lite watch list -w {args.workspace}", file=sys.stderr)
         return 0
     targets = json.loads(state_file.read_text(encoding="utf-8"))
     if not targets:
@@ -1491,17 +1541,25 @@ def cmd_watch_start(args) -> int:
     """启动 watch 调度器(同步跑,Ctrl+C 退出)"""
     from .core.watcher import Watcher
 
-    state_dir = Path.home() / ".arl-lite" / "watch"
-    state_file = state_dir / "watch.json"
+    # r70:这里原来写的是
+    #   `Storage(workspace=getattr(args, "workspace", "default"))`
+    # 而 watch 全系的 argparse **从来没注册过 -w** —— 那个属性永远不存在,
+    # getattr 兜底恒生效,于是 `watch start` 永远写进 default 工作区。
+    # 用户没有任何办法让它写去别处,而不报任何错(实测:
+    # `watch add example.com -w teamA` 直接 rc=2 unrecognized arguments,
+    #  那是 add 的表现;start 这边连参数都不认,只是默默写错地方)。
+    # 现在 -w 真的存在了,读它就是真的。
+    _warn_about_legacy_watch_state(args.workspace)
+    state_file = _watch_state_file(args.workspace)
     if not state_file.exists():
-        print("[!] no watch state")
+        print(f"[!] no watch state (workspace {args.workspace!r})")
         return 1
     targets_data = json.loads(state_file.read_text())
     if not targets_data:
-        print("[!] no watch targets")
+        print(f"[!] no watch targets (workspace {args.workspace!r})")
         return 1
 
-    storage = Storage(workspace=getattr(args, "workspace", "default"))
+    storage = Storage(workspace=args.workspace)
     w = Watcher(storage, state_path=state_file)
     skipped = 0
     for t in targets_data:
@@ -1902,15 +1960,22 @@ def build_parser() -> argparse.ArgumentParser:
     pwaa.add_argument("target", help="目标域名/IP")
     pwaa.add_argument("-m", "--modules", help="逗号分隔 module 列表")
     pwaa.add_argument("--interval", type=int, default=86400, help="重跑间隔秒(默认 86400=24h)")
+    # r70:watch 全系补 -w。cmd_watch_start 一直在读 args.workspace,
+    # 而这里从来没注册过 —— 属性永远不存在,结果恒落 default 工作区。
+    pwaa.add_argument("-w", "--workspace", help="工作空间名", default="default")
     pwaa.set_defaults(func=cmd_watch_add)
     pwar = pwa_sub.add_parser("remove", help="移除 watch target")
     pwar.add_argument("target", help="目标")
+    pwar.add_argument("-w", "--workspace", help="工作空间名", default="default")
     pwar.set_defaults(func=cmd_watch_remove)
     pwal = pwa_sub.add_parser("list", help="列出 watch targets")
+    pwal.add_argument("-w", "--workspace", help="工作空间名", default="default")
     pwal.set_defaults(func=cmd_watch_list)
     pwas = pwa_sub.add_parser("start", help="启动 watch 调度器(前台运行,Ctrl+C 停止)")
+    pwas.add_argument("-w", "--workspace", help="工作空间名", default="default")
     pwas.set_defaults(func=cmd_watch_start)
     pwap = pwa_sub.add_parser("stop", help="停止 watch 调度器")
+    pwap.add_argument("-w", "--workspace", help="工作空间名", default="default")
     pwap.set_defaults(func=cmd_watch_stop)
 
     # version

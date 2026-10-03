@@ -277,7 +277,12 @@ def test_watch_list_shows_the_dropped_count(tmp_path, monkeypatch, capsys):
     只进日志是不够的:日志会被翻过去,而用户下次还会看的是这条命令。
     """
     monkeypatch.setenv("HOME", str(tmp_path))
-    state_dir = tmp_path / ".arl-lite" / "watch"
+    # r70 起 watch 清单按工作区存:~/.arl-lite/watch/<workspace>/watch.json。
+    # 这里造 default 工作区的那份。改的只是**造数据的位置**,
+    # 断言(它要守的「丢弃数必须显示出来」)一个字没动 ——
+    # 前提是断言的判据不能因为实现变了就跟着放松(r 的规矩:判错的前提要改判据,
+    # 但这里前提没变,只是数据落地位置改了)。
+    state_dir = tmp_path / ".arl-lite" / "watch" / "default"
     state_dir.mkdir(parents=True)
     (state_dir / "watch.json").write_text(json.dumps([
         {"target": "example.com", "modules": ["dns"], "interval_seconds": 3600,

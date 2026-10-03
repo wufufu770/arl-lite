@@ -50,7 +50,7 @@ from test_cli_advice_commandable import (  # noqa: E402
     _why_unverified,
 )
 
-PINNED_VERDICTS = {"重建后干净": 8}
+PINNED_VERDICTS = {"重建后干净": 10}
 
 
 def test_every_truncated_item_reconstructs_and_is_reverified():
