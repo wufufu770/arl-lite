@@ -194,7 +194,10 @@ def test_every_declared_change_type_is_actually_produced():
             fn = node.func
             name = fn.id if isinstance(fn, ast.Name) else (
                 fn.attr if isinstance(fn, ast.Attribute) else None)
-            if name != "record_change":
+            # 扫**所有**变更记录入口,不只 record_change:r50 加了
+            # record_change_capped 包装,只扫 record_change 时 `NEW_ASSET` 和
+            # `DISAPPEARED` 的字面量在包装里,这里会误判成「谁也产不出」。
+            if name not in CHANGE_WRITERS:
                 continue
             if len(node.args) >= 3 and isinstance(node.args[2], ast.Constant):
                 produced.add(node.args[2].value)
@@ -204,8 +207,22 @@ def test_every_declared_change_type_is_actually_produced():
 
 # ── 生产代码里的调用点:AST 检查,不靠文本子串 ──
 
+# 扫哪些函数名算「变更记录入口」。`record_change` 之外还有它的包装:
+# r50 加的 `record_change_capped` 内部把 change_type 原样传下去,所以调用点
+# 在**包装里**,不在 `record_change` 上。
+#
+# 这不是「为了让测试变绿而加个名字」——r50 实测过:只扫 `record_change` 时,
+# `test_every_declared_change_type_is_actually_produced` 报
+# `CHANGE_TYPES 里有谁也产不出的类型:{'NEW_ASSET', 'DISAPPEARED'}`。
+# 那不是那条测试坏了,是**静态判据真的漏了**:字面量被挪进了包装,
+# 扫描器看不见了。r42 的坑(一份没人读的/看不见的定义比没有更坏)从另一扇门回来。
+# 所以这份名单由下面的 `test_scanner_covers_every_caller_of_record_change` 守住:
+# 新增任何一个包装而忘了加进来,那条会红。
+CHANGE_WRITERS = ("record_change", "record_change_capped")
+
+
 def _record_change_literals():
-    """遍历 arl_lite/ 源码,取出每个 record_change 调用点的 change_type
+    """遍历 arl_lite/ 源码,取出每个变更记录调用点的 change_type
 
     用 AST 而不是正则/子串:文本里出现的 `"NEW_ASSET"` 可能在注释、
     字符串常量、甚至另一个函数名里,那些都不是调用点。
@@ -219,7 +236,7 @@ def _record_change_literals():
             fn = node.func
             name = fn.id if isinstance(fn, ast.Name) else (
                 fn.attr if isinstance(fn, ast.Attribute) else None)
-            if name != "record_change":
+            if name not in CHANGE_WRITERS:
                 continue
             ct = None
             if len(node.args) >= 3:
@@ -231,6 +248,25 @@ def _record_change_literals():
             found.append((path.relative_to(REPO).as_posix(),
                           node.lineno, ct))
     return found
+
+
+def _functions_calling(name: str) -> set[str]:
+    """arl_lite/ 里所有**直接调用** `name` 的函数名"""
+    callers = set()
+    for path in sorted(ARL_ROOT.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for fn in ast.walk(tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(fn):
+                if not isinstance(node, ast.Call):
+                    continue
+                callee = node.func
+                cname = callee.id if isinstance(callee, ast.Name) else (
+                    callee.attr if isinstance(callee, ast.Attribute) else None)
+                if cname == name:
+                    callers.add(fn.name)
+    return callers
 
 
 def _non_literal(call_sites) -> list:
@@ -273,4 +309,84 @@ def test_production_call_sites_are_actually_scanned():
     assert any(p.endswith("core/monitor.py") for p in files), (
         f"没扫到 core/monitor.py 里的调用点,扫到的是:{sorted(files)}"
     )
-    assert len(found) >= 3, f"只扫到 {len(found)} 个调用点,预期至少 3 个"
+    # 「至少 3 个调用点」这条是 **r50 之前的写法**,现在刻意不保留了。
+    # 它是个魔法数字,绑的是当时的代码形状:r50 把 watcher 里两个调用点合并进
+    # record_change_capped,扫到的从 3 个变成 2 个,那条断言就红了。
+    # 把 3 改成 2 是**为了让它绿**,而那正是本协议反复警告的事 ——
+    # 门槛跟着代码走,就等于没有门槛。
+    #
+    # 真正要守的是「没有漏扫」,那就别用数量表达:下面那条
+    # `test_scanner_covers_every_caller_of_record_change` 独立扫一遍所有
+    # 调用 record_change 的函数,要求它们全都在扫描名单里。数量涨了跌了
+    # 都不影响那条成立,而漏掉一个包装它就红。
+
+
+# `CHANGE_WRITERS` 之外的合法例外:这些函数也调用 record_change,但它们传的
+# change_type **本来就该是变量**,字面量不在它们身上。
+#
+# 放在这里而不是放宽判据,是因为豁免本身需要被 review —— 只写在代码注释里的
+# 豁免等于没有豁免。
+#
+# `_sink` / `attach_field_change_sink`:字段级变更路径。change_type 来自
+# `FIELD_CHANGE_TYPES` 的**值**(那张表由 `test_field_types_are_all_real_types`
+# 校验每个类型都真存在),所以字面量不在调用点上。r50 之前它们本来也不在
+# 扫描范围内 —— 那时候 `produced` 集合是靠 `set(FIELD_CHANGE_TYPES.values())`
+# 补齐的,不是靠扫调用点。
+VARIABLE_CHANGE_TYPE_CALLERS = {
+    "_sink": "字段级变更路径,类型来自 FIELD_CHANGE_TYPES 的值",
+    "attach_field_change_sink": "同上(外层函数本身不记变更,只是接线)",
+}
+
+
+def test_scanner_covers_every_caller_of_record_change():
+    """扫描名单要覆盖**每一个**靠字面量产出 change_type 的调用者
+
+    r50 实测过的坑:新增 `record_change_capped` 包装之后,只扫
+    `record_change` 的判据看不见调用点了,于是
+    `test_every_declared_change_type_is_actually_produced` 报
+    「NEW_ASSET / DISAPPEARED 谁也产不出」—— 那不是判据太严,
+    是判据**漏了**。而漏了的判据比没有更坏:它会给出一个假的「有死条目」结论。
+
+    所以名单不能靠人记得补,得由这条测试从「谁调用了 record_change」推出来。
+    以后再有人加包装而忘了加进 `CHANGE_WRITERS`,这里会红。
+
+    注意不是「所有调用者都要进名单」:传**变量**的调用者(字段级变更路径)
+    本来就不该出现在字面量扫描里,它们在 `VARIABLE_CHANGE_TYPE_CALLERS` 里
+    带理由列出。第一版把判据写成「所有调用者都要进」,结果把那两个也判成违规
+    —— 判据要比它守的事窄。
+    """
+    wrappers = _functions_calling("record_change")
+    missing = ({w for w in wrappers if w not in CHANGE_WRITERS}
+               - set(VARIABLE_CHANGE_TYPE_CALLERS))
+    missing.discard("record_change")
+    assert not missing, (
+        f"这些函数调用了 record_change,却不在 CHANGE_WRITERS 里:{sorted(missing)}。"
+        f"它们的调用点不会被扫到 —— 字面量检查和「谁产得出哪些类型」两条"
+        f"判据会一起失效(实测:r50 加 record_change_capped 后就踩到了)。"
+        f"如果它传的是变量而不是字面量,加进 VARIABLE_CHANGE_TYPE_CALLERS "
+        f"并写明理由。")
+
+
+def test_change_writers_are_all_real_change_type_passthroughs():
+    """`CHANGE_WRITERS` 里的每个名字都必须是真实的变更记录入口
+
+    防止有人往名单里塞一个不相干的函数,让扫描范围看起来比实际大 ——
+    那等于给上面两条判据开后门。
+    """
+    for name in CHANGE_WRITERS:
+        if name == "record_change":
+            continue
+        assert name in _functions_calling("record_change"), (
+            f"CHANGE_WRITERS 里的 {name!r} 根本不调用 record_change")
+
+
+def test_variable_change_type_exceptions_still_exist():
+    """例外名单不许腐化:里面的函数要么还在,要么该把理由删掉
+
+    豁免本身需要被 review —— 一个指向已不存在函数的豁免,是给将来的
+    改动留的一个不用解释的口子。
+    """
+    for name in VARIABLE_CHANGE_TYPE_CALLERS:
+        assert name in _functions_calling("record_change"), (
+            f"例外名单里的 {name!r} 已经不调用 record_change 了 —— "
+            f"删掉这条豁免,别留一个指向死函数的免死金牌")

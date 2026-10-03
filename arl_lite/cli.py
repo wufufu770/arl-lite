@@ -1127,6 +1127,15 @@ def cmd_watch_list(args) -> int:
         last_run = t.get("last_run")
         if last_run:
             print(f"    last_run={last_run} status={t.get('last_status') or '-'}")
+        # 截断留痕要出现在用户**还会再看的地方**,不只在日志里。
+        # 累计丢弃数不为 0 就说明有变更永远没进 asset_changes(r50:丢掉是
+        # 永久的,因为下一轮的检测窗口起点已经越过它们的 first_seen)。
+        dropped = t.get("dropped_change_count") or 0
+        if dropped:
+            last_dropped = t.get("last_dropped_change_count") or 0
+            print(f"    [!] 累计有 {dropped} 条变更因写入上限没进 asset_changes"
+                  f"(最近一轮 {last_dropped} 条,且不会补上)"
+                  f" —— `monitor changes` 看到的记录是不完整的")
     return 0
 
 
