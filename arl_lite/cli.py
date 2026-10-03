@@ -29,6 +29,11 @@ from . import __version__
 from .db.storage import Storage, get_default_workspace_root
 from .core.task_runner import TaskRunner
 from .core.signal_handler import GracefulShutdown
+# 词表只此一份:CLI 的 choices 从这里派生,不手写(见 build_parser 里
+# `monitor changes` 那处的说明)。手写的那份已经过期过一次。
+from .core.monitor import CHANGE_TYPES, Monitor as _Monitor
+
+_ASSET_TYPES = tuple(_Monitor._ASSET_TABLES)
 from .modules.registry import discover_modules
 
 log = logging.getLogger("arl_lite.cli")
@@ -1162,10 +1167,19 @@ def build_parser() -> argparse.ArgumentParser:
     pme.set_defaults(func=cmd_monitor_enable)
 
     pmc = pm_sub.add_parser("changes", help="看变更事件")
-    pmc.add_argument("-t", "--type", choices=["domain", "host", "port", "site", "finding"],
+    # 这两个 choices **从契约表派生**,不手写。
+    #
+    # 手写过,后果实测过:`--change-type ADDRESS_CHANGED` 被 argparse
+    # 直接拒绝(exit 2),而错误信息只列那 6 个旧值,看起来像是这个类型
+    # 根本不存在。同一张契约表当时有三份来源 —— `core/monitor.py`(真的)、
+    # `schema.sql` 的注释(已被测试钉住)、这里(没人管)。
+    # 同一张表有两个来源,迟早会漂;三个只是漂得更晚一点。
+    # 列表**不在** help 文本里再写一遍:argparse 的 usage 行本来就从
+    # `choices` 渲染出完整取值,再抄一份等于给自己造第二处会漂移的地方
+    # (r45 的第一版就正好栽在这:choices 派生了,help 却写死旧列表)。
+    pmc.add_argument("-t", "--type", choices=sorted(_ASSET_TYPES),
                     help="资产类型")
-    pmc.add_argument("-c", "--change-type", choices=["NEW_ASSET", "DISAPPEARED", "TITLE_CHANGED",
-                                                     "TECH_CHANGED", "FINGERPRINT_CHANGED", "STATUS_CHANGED"],
+    pmc.add_argument("-c", "--change-type", choices=list(CHANGE_TYPES),
                     help="变更类型")
     pmc.add_argument("-l", "--limit", type=int, default=50, help="最多显示多少条")
     pmc.add_argument("-w", "--workspace", help="工作空间名", default="default")

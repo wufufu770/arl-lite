@@ -404,11 +404,23 @@ def test_disappeared_flows_into_asset_changes(st):
 
 
 def test_cli_change_type_choices_include_disappeared():
-    """CLI 的 --change-type 早就列了 DISAPPEARED,现在真有数据能查了"""
-    import re
-    from pathlib import Path
-    src = Path(__file__).parents[1] / "arl_lite" / "cli.py"
-    assert re.search(r'"DISAPPEARED"', src.read_text(encoding="utf-8"))
+    """CLI 的 --change-type 接受 DISAPPEARED,现在真有数据能查了
+
+    ## r45:这条原来断言的是**源码文本**里有没有 `"DISAPPEARED"` 字面量
+
+    那是文本子串检查,验的是「有人把这几个字抄进了 cli.py」,不是
+    「用户真的能拿这个值去查」。r45 把 choices 改成从 `CHANGE_TYPES`
+    派生之后,cli.py 里自然不再有这个字面量,这条就红了 ——
+    红的不是行为,是实现细节。
+
+    同一个陷阱本项目反复栽过(拿文本子串当结构判据)。改成行为断言:
+    直接让 argparse 解析一次。用户能不能查到,看的是解析结果。
+    """
+    from arl_lite.cli import build_parser
+
+    args = build_parser().parse_args(
+        ["monitor", "changes", "--change-type", "DISAPPEARED"])
+    assert args.change_type == "DISAPPEARED"
 
 
 # =====================================================================
