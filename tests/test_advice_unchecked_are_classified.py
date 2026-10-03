@@ -1,34 +1,37 @@
-"""r63:判据放过的「查不动」不是一个数,是一类 —— 逐条打标,不许有第四类
+"""r63/r64:建议的判定结果必须**分完**,而且每一类都得有牙齿
 
-## 为什么要有这条
+## 这条判据在守什么
 
-r61 修完之后,判据提到 102 条建议 / 91 条干净 / 1 条死路 / 10 条查不动。
-那个「10」是个**数**,不是**一类**。而这一轮的真收获恰恰来自把它拆开:
+r63 把「查不动 11 条」拆开,发现 1 条是**死路**(散文收尾),修完剩 10 条;
+r64 又发现那 8 条「提取截断」不是良性的桶 —— 补全值重验之后 1 条藏着死路
+(`-p` 那个,真签名是 `--priority`)。所以判定现在是**四桶**:
 
-r61 的规则是**反向**的 ——「尾巴非空就放过」。r63 把它改成**正向**的
-「尾巴里有没有一个能补上缺失参数的**值**」,立刻从 10 条里分出 3 条形状:
+| 桶 | 意思 | r64 实测 |
+|---|---|---|
+| `CLEAN` | 直接解析通过 | 92 |
+| `DEAD` | argparse 明确不认 | 0 |
+| `UNVERIFIED` | 提取器吃不下尾巴,但**接回去重验过了**,且过了 | 8 |
+| `UNCHECKED` | 验不了:抱怨的值本身是占位符,补了就是在猜 | 2 |
 
-| 类 | 条数 | 尾巴长什么样 | 判据能不能自己验 |
-|---|---|---|---|
-| `提取截断` | 8 | `"标题"` / `\\x00` / `"解释这个关联分析"` | 能:引号/槽是机器可判的 |
-| `占位符` | 2 | argparse 抱怨的值就是 `<subcmd>` / `...` | 能:从错误文本里抠出来 |
-| `散文收尾` | 1 | `直接调 q.finish(...) 而不传 note` | 能:首 token 不是值形状 |
-| `没给` | 0 | 空 | 能 |
+`UNVERIFIED` 和 `UNCHECKED` 必须分开:前者验过了,后者永远验不了。
+把它们混成「查不动」正是 r60→r63 连续三轮漏掉死路的原因。
 
-而那 1 条 `散文收尾` **就是第 8 处死路**:文档写 `arl-lite devloop done-item`
-却不说 `item_id`,而 `done-item` 必填它。反向规则放过了整整两轮。
+## 三个坑,每一个都是判据自己或变异测试逮出来的
 
-## 这条判据自己守什么
-
-1. 四类**穷尽且互斥** —— 三类之和必须等于查不动总数,不许有第四类漏网。
-2. 四类**都不许是 0** —— 全 0 说明标签成了摆设,比不分类更坏。
-3. **条数钉死具体数字** —— 提取器一改就漂移,钉住才能让漂移变成一次有意的决定。
-4. 打标必须是**机器可判**的 —— 判据用的是命令行形状和 argparse 的错误文本,
-   没有人肉归类,也没有任何一条按来源文件硬编码。
+1. **「每一类都不许是 0」是错的断言**。我这么写过,当场把自己判红 ——
+   `散文收尾` 恰恰因为把死路改对才归零。断言写成了和事实作对的话,那它
+   守的就不是它宣称的东西(和 r61 那条「三类必须分完」同一个毛病)。
+2. **类列表是牙齿,而牙齿可以直接拿掉**。把 `DEAD_CLASSES` 清成 `()`,
+   `parametrize` 一个用例都不生成,判据**静默变成空转**。所以类列表的内容
+   本身被钉死。
+3. **禁用词表这种写法本身就是洞**。原本用
+   `banned = ("arl_lite/", "README.md", "docs/", ".py:")` 守「不许按来源文件
+   硬编码」,而变异 M6 写的是 `if "devloop-protocol.md" in cmd` —— 不在表里,
+   判据一声不响。改成盯不变量 + 盯函数签名。
 """
 from __future__ import annotations
 
-import re
+import inspect
 import sys
 from collections import Counter
 from pathlib import Path
@@ -42,170 +45,140 @@ from test_cli_advice_commandable import (  # noqa: E402
     CLEAN,
     DEAD,
     UNCHECKED,
-    _tail_carries_a_value,
+    UNVERIFIED,
     _why_unchecked,
+    _why_unverified,
 )
 
-# 「查不动」只该有两种:提取器够不着,或者值本来就是占位符。
-# 另外两种(`散文收尾` / `没给`)不是「查不动」,是**死路** —— 建议真的没给
-# 必填参数。所以它们在 UNCHECKED 里必须是 0,这是断言,不是例外。
-UNCHECKED_CLASSES = ("提取截断", "占位符")
-DEAD_CLASSES = ("散文收尾", "没给")
+BUCKETS = ("干净", "死路", "重验过", "查不动")
+UNVERIFIED_CLASSES = ("重建后干净",)
+DEAD_VERDICT_CLASSES = ("重建后死路", "重建不出来")
+UNCHECKED_CLASSES = ("占位符",)
+DEAD_UNCHECKED_CLASSES = ("散文收尾", "没给")
 
-# r63 实测:102 条建议 / 91 干净 / 1 死路 / 10 查不动,查不动里 8 + 2 + 0 + 0。
-# 数字钉死不是为了「不许变」,是为了让提取器一改、条数一变,
+# r64 实测。数字钉死不是为了「不许变」,是为了让提取器一改、条数一变,
 # 那次变化必须是有人**看着数字改的**,而不是悄悄漂过去的。
-PINNED = {"提取截断": 8, "占位符": 2, "散文收尾": 0, "没给": 0}
-PINNED_UNCHECKED = 10
+PINNED_BUCKETS = {"干净": 92, "死路": 0, "重验过": 8, "查不动": 2}
+PINNED_UNVERIFIED = {"重建后干净": 8}
+PINNED_UNCHECKED = {"占位符": 2}
 
 
-def _counts() -> Counter:
-    return Counter(_why_unchecked(cmd, tail) for _, cmd, tail in UNCHECKED)
+def _bucket(a) -> str:
+    for name, group in (("干净", CLEAN), ("死路", DEAD),
+                        ("重验过", UNVERIFIED), ("查不动", UNCHECKED)):
+        if a in group:
+            return name
+    return "?"
 
 
-def test_the_unchecked_ones_split_into_exactly_these_classes():
-    """穷尽且互斥:两类之和 == 查不动总数,不许有第三类混进来。"""
-    counts = _counts()
-    unknown = set(counts) - set(UNCHECKED_CLASSES)
-    assert not unknown, f"冒出了没定义过的类:{unknown}"
-    assert sum(counts.values()) == len(UNCHECKED), (
-        f"分类没覆盖完:{dict(counts)} 合计 {sum(counts.values())},"
-        f"而查不动有 {len(UNCHECKED)} 条"
+def _bucket_counts() -> Counter:
+    return Counter(_bucket(a) for a in ADVICE)
+
+
+def test_the_four_buckets_partition_every_advice_item():
+    """穷尽且互斥:四桶之和 == 建议总数,不许有第五桶漏网。"""
+    counts = _bucket_counts()
+    assert set(counts) <= set(BUCKETS), f"冒出了没定义过的桶:{set(counts) - set(BUCKETS)}"
+    assert sum(counts.values()) == len(ADVICE), (
+        f"四桶没分完:{dict(counts)} 合计 {sum(counts.values())},建议有 {len(ADVICE)} 条"
     )
+    assert len(CLEAN) + len(DEAD) + len(UNVERIFIED) + len(UNCHECKED) == len(ADVICE)
 
 
-def test_the_class_lists_themselves_have_teeth():
-    """类列表是断言的**牙齿**:清空它,parametrize 就一个用例都不生成,
-    判据会**静默变成空转**而不是变红。变异 M5 实测就是靠这条才被杀。
+def test_the_bucket_names_themselves_have_teeth():
+    """桶名是断言的**牙齿**:改掉名字,parametrize 就不生成用例了。
 
-    所以这里把两个列表的**内容**也钉死 —— 光断言「加起来等于总数」不够,
-    因为清空两边之后那个等式两边都变成 0,照样成立。
+    变异 M5 实测:把类列表清空,判据静默空转而不是变红。
     """
-    assert UNCHECKED_CLASSES == ("提取截断", "占位符")
-    assert DEAD_CLASSES == ("散文收尾", "没给")
+    assert BUCKETS == ("干净", "死路", "重验过", "查不动")
+    assert UNVERIFIED_CLASSES == ("重建后干净",)
+    assert DEAD_VERDICT_CLASSES == ("重建后死路", "重建不出来")
+    assert UNCHECKED_CLASSES == ("占位符",)
+    assert DEAD_UNCHECKED_CLASSES == ("散文收尾", "没给")
+
+
+@pytest.mark.parametrize("name", UNVERIFIED_CLASSES)
+def test_the_verified_bucket_is_not_empty(name):
+    """「重验过」这一桶要是空了,说明重建这一步被拆了 —— 而它逮到过真死路。"""
+    counts = Counter(_why_unverified(c, t) for _, c, t in UNVERIFIED)
+    assert counts[name] > 0, f"「{name}」是 0 条:重建这一步可能没接上"
+
+
+@pytest.mark.parametrize("name", DEAD_VERDICT_CLASSES)
+def test_dead_verdicts_never_appear_among_verified_items(name):
+    """这两类代表「重验之后确实坏了」/「重验不了」,都不该出现在已验过里。"""
+    counts = Counter(_why_unverified(c, t) for _, c, t in UNVERIFIED)
+    assert counts[name] == 0, f"「{name}」混进了 UNVERIFIED:{dict(counts)}"
 
 
 @pytest.mark.parametrize("name", UNCHECKED_CLASSES)
-def test_no_unchecked_class_is_ever_empty(name):
-    """「查不动」的这一类要是空了,说明标签成了摆设 —— 比不分类更坏。
-
-    注意:这是**逐类**判,不是判总数不为 0。所以哪怕提取器改进让某一类
-    彻底消失,这里也会红 —— 那时候应该把这行从 UNCHECKED_CLASSES 删掉
-    并写下原因,而不是把断言改成 `> 0` 蒙混过去。
-    """
-    counts = _counts()
-    assert counts[name] > 0, (
-        f"「{name}」这一类现在是 0 条。要么是提取器改进让它消失了"
-        f"(那就从 UNCHECKED_CLASSES 删掉并写清原因),要么是标签根本没在用"
-    )
+def test_the_unchecked_bucket_is_not_empty(name):
+    counts = Counter(_why_unchecked(c, t) for _, c, t in UNCHECKED)
+    assert counts[name] > 0, f"「{name}」是 0 条 —— 那 UNCHECKED 装的就不是占位符了"
 
 
-@pytest.mark.parametrize("name", DEAD_CLASSES)
+@pytest.mark.parametrize("name", DEAD_UNCHECKED_CLASSES)
 def test_dead_classes_never_show_up_as_unchecked(name):
     """这两类必须是 0 —— 它们代表建议真的没给参数,该判死路。
 
-    首版我把四个类一视同仁地要求「都不许是 0」,结果这一条当场把自己判红了:
-    `散文收尾` 恰恰因为**把第 8 处死路改对**才归零的。断言写成了和事实作对的话,
-    那它守的就不是它宣称的东西(和 r61 那条「三类必须分完」一个毛病)。
+    首版我把四个类一视同仁地要求「都不许是 0」,结果这一条当场把自己判红了。
     """
-    counts = _counts()
-    assert counts[name] == 0, (
-        f"「{name}」是死路而不是查不动,却混进了 UNCHECKED:{dict(counts)}"
-    )
+    counts = Counter(_why_unchecked(c, t) for _, c, t in UNCHECKED)
+    assert counts[name] == 0, f"「{name}」是死路而不是查不动,却混进了 UNCHECKED:{dict(counts)}"
 
 
 def test_the_counts_are_pinned():
     """钉死具体条数,让漂移变成一次有意的决定。"""
-    counts = _counts()
-    assert dict(counts) == {k: v for k, v in PINNED.items() if v}, (
-        f"查不动的分类变了:{dict(counts)} != {PINNED}。"
+    assert dict(_bucket_counts()) == {k: v for k, v in PINNED_BUCKETS.items() if v}, (
+        f"四桶条数变了:{dict(_bucket_counts())} != {PINNED_BUCKETS}。"
         f"先弄清是哪条建议变了形状,再决定是更新判据还是修那条建议"
     )
-    assert len(UNCHECKED) == PINNED_UNCHECKED
+    assert dict(Counter(_why_unverified(c, t) for _, c, t in UNVERIFIED)) == PINNED_UNVERIFIED
+    assert dict(Counter(_why_unchecked(c, t) for _, c, t in UNCHECKED)) == PINNED_UNCHECKED
 
 
-def test_classification_keys_off_shape_not_off_specific_commands():
+def test_verified_and_unchecked_are_not_the_same_bucket():
+    """「验过了」和「验不了」必须分开 —— 混起来正是 r60→r63 连漏三轮的根因。"""
+    assert not set(map(id, UNVERIFIED)) & set(map(id, UNCHECKED))
+    assert UNVERIFIED, "UNVERIFIED 是空的:重建那一步没接上?"
+    assert UNCHECKED, "UNCHECKED 是空的:占位符那两条去哪了?"
+
+
+@pytest.mark.parametrize("fname", ["_why_unchecked", "_why_unverified"])
+def test_classification_keys_off_shape_not_off_specific_commands(fname):
     """打标必须只认**形状**,不许认具体那条命令或具体那个文件。
 
-    首版这里列的是禁用文件名(`arl_lite/`、`README.md`、`docs/`、`.py:`),
-    变异 M6 写的是 `if "devloop-protocol.md" in cmd` —— 不在禁用词表里,
-    判据一声不响。**禁用词表这种写法本身就是洞**:下一个人会写一个
-    没进表的名字。
+    首版这里列的是禁用文件名,变异 M6 写的是 `if "devloop-protocol.md" in cmd`
+    —— 不在禁用词表里,判据一声不响。**禁用词表这种写法本身就是洞**。
+    真正的不变量:归类函数里不许出现任何含命令文本或路径形状的字符串字面量。
 
-    真正的不变量是:归类函数里不许出现**任何含命令文本或路径形状的字符串字面量**
-    (含 `arl-lite `、`.md`、`.py`、`/`)。它只该看引号、槽、占位符、空这几样形状。
+    用 AST 取字面量而不是正则扫源码:正则会把 docstring 也扫进去 ——
+    实测第一版就因为 docstring 里有个「 / 」把自己判红了(判据自己犯的
+    同一个毛病:断言和事实作对)。docstring 里**应该**能自由写字。
     """
+    import ast
+
     src = Path(__file__).resolve().parent / "test_cli_advice_commandable.py"
-    text = src.read_text(encoding="utf-8")
-    body = text.split("def _why_unchecked(")[1].split("def _verdict(")[0]
-    for literal in re.findall(r'"([^"\n]*)"', body):
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    fn = next(n for n in ast.walk(tree)
+              if isinstance(n, ast.FunctionDef) and n.name == fname)
+    docstring = ast.get_docstring(fn, clean=False)
+    for node in ast.walk(fn):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        if node.value == docstring:      # docstring 里可以自由写字
+            continue
         for shape in ("arl-lite ", ".md", ".py", "/", "docs", "README"):
-            assert shape not in literal, (
-                f"归类逻辑里出现了硬编码的字面量 {literal!r}(含 {shape!r}) —— "
-                f"归类只该看形状,不该认具体命令或具体来源文件"
+            assert shape not in node.value, (
+                f"{fname} 里出现了硬编码字面量 {node.value!r}(含 {shape!r},"
+                f"行 {node.lineno})—— 归类只该看形状"
             )
 
 
-def test_classification_does_not_read_the_source_label_at_all():
-    """`_why_unchecked` 的签名里压根没有来源标签 —— 所以它**不可能**按文件归类。
+@pytest.mark.parametrize("fname", ["_why_unchecked", "_why_unverified"])
+def test_classification_does_not_read_the_source_label_at_all(fname):
+    """归类函数的签名里压根没有来源标签 —— 所以它**不可能**按文件归类。"""
+    import test_cli_advice_commandable as crit
 
-    这条比任何文本检查都硬:哪怕有人在函数体里写死一个文件名,签名不变
-    也拦不住;但签名一旦要加 `src` 参数,这里立刻红。
-    """
-    import inspect
-
-    params = list(inspect.signature(_why_unchecked).parameters)
-    assert params == ["cmd", "tail"], f"归类函数的参数变成了 {params},多出来的多半是来源标签"
-
-
-@pytest.mark.parametrize(
-    "tail, expect",
-    [
-        ('"标题"', True),                          # 引号值
-        ('"解释这个关联分析"', True),                # 引号值含中文
-        ('\x00 --limit 10000', True),              # f-string 槽
-        ('`arl-lite watch add` first', True),      # 反引号
-        ("<target>", True),                        # 占位符
-        ("# 跑单个门禁并打印实测值", False),         # 注释
-        ("直接调  q.finish(...) 而不传 note。", False),  # 散文
-        ("| 手动加待办 |", False),                   # 表格说明列
-        ("", False),
-    ],
-)
-def test_value_shaped_tail_is_a_positive_test(tail, expect):
-    """正向判定:先问「有没有值」,而不是「尾巴空不空」。
-
-    r61 那条反向规则(尾巴非空就放过)会把 `直接调 q.finish(...)` 当成
-    「值在这儿」,于是 `devloop done-item` 少写 `item_id` 没人管。
-    """
-    assert _tail_carries_a_value(tail) is expect
-
-
-@pytest.mark.parametrize(
-    "tail, expect",
-    [
-        # 两个死路类:它们在真实数据里恒为 0(会被判成 DEAD),
-        # 所以只能拿合成输入验 —— 否则这两支就是永远走不到的死代码。
-        ("", "没给"),
-        ("直接调  q.finish(...) 而不传 note。", "散文收尾"),
-        ("# 跑单个门禁并打印实测值", "散文收尾"),
-    ],
-)
-def test_dead_classes_are_reachable_at_all(tail, expect):
-    """这两支不许是死代码:它们在 UNCHECKED 里恒为 0,只靠真实数据验不到。"""
-    cmd = "arl-lite devloop gate"  # argparse 会抱怨缺 gate_name
-    assert _why_unchecked(cmd, tail) == expect
-
-
-def test_prose_tail_means_the_advice_really_did_omit_it():
-    """`散文收尾` 和 `没给` 都是**死路**,不是「查不动」。
-
-    所以 r63 修完,UNCHECKED 从 11 降到 10 —— 少的那 1 条不是被放过,
-    是被判成了死路然后**把文档改对了**(`docs/devloop-protocol.md` 里的
-    `arl-lite devloop done-item` 补成 `arl-lite devloop done-item <id>`)。
-    """
-    assert not [a for a in UNCHECKED if _why_unchecked(a[1], a[2]) == "散文收尾"], (
-        "还有建议的尾巴是散文 —— 那是建议没给必填参数,应该判死路而不是放过"
-    )
-    assert len(DEAD) == 0, f"仓库里还有死路:{[a[1] for a in DEAD]}"
-    assert len(CLEAN) + len(UNCHECKED) + len(DEAD) == len(ADVICE)
+    params = list(inspect.signature(getattr(crit, fname)).parameters)
+    assert params == ["cmd", "tail"], f"{fname} 的参数变成了 {params},多出来的多半是来源标签"

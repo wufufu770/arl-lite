@@ -1,9 +1,9 @@
-"""r60/r61/r63:面向用户的建议里不能混着跑不通的 arl-lite 命令。
+"""r60/r61/r63/r64:面向用户的建议里不能混着跑不通的 arl-lite 命令。
 
 背景(实测,不是推演):`arl-lite correlate first`、`arl-lite export json`、
 README 里 `ai explain --finding-id` / `ai suggest --target` / `ai fix --rule-id`、
 `arl-lite perf-bench --scale 0.2`、两处光秃秃的 `arl-lite run`、
-`arl-lite devloop done-item` 缺 `item_id` 共 8 处死路。跑不通的报错和真正
+`arl-lite devloop done-item` 缺 `item_id`、`devloop add` 的 `-p` 该是 `--priority` 共 9 处死路。跑不通的报错和真正
 原因毫无关系——用户看到「没关联分析」,照着提示敲 `correlate first`,撞上的
 是 argparse 的「unrecognized arguments」。给用户一条走不通的路,比不给更坏
 (r59 立的规矩)。
@@ -71,24 +71,45 @@ r61 的规则是反向的 —— 尾巴非空就放过。r63 把它改成正向�
 **非空,但不是值**。散文、注释、表格说明列都救不了缺失的参数。
 f-string 槽、引号值、反引号值、`<占位符>` 才算值。
 
-## 三类判定,不是两类
+## 「提取截断」不是良性的桶,是没人扫过的地(r64)
+
+r63 把「查不动」拆成 提取截断 8 / 占位符 2 之后,实测把那 8 条的**完整形态**
+补上值真跑一遍 —— **8 条里有 1 条藏着第 9 处死路**:文档写
+`arl-lite devloop add <id> "标题" -p 2`,真签名是 `--priority`。
+提取器在中文引号值 `"标题"` 处就截断了,`-p 2` 落在**截断点后面**,
+A1/A2/A3 全都看不见。
+
+所以判定从三桶变成**四桶**:多了 `UNVERIFIED` —— 提取器吃不下尾巴,
+但**接回去重验过了**,而且过了。它必须和 `UNCHECKED`(永远验不了)分开:
+「验过了」和「验不了」混成一句,正是 r60→r63 连漏三轮的根因。
+
+重建规则(`_reconstruct`)的三个要点都是实测踩出来的:
+按**原始文本**切第一个值(shlex 会先剥引号,值边界就丢了)、返回 **token 列表**
+(值里可能有空格)、**f-string 槽不许瞎补**(先填哑元,只有 argparse 自己回
+`invalid choice` 才用它给的第一个合法取值重试 —— 那不是猜,是 argparse 在
+回答「这位置能填什么」)。
+
+## 四桶判定,不是两类
 
 r60 只有「跑得通 / 查不动」两类,靠「有没有 SystemExit」分。r61 拆成三类
-(`_verdict`):干净 / 死路 / 查不动。分法是**看 argparse 具体抱怨什么**,加上
-**尾巴里有没有值**:
+(`_verdict`):干净 / 死路 / 查不动。分法是**看 argparse 具体抱怨什么**,
+加上**尾巴里有没有值**:
 
 * `invalid choice` 且抱怨的值不是占位符 → **死路**。值错不是缺值。
-* 抱怨的值本身是占位符(`<subcmd>`、`...`)→ 查不动,那本来就是「填这里」。
-* 抱怨缺参数/缺值,且尾巴里**有值**(中文引号值、f-string 槽)→ 查不动,
-  是提取器够不着(`arl-lite ai ask "解释这个关联分析"` 里明明有 question)。
-* 抱怨缺参数/缺值,但尾巴里**没值** → **死路**,建议真的没给。
+* 抱怨的值本身是占位符 → 查不动,那本来就是「填这里」。
+* 抱怨缺参数/缺值,且尾巴里**没有值**(散文、注释、空)→ 死路,建议真的没给。
+* 抱怨缺参数/缺值,且尾巴里**有值** → 接回去重验:过了进 `UNVERIFIED`,
+  死了进 `DEAD`(不带 `unverified:` 前缀 —— 死路是怎么发现的跟它是不是
+  死路无关,分两桶只会让「一个死路算进两桶」的空子出现)。
+* 没抱怨但 `parse_known_args` 剩了东西 → 死路(A2 管的那些)。
 
-r63 之后实测:102 条建议 / 91 干净 / 0 死路 / 10 查不动(提取截断 8 + 占位符 2)。
-打标本身的判据在 `tests/test_advice_unchecked_are_classified.py`。
+r64 实测:102 条建议 / 92 干净 / 0 死路 / 8 重验过 / 2 查不动(占位符)。
+打标与分桶的判据在 `tests/test_advice_unchecked_are_classified.py`,
+重建的判据在 `tests/test_advice_truncated_tail_reverified.py`。
 
-放过不等于不查:`test_criterion_actually_checks_enough_commands` 钉住「真验条数」
-下限,`test_the_unchecked_ones_stay_unchecked` 钉住「查不动条数」下界 —— 两头
-都钉,提取器退化了、或者被人悄悄放松,都会有声音。
+放过不等于不查:覆盖面不许静默缩 —— 守卫从「查不动条数下界」改成
+「**验过的条数**下界 + 查不动条数上界」(r64 起查不动只剩 2 条,下界没意义了;
+静默放松的表现是更多条目掉进查不动,而不是更少)。
 """
 from __future__ import annotations
 
@@ -116,6 +137,11 @@ BANNER_LEFT = re.compile(r"([-=#*~^])\1\s*$")
 VERSION_BANNER = re.compile(r"arl-lite\s+v(?=[\d{.]|\s|$)")
 # 命令 token 允许的字符(ASCII);中文正文、管道、重定向一律在此终止命令
 TOKEN = re.compile(r"[\w.:/@=<>{},%-]+")
+# r64:重建时尾巴里能接回去的 token 形状,以及 f-string 槽的替身。
+# 槽先填哑元,只有 argparse 自己说「这个位置能填 X」时才改填 X。
+TAIL_TOK = re.compile(r"[\w.:/@=<>{},%~$*+-]+")
+FSTRING_SLOT = "\x00"
+SLOT_DUMMY = "ZZSLOTZZ"
 
 
 # ---------------------------------------------------------------- 提取
@@ -293,20 +319,6 @@ def _leftovers(cmd: str):
 ADVICE = list(_all_advice())
 
 
-def _verdict(cmd: str, tail: str) -> str:
-    """这条建议是「干净」「死路」还是「查不动」。
-
-    r60 用「有没有 SystemExit」一刀切,把 argparse 的四类抱怨混成一句,
-    于是 r61 实测到的第 6 处死路被放过了一整轮。这一版按抱怨类型分开:
-
-    * `invalid choice` 且抱怨的值**不是**占位符 → 死路。值是**错的**不是缺的,
-      后面补什么都救不回来(`--scale 0.2` 只收 {small,medium,large})。
-    * 抱怨的值本身就是占位符(`<subcmd>`、`...`)→ 查不动,那本来就是「填这里」。
-    * 抱怨「缺参数 / 缺值」→ 看尾巴:尾巴里还有东西,说明是提取器够不着
-      (`arl-lite ai ask "解释这个关联分析"` 里明明有 question);
-      尾巴空了才是建议真的没给。
-    * 没抱怨但 parse_known_args 剩了东西 → 死路(A2 管的那些)。
-    """
 def _complained_value(says: str) -> str:
     """从 `invalid choice: '0.2' (choose from ...)` 里把值抠出来。"""
     return says.split("invalid choice:")[-1].split("(")[0].strip().strip("'\"")
@@ -336,20 +348,121 @@ def _tail_carries_a_value(tail: str) -> bool:
 
 
 def _why_unchecked(cmd: str, tail: str) -> str:
-    """「查不动」的进一步归类 —— 机器可判,不是人肉归类。
+    """「查不动」的归类 —— 机器可判,不是人肉归类。
 
-    四类,穷尽且互斥:
-    * `占位符`   —— argparse 抱怨的值本身就是 `<subcmd>` / `...`,那本来就是「填这里」
-    * `提取截断` —— 尾巴里**有**值,是提取器吃不下(引号值 / f-string 槽)
-    * `散文收尾` —— 尾巴里**没有**值,后面是给人看的说明
-    * `没给`     —— 尾巴是空的
+    r64 之后「查不动」只剩两种:`占位符`(argparse 抱怨的值本身就是
+    `<subcmd>` / `...`,补不了,补了就是在猜)和 `没给`(尾巴空的)。
+    另有 `散文收尾` —— 它属于**死路**不是查不动,所以在 UNCHECKED 里
+    恒为 0,判据拿合成输入验它(否则就是走不到的死代码)。
+
+    「提取截断」这一类在 r64 里**搬走了**:尾巴里有值的那些不再算查不动,
+    而是接回去重验,结果进 UNVERIFIED。
     """
     says = _argparse_says(cmd)
     if "invalid choice" in says and _is_placeholder(_complained_value(says)):
         return "占位符"
     if not tail:
         return "没给"
-    return "提取截断" if _tail_carries_a_value(tail) else "散文收尾"
+    return "散文收尾"
+
+
+def _why_unverified(cmd: str, tail: str) -> str:
+    """「重验过」的归类:干净 / 死路 / 重建不出来。"""
+    verdict, _ = _verified_by_reconstruction(cmd, tail)
+    if verdict.startswith("deadend"):
+        return "重建后死路"
+    if verdict.startswith("unchecked"):
+        return "重建不出来"
+    return "重建后干净"
+
+
+def _reconstruct(cmd: str, tail: str):
+    """把提取器吃不掉的那一段接回命令,得到**完整形态**再验一次。
+
+    ## 为什么需要这一步(r64)
+
+    r63 把「查不动」分成 提取截断 8 / 占位符 2。紧接着实测把那 8 条的完整
+    形态补上值真跑一遍,**8 条里有 1 条藏着第 9 处死路**:文档写
+    `arl-lite devloop add <id> "标题" -p 2`,真签名是 `--priority`。
+    提取器在中文引号值 `"标题"` 处就截断了,`-p 2` 落在**截断点后面** ——
+    A1/A2/A3 全都看不见它。
+
+    所以「提取截断」不是一个良性的桶,是一片没人扫过的地。这一步把它扫了。
+
+    ## 三个必须守住的细节(每条都是实测踩出来的)
+
+    * **按原始文本切第一个值**,不能用 shlex:shlex 先剥引号,`"标题"` 变成
+      `标题`,「值到哪结束」这个信息就丢了 —— 实测 8 条里 5 条重建不出来。
+    * **返回 token 列表而不是字符串**:值里可能有空格
+      (`"title like '%admin%'"`),拼成字符串再 split 就散了。
+    * **f-string 槽不许瞎补**:槽是运行期插值,补错会凭空造出假死路。
+      所以先填哑元;若 argparse 回 `invalid choice`,才改用 argparse 自己给的
+      第一个合法取值重试 —— 那不是猜,那是 argparse 在回答「这位置能填什么」。
+    """
+    tail = tail.strip()
+    if not tail:
+        return None
+    if tail[0] in ('"', "'", "`"):
+        end = tail.find(tail[0], 1)
+        if end == -1:
+            return None
+        value, rest = tail[1:end], tail[end + 1:]
+    else:
+        m = re.match(r"\S+", tail)
+        value, rest = m.group(0), tail[m.end():]
+        # 不带引号的分支只认两种:槽和占位符。少了这道守卫,散文
+        # (`直接调 q.finish(...)`)和注释(`# 跑单个门禁`)的第一个词
+        # 都会被当成参数值接回命令 —— 实测判据自己就是这么把自己判红的。
+        if not (value == FSTRING_SLOT or _is_placeholder(value)):
+            return None
+    if not value:
+        return None
+    extra = []
+    if rest.strip():
+        try:
+            rest_toks = shlex.split(rest.replace("`", " "), comments=False)
+        except ValueError:
+            rest_toks = rest.split()
+        for t in rest_toks:
+            t = t.rstrip(")]}>,;:_!")
+            # 表格竖线、井号、纯中文(散文)都停 —— 那是给人看的,不是命令
+            if not t or t in ("|", "#") or not t.isascii() or not TAIL_TOK.match(t):
+                break
+            extra.append(t)
+    return [*cmd.split(), value, *extra]
+
+
+def _run_argv(argv: list):
+    """按 token 列表跑一遍真 parser,返回 (argparse 的抱怨, 多余参数)。"""
+    parser = build_parser()
+    sink = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(sink), contextlib.redirect_stdout(io.StringIO()):
+            _, extra = parser.parse_known_args(argv[1:])
+    except SystemExit:
+        lines = [ln for ln in sink.getvalue().splitlines() if "error:" in ln]
+        return (lines[-1].split("error:")[-1].strip() if lines else "(无 error 行)"), []
+    return "", extra
+
+
+def _verified_by_reconstruction(cmd: str, tail: str):
+    """重建后重验。返回 (判定, 可读形态)。"""
+    full = _reconstruct(cmd, tail)
+    if full is None:
+        return "unchecked:重建不出来", ""
+    argv = [a.replace(FSTRING_SLOT, SLOT_DUMMY) for a in full]
+    says, extra = _run_argv(argv)
+    if says and SLOT_DUMMY in says and "invalid choice" in says:
+        m = re.search(r"choose from '([^']+)'", says)
+        if m:
+            argv = [a.replace(SLOT_DUMMY, m.group(1).split(",")[0].strip()) for a in argv]
+            says, extra = _run_argv(argv)
+    readable = " ".join(a if a != FSTRING_SLOT else "<槽>" for a in full)
+    if says:
+        return f"deadend:{says}", readable
+    if extra:
+        return f"deadend:多余参数 {extra}", readable
+    return "clean", readable
 
 
 def _verdict(cmd: str, tail: str) -> str:
@@ -377,12 +490,25 @@ def _verdict(cmd: str, tail: str) -> str:
         return f"deadend:值不合法 {value}"
     if not _tail_carries_a_value(tail):
         return f"deadend:{says}"
-    return f"unchecked:提取到 {tail[:20]}"
+    # 尾巴里确实有值,但提取器吃不下(中文引号值 / f-string 槽)——
+    # **这不等于它没问题**,只等于提取器看不全。r64 实测:8 条这种建议补全
+    # 之后有 1 条藏着死路(`-p` 那个,真签名是 `--priority`)。所以接回去重验。
+    #
+    # 重验出来是死路的就是死路,**不带** `unverified:` 前缀 —— 前缀是给
+    # 「验过且过了」和「重建不出来」用的。死路是怎么发现的跟它是不是死路
+    # 没关系,分成两桶只会让「一个死路能同时算进两桶」这种空子出现。
+    sub, _ = _verified_by_reconstruction(cmd, tail)
+    if sub.startswith("deadend"):
+        return sub
+    return f"unverified:{sub}"
 
 
 CLEAN = [a for a in ADVICE if _verdict(a[1], a[2]).startswith("clean")]
 DEAD = [a for a in ADVICE if _verdict(a[1], a[2]).startswith("deadend")]
 UNCHECKED = [a for a in ADVICE if _verdict(a[1], a[2]).startswith("unchecked")]
+# 第四类(r64 新增):提取器吃不下尾巴,但**接回去重验过**。
+# 它和「查不动」不是一回事:查不动是永远验不了,这一类是验过了、而且过了。
+UNVERIFIED = [a for a in ADVICE if _verdict(a[1], a[2]).startswith("unverified")]
 
 
 # ---------------------------------------------------------------- 判据
@@ -434,22 +560,32 @@ def test_the_unchecked_ones_stay_unchecked():
     """「查不动就放过」不许被悄悄改成「查不动就当通过」。
 
     变异测试 M14(r60)把 `except SystemExit: return None` 改成 `return []`,
-    一批占位符建议从「查不动」变成「已验通过」,一条测试都没红——判据的覆盖面
-    少了一截,却没有任何声音。所以这里把「查不动的那一批」钉成有下界的集合。
-    r61 修完提取器后实测 15 条(占位符 `<subcmd>`、中文引号值、f-string 槽)。
+    一批建议从「查不动」变成「已验通过」,一条测试都没红——判据的覆盖面
+    少了一截,却没有任何声音。
+
+    r64 起「查不动」只剩 2 条(占位符,补了就是在猜),所以**条数下界不再是
+    合适的守卫** —— 真正的守卫是「验过的条数不许缩」:静默放松的表现是
+    更多条目被塞进查不动,而不是更少。
     """
-    assert len(UNCHECKED) >= 5, (
-        f"只剩 {len(UNCHECKED)} 条查不动,其余全被当成「已验通过」了 —— "
-        f"检查覆盖面被静默削掉了吗"
+    verified = len(CLEAN) + len(UNVERIFIED)
+    assert verified >= 98, (
+        f"只有 {verified} 条被验过(干净 {len(CLEAN)} + 重验过 {len(UNVERIFIED)}),"
+        f"低于 98 —— 检查覆盖面被静默削掉了吗"
+    )
+    assert len(UNCHECKED) <= 5, (
+        f"{len(UNCHECKED)} 条落进「查不动」,超过 5 条 —— "
+        f"多出来的多半是提取器退化了,不是真的验不了"
     )
     # 三类必须**分完**,不许有第四类。第一版这条写成了 `UNCHECKED + CLEAN ==
     # ADVICE`,漏了 DEAD 一类 —— 于是它歪打正着当成了「一条死路都不能有」的
     # 后盾,覆盖变异 C-value 明明 skip 掉了 A3 却被它杀掉,我一度以为 A3 之外
     # 还有别的守卫。查下去才发现是自己的断言写错了:它守的东西和它宣称的名字
     # 不是一回事,和 r35 那条「字段名承诺的语义必须和承载的语义对得上」同一族。
-    assert len(UNCHECKED) + len(CLEAN) + len(DEAD) == len(ADVICE), (
-        f"三类没分完:{len(CLEAN)} 干净 + {len(DEAD)} 死路 + "
-        f"{len(UNCHECKED)} 查不动 != {len(ADVICE)} 条建议"
+    # r64 起是**四桶**:干净 / 死路 / 重验过 / 查不动。「重验过」单列是因为
+    # 「验过了」和「验不了」混成一句正是 r60→r63 连漏三轮的根因。
+    assert len(CLEAN) + len(DEAD) + len(UNVERIFIED) + len(UNCHECKED) == len(ADVICE), (
+        f"四桶没分完:{len(CLEAN)} 干净 + {len(DEAD)} 死路 + "
+        f"{len(UNVERIFIED)} 重验过 + {len(UNCHECKED)} 查不动 != {len(ADVICE)} 条建议"
     )
 
 
@@ -473,9 +609,16 @@ def test_the_unchecked_ones_stay_unchecked():
         # 查不动:抱怨的值本来就是占位符
         ("arl-lite devloop <subcmd>", "", "unchecked"),
         ("arl-lite devloop ...", "  ", "unchecked"),
-        # 查不动:尾巴里明明有值,是提取器够不着
-        ("arl-lite ai ask", '"解释这个关联分析"', "unchecked"),
-        ("arl-lite devloop add foo", '"标题"', "unchecked"),
+        # 死路:值是对的但挂了个不存在的参数(藏在中文引号值后面)
+        ("arl-lite devloop add foo", '"标题" -p 2', "deadend"),
+        # 查不动:抱怨的值本身就是占位符,补了就是在猜
+        ("arl-lite perf-bench --scale <档位>", "  ", "unchecked"),
+        # r64:尾巴里明明有值 —— 接回去重验过了,而且过了(r63 算它是「查不动」)
+        ("arl-lite ai ask", '"解释这个关联分析"', "unverified"),
+        ("arl-lite devloop add foo", '"标题"', "unverified"),
+        # r64:接回去重验之后发现死路
+        ("arl-lite devloop add <id>", '"标题" -p 2 | 说明列 |', "deadend"),
+        ("arl-lite devloop add <id>", '"标题" --priority 2 | 说明列 |', "unverified"),
     ],
 )
 def test_verdict_classifies_each_argparse_complaint(cmd, tail, expect):
