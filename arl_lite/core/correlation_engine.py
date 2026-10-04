@@ -552,6 +552,38 @@ def run_all_rules(storage, rules_dir: str | Path | None = None,
     return all_hits
 
 
+def hit_identity(hit: CorrelationHit) -> tuple[str, str]:
+    """`(target, target_type)` —— 命中目标的主键和类型
+
+    ## 为什么抽出来(r96)
+
+    这个提取原先**只**内联在 `save_correlations` 里。而
+    `arl_lite/mcp/server.py` 的 `run_correlate` **自己抄了一份**,
+    抄的还是错的:`hit.target` 是个 `dict`,而那份抄写写的是
+    `h.target_type` —— 这个属性在 `CorrelationHit` 上**压根不存在**。
+
+    实测:造 6 台开着 23/6379/9200/3306/27017 的机器,规则一命中就抛
+        AttributeError: 'CorrelationHit' object has no attribute 'target_type'
+
+    也就是说 **MCP 的 `run_correlate` 从来没成功执行过**。之前没暴露,
+    是因为没有哪个测试真的造出过命中 —— 0 命中时那段循环根本不进。
+    这和 r94 那条名单判据是同一个病:代码写了,但从没跑过,于是没人知道
+    它是错的。
+
+    「两处手抄同一段逻辑,迟早漂」是本仓库的决策 #9,这里是它的一个
+    已实现的实例 —— 漂了,而且漂成了崩。
+    """
+    t = hit.target
+    if "aggregate" in t:
+        return f"workspace@{t.get('aggregate')}", "aggregate"
+    target = (t.get("ip") or t.get("host") or t.get("domain")
+              or t.get("target") or t.get("url") or t.get("id") or "unknown")
+    target_type = ("ip" if "ip" in t else "host" if "host" in t
+                   else "domain" if "domain" in t
+                   else "site" if "url" in t else "other")
+    return target, target_type
+
+
 def save_correlations(storage, hits: list[CorrelationHit]) -> int:
     """把命中写进 correlations 表,返回写入条数
 
@@ -563,21 +595,7 @@ def save_correlations(storage, hits: list[CorrelationHit]) -> int:
     count = 0
     for hit in hits:
         # target 字段取主键(ip / host / domain),聚合规则固定为 workspace
-        if "aggregate" in hit.target:
-            target, target_type = f"workspace@{hit.target.get('aggregate')}", "aggregate"
-        else:
-            target = (hit.target.get("ip")
-                      or hit.target.get("host")
-                      or hit.target.get("domain")
-                      or hit.target.get("target")
-                      or hit.target.get("url")
-                      or hit.target.get("id")
-                      or "unknown")
-            target_type = "ip" if "ip" in hit.target else (
-                "host" if "host" in hit.target else (
-                "domain" if "domain" in hit.target else (
-                "site" if "url" in hit.target else "other"
-            )))
+        target, target_type = hit_identity(hit)
         evidence = hit.evidence_preview or json.dumps(hit.target, ensure_ascii=False, default=str)
         try:
             with storage._conn() as conn:
