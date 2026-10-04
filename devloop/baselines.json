@@ -196,18 +196,8 @@
   "prompt_injection_guard": 1,
   "rules_have_advice": 37,
   "test_baseline": {
-    "allowed_failures": [
-      "tests/test_phase1.py::test_3state_discipline",
-      "tests/test_phase1.py::test_base_module_3state",
-      "tests/test_phase1.py::test_crtsh_module_mock",
-      "tests/test_phase2.py::test_9_sources_integration",
-      "tests/test_phase2.py::test_concurrent_isolation",
-      "tests/test_phase2.py::test_e2e_chain",
-      "tests/test_phase2.py::test_httpx_probe_integration",
-      "tests/test_phase2.py::test_portscan_integration",
-      "tests/test_phase3.py::test_e2e_full"
-    ],
-    "failed": 9,
-    "passed": 433
+    "allowed_failures": [],
+    "failed": 0,
+    "passed": 1249
   }
 }
