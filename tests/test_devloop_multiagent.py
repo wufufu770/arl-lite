@@ -543,21 +543,67 @@ def test_protocol_does_not_duplicate_the_locked_read_modify_write():
 
     这条断言直接把那个漂移钉死:protocol 只能调 Queue 的方法。
     """
+    import ast
     import inspect
+    import textwrap
     from arl_lite.devloop.protocol import Loop
 
-    src = inspect.getsource(Loop.recover_stale_in_progress)
+    # 首版这里用的是 `"q.recover_stale(" in inspect.getsource(...)` —— **被证明
+    # 能假绿**:把真调用换成 `n, held = 0, 0`、再往函数里加一行
+    # `# ... q.recover_stale(` 的注释,这条断言照样 passed。
+    # 注释和 docstring 同样包含那串字符,而这条断言守的恰恰是多 agent 并发安全
+    # (漏掉 Queue.recover_stale = 安静地丢更新、抹掉别的 agent 刚领的活)。
+    # **结构检查必须用 AST,不能用文本子串** —— 子串能被注释喂饱。
+    def _src_of(obj) -> ast.AST:
+        # getsource 对方法返回的是带缩进的片段,必须 dedent 才能 parse
+        return ast.parse(textwrap.dedent(inspect.getsource(obj)))
+
+    def _calls(node) -> set[str]:
+        """函数体里真正**被调用**的方法名(属性访问,按对象名分组)。"""
+        out = set()
+        for sub in ast.walk(node):
+            if (isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                    and isinstance(sub.func.value, ast.Name)):
+                out.add(f"{sub.func.value.id}.{sub.func.attr}")
+        return out
+
+    fn = next(n for n in ast.walk(_src_of(Loop.recover_stale_in_progress))
+              if isinstance(n, ast.FunctionDef))
+    called = _calls(fn)
+
     # 复位必须在 Queue 的临界区内完成
-    assert "q.recover_stale(" in src, "protocol 没走 Queue.recover_stale"
-    # protocol 不该自己碰锁
-    assert "file_lock" not in src, "protocol 自己在加锁,规则又变成两处"
-    # 也不该自己 load→save
-    assert "q.load()" not in src and "q.save(" not in src, \
-        "protocol 自己做读-改-写,绕开了 Queue 的加锁入口"
-    # 顺带守住 Queue 那一侧:复位必须真的在锁里 load
-    qsrc = inspect.getsource(Queue.recover_stale)
-    locked_at = qsrc.index("with self._locked(")
-    assert locked_at < qsrc.index("self.load()"), \
+    assert "q.recover_stale" in called, (
+        f"protocol 没走 Queue.recover_stale(实际调用的: {sorted(called)})"
+    )
+    # protocol 不该自己碰锁 / 不该自己 load→save
+    # 这两条原来是 `"file_lock" not in src` 之类的子串判断,同样能被注释喂饱 ——
+    # 注释里写一句「早先这里用 file_lock」就会假绿。改成看真正调了什么。
+    forbidden = {"q.file_lock", "file_lock", "q.load", "q.save"}
+    leaked = sorted(forbidden & called)
+    assert not leaked, (
+        f"protocol 自己做读-改-写/自己加锁,绕开了 Queue 的加锁入口:{leaked}"
+    )
+    # 顺带守住 Queue 那一侧:复位必须真的在锁里 load。
+    # 原版用 `qsrc.index("with self._locked(") < qsrc.index("self.load()")` 找位置,
+    # 那也只认字面、不认结构;这里直接看 AST 节点顺序。
+    qfn = next(n for n in ast.walk(_src_of(Queue.recover_stale))
+               if isinstance(n, ast.FunctionDef))
+
+    def _first_idx(pred) -> int | None:
+        for i, sub in enumerate(ast.walk(qfn)):
+            if pred(sub):
+                return i
+        return None
+
+    lock_at = _first_idx(lambda s: isinstance(s, ast.Call)
+                         and isinstance(s.func, ast.Attribute)
+                         and s.func.attr == "_locked")
+    load_at = _first_idx(lambda s: isinstance(s, ast.Call)
+                         and isinstance(s.func, ast.Attribute)
+                         and s.func.attr == "load")
+    assert lock_at is not None and load_at is not None, \
+        f"Queue.recover_stale 里找不到 with self._locked(...) 或 self.load() 调用"
+    assert lock_at < load_at, \
         "Queue.recover_stale 的 load 在锁外 —— 丢更新会回来"
 
 
