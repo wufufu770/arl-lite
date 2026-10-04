@@ -54,6 +54,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -326,64 +327,183 @@ class TestNoStrayTmpDirsSurviveARun(unittest.TestCase):
     人再用一个 `mkdtemp()` 照样漏。所以改成两条:
 
     1. `tests/conftest.py` 里有会话级兜底,来一次收一次
-    2. 本条直接验**兜底真的有效**:跑一遍,`/tmp` 目录数不许增加
+    2. 本条直接验**兜底真的有效**:跑一遍,临时目录不许增加
 
-    ## 局限,说在前面
+    ## r87:`tmp*` 不是 arl-lite 的名字,是 Python 全局的名字
 
-    判据是"目录数不增加",所以:
+    r36 把快照从「整个 `/tmp`」收窄到「`tmp*`」,理由是
+    `tempfile.mkdtemp()` 造出来的目录一律以 `tmp` 开头。这个理由对,
+    但结论错了一半:**`tmp*` 是整台机器上每一个 Python 程序的约定**,
+    不是本项目的。收窄之后,判据守的仍然是「这台机器的 /tmp 没有新增」。
 
-    - 只能证明**这次**没漏,不能证明代码里没有 `mkdtemp()`
-    - 并发跑多个 pytest 时会互相干扰(别人建的目录也算进来)
-    - 只统计顶层目录,不递归
+    r87 实测(零 arl-lite 测试在跑的 60 秒窗口内):
 
-    所以它是兜底的兜底。真正该做的是写测试时用 `TemporaryDirectory`。
+        起点 tmp* 目录数: 143
+          t+16s  新增=['tmp4sfrus9a'] 消失=0
+        60 秒内外部进程新建的 tmp* 目录: ['tmp4sfrus9a']
+
+    那次红不是回归,是一个跟本项目毫无关系的进程在写 /tmp。而这种红
+    **和真回归长得一模一样** —— 正是本文件 r36 段自己写的「假红才可怕」:
+    门禁随机飘红,飘红会被当成真回归去查。r87 当天就为这个假红付了一次
+    全量(10 条失败里那 1 条)。
+
+    修法不是把 `tmp*` 再收窄(收无可收),而是**换测量对象**:把子进程
+    的 `TMPDIR` 指到一块私有地,让 `tempfile.gettempdir()` 在子进程里
+    解析到那里。判据要看的是「conftest 回收器有没有漏掉**它自己那块**
+    的目录」,那就只量它自己那块。
+
+    附带把 r36 列的另一条局限也消掉了:并发跑多个 pytest 现在互不干扰,
+    因为各量各的私有地。
+
+    ## 判据不许只能靠「今天恰好没噪音」变绿
+
+    修掉的是假红,所以**正常跑是验不出来的** —— 机器安静时新旧写法都绿。
+    唯一能确定性地守住的办法是**主动注入噪音**:在快照窗口内,往真实
+    `/tmp` 塞一个 `tmp*` 目录。注入在快照窗口**之内**,所以它精确地
+    模拟了 r87 实测到的那个外部进程。
+
+    守不住的那一侧会立刻红:`TMPDIR` 那一行一旦被删掉,注入的目录就会
+    落进快照,`test_machine_wide_tmp_churn_cannot_make_this_red` 报出
+    它自己刚种下的那个名字。
     """
 
-    def test_running_a_subset_leaves_no_stray_tmp_dirs(self):
-        import tempfile as _tf
+    CHILD_TESTS = ("tests/test_devloop.py", "tests/test_phase4.py")
 
-        tmp = Path(_tf.gettempdir())
+    def _private_tmpdir(self) -> Path:
+        """给子进程一块私有临时地,并登记清理"""
+        d = Path(tempfile.mkdtemp(prefix="arlstray-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        return d
 
-        def snapshot():
-            """只收 `tmp*` 的目录 —— 判据必须比它守的事**窄**(r36)
+    @staticmethod
+    def _tmp_dirs(root: Path) -> set[str]:
+        try:
+            return {p.name for p in root.iterdir()
+                    if p.is_dir() and p.name.startswith("tmp")}
+        except OSError:
+            return set()
 
-            原来这里收的是**整个 `/tmp` 的目录名集合**,于是判据变成
-            「系统上任何目录都不许新增」。它守的是「conftest 的会话级
-            回收器没把 devloop 自己的临时目录漏掉」,信号范围却宽了十万倍。
+    @staticmethod
+    def _child_tempdir(env: dict) -> Path:
+        """问子进程它的 `tempfile` 实际指向哪 —— **不假设 TMPDIR 一定被认**
 
-            r36 实测后果:同时在别处 `mkdir /tmp/unrelated-probe-aaa`
-            (与本项目毫无关系),它立刻红:
+        这一步是 r87 返工才补上的。第一版直接把快照目标写死成那块私有地,
+        于是「快照看哪儿」和「TMPDIR 有没有生效」两件事被解耦了:把
+        `TMPDIR` 那行删掉,子进程照样跑,快照照样只看私有地,判据全绿 ——
+        修复等于没修,实测 rc=0 才发现。
 
-                跑完测试后 /tmp 里多出 1 个目录:['unrelated-probe-aaa']
+        快照对象必须由**子进程自己报**。它报私有地,量就只有私有地那么宽;
+        它报真实 `/tmp`(TMPDIR 没被认),量就宽到整台机器 —— 这时注入的
+        噪音立刻被抓出来。耦合 restored,修复才真的在守。
+        """
+        r = subprocess.run(
+            [sys.executable, "-B", "-c", "import tempfile;print(tempfile.gettempdir())"],
+            capture_output=True, text=True, timeout=60, env=env)
+        return Path(r.stdout.strip())
 
-            假绿不可怕,**假红才可怕** —— 它让 `test_baseline` 门禁随机
-            飘红,而门禁飘红会被当成真回归去查。
+    def _child_strays(self, env: dict, noise=None) -> list[str]:
+        """跑一遍子进程,返回它没收拾干净的 `tmp*` 目录
 
-            收窄到 `tmp*` 是有依据的:`tempfile.mkdtemp()` 造出来的目录
-            一律以 `tmp` 开头,而 conftest 的回收器只可能漏掉**这一类**。
-            与本项目无关的目录本来就不归它管,进来只会变成噪音。
-            """
-            try:
-                return {p.name for p in tmp.iterdir()
-                        if p.is_dir() and p.name.startswith("tmp")}
-            except OSError:
-                self.skipTest(f"读不了临时目录:{tmp}")
-
-        before = snapshot()
+        `noise` 在**快照窗口之内**被调用 —— 模拟别的进程这时在真实
+        `/tmp` 里造目录。它种在哪由 noise 自己决定,判据管不着。
+        """
+        where = self._child_tempdir(env)        # ← 快照对象由子进程自己说
+        before = self._tmp_dirs(where)
         proc = subprocess.run(
             [sys.executable, "-B", "-m", "pytest", "-q", "-p", "no:cacheprovider",
-             "tests/test_devloop.py", "tests/test_phase4.py"],
-            cwd=REPO, capture_output=True, text=True, timeout=900,
-            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+             *self.CHILD_TESTS],
+            cwd=REPO, capture_output=True, text=True, timeout=900, env=env,
         )
-        after = snapshot()
-        strays = sorted(after - before)
+        if noise is not None:
+            noise()
+        strays = sorted(self._tmp_dirs(where) - before)
+        self.assertEqual(
+            proc.returncode, 0,
+            f"子进程自己就红了,没资格谈它漏没漏:\n{proc.stdout[-800:]}")
+        return strays
+
+    def _child_env(self, private: Path) -> dict:
+        return {**os.environ, "PYTHONDONTWRITEBYTECODE": "1",
+                "TMPDIR": str(private)}
+
+    def test_the_child_really_honours_our_tmpdir(self):
+        """子进程必须真的把 tempfile 指到私有地 —— 钉住机制本身
+
+        没有这条,「隔离生效」只是从「快照没看到噪音」**推**出来的。
+        这里是直接问:它自己说它指向哪。
+        """
+        private = self._private_tmpdir()
+        where = self._child_tempdir(self._child_env(private))
+        self.assertEqual(
+            where, private.resolve(),
+            f"TMPDIR 没被认,子进程的 tempfile 指向 {where} —— "
+            f"判据量的还是整台机器的 /tmp,r87 那个假红原样还在。")
+
+    def test_the_snapshot_actually_sees_tmp_dirs(self):
+        """快照函数不许空转 —— 恒返回空集的话上面两条会一起绿
+
+        `_tmp_dirs` 一旦坏掉,`before` 和 `after` 都空,`strays` 恒空,
+        两条判据一起变成恒真。所以单测它本身:该看见的看得见,
+        不该看见的(不以 `tmp` 开头的)看不见。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "tmp_should_be_seen").mkdir()
+            (root / "unrelated_probe_aaa").mkdir()
+            (root / "tmpfile_not_a_dir").write_text("x")
+            got = self._tmp_dirs(root)
+            self.assertEqual(got, {"tmp_should_be_seen"},
+                             f"快照该收没收对,实得 {sorted(got)}")
+            self.assertNotIn("tmpfile_not_a_dir", got,
+                             "普通文件不是 mkdtemp 建的目录,不该算进去")
+            self.assertNotIn("unrelated_probe_aaa", got,
+                             "不以 tmp 开头的与本项目无关,不该算进去")
+
+    def test_running_a_subset_leaves_no_stray_tmp_dirs(self):
+        private = self._private_tmpdir()
+        strays = self._child_strays(self._child_env(private))
         self.assertEqual(
             strays, [],
-            f"跑完测试后 /tmp 里多出 {len(strays)} 个 tmp* 目录:{strays[:10]}\n"
-            f"conftest 的会话级兜底没兜住。\n"
-            f"pytest 输出尾部:\n{proc.stdout[-1200:]}"
-        )
+            f"子进程在自己的临时地里留下 {len(strays)} 个 tmp* 目录:{strays[:10]}\n"
+            f"conftest 的会话级兜底没兜住。")
+
+    def test_machine_wide_tmp_churn_cannot_make_this_red(self):
+        """主动往真实 `/tmp` 塞噪音,判据必须照样绿 —— r87 的核心修复
+
+        这是**唯一**能确定性守住这个修复的办法:假红在机器安静时不出现,
+        只靠 `test_running_a_subset_leaves_no_stray_tmp_dirs` 的话,
+        有人把 `TMPDIR` 那行删了也不会有任何一条变红。
+        """
+        planted: list[str] = []
+
+        def noise() -> None:
+            d = tempfile.mkdtemp()          # 真实 /tmp,不是私有地
+            self.addCleanup(shutil.rmtree, d, True)
+            planted.append(d)
+
+        private = self._private_tmpdir()
+        strays = self._child_strays(self._child_env(private), noise=noise)
+
+        self.assertEqual(len(planted), 1, "噪音没种进去,这条判据等于没注入")
+        # 注入必须真的落在**真实临时区**、且符合 mkdtemp 的命名 ——
+        # 否则这条判据测的是「机器今天安不安静」,不是「判据扛不扛得住噪音」。
+        # r87 栽在这上面一次:变异把 mkdtemp() 换成一个普通变量,可它调的还是
+        # mkdtemp(),照样在真实 /tmp 里造了 tmp* 目录,于是什么都没测出来。
+        # 探针得先证明自己 stimulus 落在该落的地方(r84 的规矩)。
+        planted_dir = Path(planted[0])
+        self.assertEqual(
+            planted_dir.parent, Path(tempfile.gettempdir()),
+            f"噪音种在了 {planted_dir.parent},不是真实临时区 "
+            f"{tempfile.gettempdir()} —— 这条判据退化成「机器今天安不安静」。")
+        self.assertTrue(
+            planted_dir.name.startswith("tmp"),
+            f"注入的目录叫 {planted_dir.name!r},不以 tmp 开头 —— "
+            f"判据本来就不收它,注入等于没发生。")
+        self.assertEqual(
+            strays, [],
+            f"别的进程在真实临时区里造了 {planted_dir.name},"
+            f"这条判据就红了 —— 它量的还是整台机器的 /tmp。\n"
+            f"(r87 实测:零测试运行的 60 秒里外部进程就造过一个 tmp* 目录)")
 
 
 class TestThisFileIsSelfConsistent(unittest.TestCase):
