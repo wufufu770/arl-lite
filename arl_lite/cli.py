@@ -1998,7 +1998,10 @@ def build_parser() -> argparse.ArgumentParser:
     pwas.add_argument("-w", "--workspace", help="工作空间名", default="default")
     pwas.set_defaults(func=cmd_watch_start)
     pwap = pwa_sub.add_parser("stop", help="停止 watch 调度器")
-    pwap.add_argument("-w", "--workspace", help="工作空间名", default="default")
+    # watch stop 是同步模式下的空操作(cmd_watch_stop 只打印「去 Ctrl+C」),
+    # 不碰任何工作区。按本仓既有约定(见 `workspace list -w`)如实标注为忽略,
+    # 别让 help 写着「工作空间名」暗示它真的选工作区。
+    pwap.add_argument("-w", "--workspace", help="(忽略)watch stop 不作用于任何工作区", default="default")
     pwap.set_defaults(func=cmd_watch_stop)
 
     # version
