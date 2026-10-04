@@ -30,6 +30,7 @@ import os
 import pathlib
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -52,6 +53,56 @@ def _home(tmp_path, name="h"):
     h = tmp_path / name
     h.mkdir(parents=True, exist_ok=True)
     return h
+
+
+def _run_foreground_until(argv, home, want, timeout=15):
+    """跑一个**按设计永不返回**的前台命令,等 `want` 出现就把它掐掉。
+
+    ## r89:这个辅助是为了换掉一种又慢又难读的控制流
+
+    原先那两条测试是这么写的:
+
+        try:
+            _run(["watch", "start", "-w", "teamA"], home, timeout=25)
+        except subprocess.TimeoutExpired:
+            pass  # 前台调度器,超时的正是我们要的
+
+    然后去断言工作区建成了没有。docstring 自己写着「验证方式刻意**不依赖
+    它跑完**」—— 结果机制恰好相反:白等满 25 秒,再把「超时」当成正常
+    路径接住。两条测试合计 **50.6 秒**,占全量的 10.6%(r89 用
+    `--durations` 实测:25.44s + 25.19s)。
+
+    真正要等的是那个目录出现,不是时间耗完。r89 实测它 **0.39 秒**就建好
+    了(terminate + wait 0.01 秒)。所以这里轮询到 `want` 出现就 terminate,
+    15 秒的 deadline 相对实测值还有 38 倍余量。
+
+    超时不是被「接住」的正常结局:真到了 deadline 还是没出现,循环退出、
+    进程被掐掉,紧接着的断言会照常失败并说明建出了什么。信号一点没弱化,
+    只是不再拿 25 秒换一句「超时正是我们要的」。
+    """
+    proc = subprocess.Popen(
+        [sys.executable, "-B", "-m", "arl_lite.cli", *argv],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=REPO,
+        env=dict(os.environ, HOME=str(home), PYTHONDONTWRITEBYTECODE="1"),
+    )
+    try:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if want.exists():
+                return                       # 出现了,不用再等
+            if proc.poll() is not None:
+                return                       # 它自己退了 —— 断言会去说为什么
+            time.sleep(0.02)
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:  # pragma: no cover - 兜底
+                proc.kill()
+                proc.wait(timeout=5)
+        proc.stdout.close()
+        proc.stderr.close()
 
 
 def _state(home, workspace) -> pathlib.Path:
@@ -142,13 +193,15 @@ def test_watch_start_writes_into_the_named_workspace(tmp_path):
     这是 r70 那个 bug 的核心。验证方式刻意**不依赖它跑完** ——
     `watch start` 是前台同步调度器,会一直跑(r70 调研时实测踩到,
     第一次验证超时了)。
+
+    r89:原先靠 `_run(timeout=25)` + `except TimeoutExpired: pass` 来实现
+    「不依赖它跑完」,代价是每次白等满 25 秒。改成
+    `_run_foreground_until` —— 轮询到工作区目录出现就掐掉进程。
     """
     home = _home(tmp_path)
     _run(["watch", "add", "a.example.com", "-m", "whois", "-w", "teamA"], home)
-    try:
-        _run(["watch", "start", "-w", "teamA"], home, timeout=25)
-    except subprocess.TimeoutExpired:
-        pass  # 前台调度器,超时的正是我们要的
+    _run_foreground_until(["watch", "start", "-w", "teamA"], home,
+                          home / ".arl-lite" / "workspaces" / "teamA")
     root = home / ".arl-lite" / "workspaces"
     made = sorted(d.name for d in root.iterdir()) if root.exists() else []
     assert "teamA" in made, f"watch start 没写进 teamA,建出的是:{made}"
@@ -159,10 +212,8 @@ def test_watch_start_without_w_still_uses_default(tmp_path):
     """不带 -w 时行为不变(向后兼容)。"""
     home = _home(tmp_path)
     _run(["watch", "add", "a.example.com", "-m", "whois"], home)
-    try:
-        _run(["watch", "start"], home, timeout=25)
-    except subprocess.TimeoutExpired:
-        pass
+    _run_foreground_until(["watch", "start"], home,
+                          home / ".arl-lite" / "workspaces" / "default")
     root = home / ".arl-lite" / "workspaces"
     made = sorted(d.name for d in root.iterdir()) if root.exists() else []
     assert made == ["default"], f"不带 -w 时应当落 default,实测 {made}"
