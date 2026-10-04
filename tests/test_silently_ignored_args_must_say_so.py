@@ -16,7 +16,21 @@
 
 推导出 0 条不等于这条判据没用 —— 它是让「新增一个被忽略的参数」变成
 一次有意的决定,而不是一次没人注意的漂移。所以条数钉死。
+
+## r86:补上反向那一半(上面「双向不变量」此前只实现了一半)
+
+本文件此前只推导了**一个方向**:「注册了却从不被读 → help 必须写忽略」。
+另一半没实现:「help 写了忽略 → 必须真的从未被读」。
+
+r86 实测这个缺口是真空的:把 `query -w` 的 help 从「工作空间名」改成
+「工作空间名(忽略)」——这个参数**真的**被 `cmd_query` 读——本文件 6 条
+判据**全绿**。
+
+这个方向的谎比原 bug 更危险。原 bug 是「参数被忽略、help 暗示生效」,
+用户多传一个参数,白传;这一半是「参数生效、help 说忽略」,用户**不传**
+,于是静默吃了默认值 —— 连「白传」这个提示都没有。
 """
+
 from __future__ import annotations
 
 import ast
@@ -135,6 +149,32 @@ def _help_text(path: str, dest: str) -> str:
     return target or ""
 
 
+# 本仓约定的「这个参数真的不生效」标记,r75 定的
+IGNORE_MARKER = "忽略"
+
+
+def _all_user_args() -> dict[tuple[str, str], str]:
+    """全部用户参数的 help 文案:`{(命令路径, dest): help}`。
+
+    r86 新增。正向那条判据只需要「被忽略的那几个」,所以历来只从 `derived`
+    出发;反向那条必须**从全部参数出发**扫「谁标了忽略」—— 漏扫的那些
+    正是谎标的那几个。
+    """
+    out: dict[tuple[str, str], str] = {}
+    for path, (_fn, dests) in _command_paths().items():
+        for d in sorted(dests - _INFRA_DESTS):
+            if d.endswith("_cmd") or d == "command":
+                continue  # argparse 用它分派,不是用户参数
+            out[(path, d)] = _help_text(path, d)
+    return out
+
+
+def _annotated_as_ignored() -> set[tuple[str, str]]:
+    """help 里标了「忽略」的全部参数。"""
+    return {k for k, help_text in _all_user_args().items()
+            if IGNORE_MARKER in help_text}
+
+
 @pytest.fixture(scope="module")
 def derived() -> set[tuple[str, str]]:
     found: set[tuple[str, str]] = set()
@@ -166,6 +206,38 @@ def test_every_silently_ignored_arg_says_so(derived):
     assert not lying, (
         "这些参数从未被命令读取,help 却不说明,用户会以为它生效了:\n  "
         + "\n  ".join(lying)
+    )
+
+
+def test_ignore_annotations_must_be_true(derived):
+    """反向不变量:标了「忽略」的参数,必须**真的**从未被读过。
+
+    正向那条只堵一半。这一半的谎更贵:参数生效,help 却说忽略,用户据此
+    判定「不用传」,于是静默吃了默认值,连「白传」那点提示都没有。
+
+    r86 实测:把 `query -w` 的 help 改成「工作空间名(忽略)」,本文件
+    此前 6 条判据全绿 —— 那个参数是真的被 `cmd_query` 读的。
+    """
+    lying = sorted(_annotated_as_ignored() - derived)
+    assert not lying, (
+        "这些参数 help 标了「忽略」,实际却被命令读取 —— 用户会以为不用传:\n  "
+        + "\n  ".join(f"{p} -{d}: {_all_user_args()[(p, d)]!r},但它真被读了" for p, d in lying)
+        + "\n二选一:要么命令真的别读它,要么把 help 改回描述它实际的作用。"
+    )
+
+
+def test_the_ignore_scan_actually_finds_annotations():
+    """反向判据不许空转 —— 扫不到「忽略」标注时,上面那条会恒真。
+
+    判据不能靠「现在恰好一条谎都没有」来证明自己在跑。r85 的教训照搬:
+    只验退出码,「永远返回 INFO」那种退化能蒙过去。这里钉的是**扫描器
+    看得见东西**这件事本身。
+    """
+    found = _annotated_as_ignored()
+    assert found >= PINNED_SILENTLY_IGNORED, (
+        f"反向扫描只找到 {sorted(found)},r75 钉死的 {sorted(PINNED_SILENTLY_IGNORED)} "
+        f"至少要能被扫到。扫不到说明 help 文案或 _help_text 变了 —— "
+        f"上面那条会变成恒真,不是实现变干净了。"
     )
 
 
