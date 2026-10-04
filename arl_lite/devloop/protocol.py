@@ -146,17 +146,39 @@ class Loop:
             f" / {stt.get('in_progress', 0)} in_progress"
             f" / {stt.get('done', 0)} done / {stt.get('dropped', 0)} dropped",
         ]
-        # 被别人认领的条目。多 agent 场景下"队列里没活可选"经常不是
+        # 被认领的条目。多 agent 场景下"队列里没活可选"经常不是
         # 队列空了,而是活被别人拿走了 —— 不显示出来会让人以为队列有毛病。
         claimed = q.claimed_by()
         if claimed:
-            lines.append(f"  claimed    : {len(claimed)} 条正在被别人做")
+            last_finished = s.history[-1].finished_at if s.history else 0.0
+            lines.append(f"  claimed    : {len(claimed)} 条 in_progress")
             for iid, owner in sorted(claimed.items()):
                 age = ""
                 by_id = next((i for i in items if i.id == iid), None)
                 if by_id and by_id.claimed_at:
                     age = f", 已领 {_age_str(_now() - by_id.claimed_at)}"
-                lines.append(f"                 {iid} ← {owner or '(无主)'}{age}")
+                # r82:「在途」和「上一轮忘了收尾的残留」必须能分开。
+                # 判据只用**可判定的事实** —— 认领时刻早于最后一轮的
+                # finished_at,也就是有一轮是在它还开着的时候结束的。
+                #
+                # 为什么不用 owner 的 pid 判:r82 实测,`devloop claim` 是
+                # 从一次性的短命进程发的,进程立刻退出,于是 owner 里的
+                # pid **永远**是死的 —— `is_stale_claim` 对每一条 CLI
+                # 认领都返回「该复位」。拿它当告警条件会 100% 常红,
+                # 那不是守卫,是个摆设。所以这里只报事实,判定交给
+                # 「owner 还在不在」这条旁证。
+                why = ""
+                if by_id and by_id.claimed_at and last_finished \
+                        and by_id.claimed_at < last_finished:
+                    alive = self.queue_mod.Queue.owner_alive(owner)
+                    if alive is False:
+                        why = ("  ← 上一轮结束时它还开着,且 owner 进程已退出:"
+                               "多半是认领完忘了 done-item")
+                    elif alive is True:
+                        why = "  ← 上一轮结束时它还开着(owner 仍在运行,确认下是不是忘了收尾)"
+                    else:
+                        why = "  ← 上一轮结束时它还开着(owner 探测不到,确认下是不是忘了收尾)"
+                lines.append(f"                 {iid} ← {owner or '(无主)'}{age}{why}")
         # 有人正在写队列时提示一下。"队列看着没变"和"另一个 agent 正在
         # 写、等一下就好了"必须能区分开,否则会把正常的并发写误判成故障。
         from . import lock as _lock
