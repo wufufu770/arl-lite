@@ -35,6 +35,7 @@ import asyncio
 import hashlib
 import importlib.util
 import inspect
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -92,6 +93,62 @@ def _real_state_untouched_by_tests():
 
 def _snapshot() -> set[str]:
     return {p.name for p in Path(tempfile.gettempdir()).iterdir()}
+
+
+# 会话开始时的真实 HOME。任何时候想给子进程一个「没被测试污染过」的
+# HOME,都用它 —— 不要用 `os.environ["HOME"]`,那正是本文件下面要还原的东西。
+REAL_HOME = os.environ.get("HOME")
+
+
+@pytest.fixture(scope="session")
+def real_home() -> str | None:
+    """会话开始时的真实 HOME —— 给需要「没被污染的 HOME」的子进程用
+
+    判据 `test_home_leaked_by_one_test_cannot_break_the_next` 要用:
+    它在临时目录里造一次真 pytest 运行,如果继承到被污染的 HOME,
+    失败原因会变成「pytest 找不到」而不是「HOME 泄漏」——那是在测另一件事。
+    """
+    return REAL_HOME
+
+
+@pytest.fixture(autouse=True)
+def _restore_home_between_tests():
+    """每个测试结束后把 `HOME` 还原 —— r95 实测吃过两次这个亏
+
+    `tests/test_phase4.py` 等 **6 处**直接 `os.environ["HOME"] = home`,
+    没用 `monkeypatch`,所以**不还原**。那个 `home` 来自
+    `tempfile.TemporaryDirectory()`,`with` 块一退出目录就被删 ——
+    于是 `os.environ["HOME"]` 指向一个**不存在的路径**,并一直带到后面的测试。
+
+    ## 同一个病,两次假红,都不是猜的
+
+    - **r68**:`test_baseline` 门禁报 `could not parse pytest summary` +
+      `/usr/bin/python3: No module named pytest`。当时归因成「HOME 被临时
+      设成 /tmp」,机制没查清;
+    - **r95**:这一轮新写的两条判据(都要起 pytest 子进程)
+      **单跑 6 passed、跑全量 3 failed**,报错一模一样。r95 是照着
+      `tests/test_tui_fallback_advice_runnable.py` 的 docstring 复现出来的:
+      它早就写明「实测单跑本文件全绿、跑全量全红」。
+
+    机制:pytest 装在 `~/.local` 里,HOME 一坏,子进程就找不到它。
+
+    ## 为什么治根,而不是照那份 docstring 在消费端打补丁
+
+    `test_tui_fallback_advice_runnable.py` 的做法是给子进程显式一个干净
+    HOME。那是**消费端**补丁:它只保护那一个判据。下一个起子进程的判据
+    照样中招 —— r95 的两条判据就是证据。
+
+    和本文件上面那个临时目录兜底是同一个道理:实测有 6 处
+    `os.environ["HOME"] = ...`,逐处改要动 6 个 `with` 块的缩进,漏一处
+    就继续漏,而 `os.environ["X"] = ...` 看上去比 `monkeypatch.setenv`
+    简单,下一个人还会再写。
+    """
+    saved = os.environ.get("HOME")
+    yield
+    if saved is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = saved
 
 
 # ── async 测试:纯 stdlib 接管 ──

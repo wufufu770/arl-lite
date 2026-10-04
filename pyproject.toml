@@ -38,9 +38,15 @@ dependencies = []
 # 它们是外部二进制,通过 shutil.which 探测 + subprocess 调用,缺失时
 # 对应模块返回 success=False 并提示安装命令,不阻塞其他模块。
 # 那是另一个类别的依赖,声明在这里会造成误导。
+# 零 pip 依赖铁律在这里的执行方式:dependencies 恒为空。
+#
+# dev 里只列**本机能装上、且代码真的用到**的东西。r95 从这里删掉了
+# `pytest-asyncio>=0.21` —— 本机装不上(PEP 668),而那 9 条 async 测试
+# 从 r92 起已经由 tests/conftest.py 里的纯 stdlib hook 接管,不再需要它。
+# 「只声明不实现,比不声明更糟」是本文件上面那段注释的原话,而这一条
+# 当时正好违反它。
 dev = [
     "pytest>=7",
-    "pytest-asyncio>=0.21",
 ]
 
 [project.scripts]
@@ -53,7 +59,31 @@ include = ["arl_lite*"]
 arl_lite = ["db/*.sql", "fingerprints/*.json"]
 
 [tool.pytest.ini_options]
-# async def test_xxx() 需要 auto 模式才会被 pytest-asyncio 接管。
-# 之前没配这一项,9 个 async 测试全部被 skip 成 "async def functions are not natively supported",
-# 覆盖率比看起来低很多。
-asyncio_mode = "auto"
+# 这里**曾经**配着 `asyncio_mode = "auto"`,r95 删掉了。
+#
+# 那一行是给 pytest-asyncio 用的,而 pytest-asyncio 在本机装不上(PEP 668)。
+# 于是它从来只是让 pytest 每跑一次就报一次:
+#     PytestConfigWarning: Unknown config option: asyncio_mode
+# 实测:一次全量变异扫描(54 个脚本 / 446 条变异)要起 446 次 pytest,
+# **每一次**都带这条。**一条每次都出现的告警等于没有告警** —— 人会脱敏,
+# 下一条真告警跟着被忽略。
+#
+# 而那 9 条 async 测试确实需要有人接管,只是那个人不是 pytest-asyncio:
+# r92 起是 `tests/conftest.py` 里那个纯 stdlib 的 `pytest_pyfunc_call`。
+# 所以删掉这一行不影响它们跑 —— 全量实测 1291 collected / 1257 passed /
+# 34 skipped / 0 failed,和删之前一致。
+#
+# 顺便记一笔:这一行上面的注释原本写的是「9 个 async 测试全部被 skip 成
+# async def functions are not natively supported」—— **两处都是错的**。
+# 9 条测试早就被接管了(不是 skip),而这一行本身本机就不被识别。
+# 一段把现状说反了的注释,比没有注释更容易误导下一个人。
+#
+# ## 如果将来真装了 pytest-asyncio
+#
+# 它的默认模式是 strict,只接管打了 `@pytest.mark.asyncio` 的测试,所以
+# conftest 那个 hook 照旧会跑那 9 条;而一旦你显式配了
+# `asyncio_mode = "auto"`,hook 会主动让位(见 conftest 的
+# `_pytest_asyncio_installed`)。
+#
+# **这一段没能在本机实测** —— 装不上,手上没有数据。这里写的是按文档推的,
+# 不替它下结论。真装了的话请回来把这段改成实测结果。

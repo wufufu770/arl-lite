@@ -68,12 +68,24 @@ _GROUP_IMPORT_ROOT = {
 
 # 靠**配置**激活、因此不会出现在 import 里的包。
 # 每一项都必须写明"它靠什么生效",否则这个白名单就成了绕过检查的后门。
-_DECLARATIVE = {
-    "pytest-asyncio": (
-        "pytest 插件,通过 pyproject 的 asyncio_mode=\"auto\" 激活。"
-        "它不在任何文件里 import —— 装了它,pytest 就接管 async 测试。"
-    ),
-}
+#
+# r95:这里是**空的**,而且这个"空"是被上一条判据逼出来的。
+#
+# 原来只有一条 `pytest-asyncio`,理由写的是「通过 pyproject 的
+# asyncio_mode="auto" 激活」。r95 删掉了那个声明(本机装不上 PEP 668,
+# 而那 9 条 async 测试从 r92 起已由 conftest 的纯 stdlib hook 接管)——
+# 于是这条豁免的理由两半都成了假话:配置没了,包也不声明了。
+# 留着它,`test_declarative_allowlist_stays_minimal_and_justified` 当场报红:
+#     pytest-asyncio 在 _DECLARATIVE 里但 pyproject 并没有声明它
+#
+# 那条判据的规则 2 早就写着「留着一条用不上的豁免,会让人以为它还生效着」。
+# 它精确预言了这一轮 —— 所以这不是判据太严,是**改一半**:
+# 删了声明却没删豁免。豁免比声明更危险:声明看不见,豁免看起来像"这里
+# 有人处理过了"。
+#
+# 结构留着(机制本身是对的:确实存在"靠配置激活所以不 import"的包),
+# 空的比留一条假的强。
+_DECLARATIVE: dict[str, str] = {}
 
 
 def _imports_in(dirname: str) -> set[str]:
