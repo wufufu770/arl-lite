@@ -306,7 +306,11 @@ def _cmd_gate(args) -> int:
     except KeyError as e:
         print(f"[!] {e}", file=sys.stderr)
         print(f"    available: {', '.join(gates.all_gate_names())}", file=sys.stderr)
-        return 2
+        # 约定:rc=1 = 业务层失败(门禁红、门禁不存在、条目不存在…),
+        # rc=2 留给 argparse 的用法错误(argparse 自己 exit 2,不由本文件决定)。
+        # 这里原来返 2,于是同一条命令「门禁红」返 1、「门禁不存在」返 2 ——
+        # 同一命令的两种失败给两种码,脚本没法用统一条件判失败。
+        return 1
     r = gate.run(_repo_root())
     mark = "OK" if r.passed else ("WARN" if not r.blocking else "FAIL")
     print(f"{mark:4} {r.name}: {r.detail}")
@@ -393,7 +397,10 @@ def _cmd_unmark(args) -> int:
     ok, detail = q.unmark(args.item_id, getattr(args, "reason", "") or "")
     if not ok:
         print(f"[!] {detail}", file=sys.stderr)
-        return 2
+        # 业务层失败一律 1(rc=2 留给 argparse 用法错误)。这里原来返 2,而
+        # `drop` 对**完全相同**的条件、完全相同的消息 `no such item: 'x'`
+        # 返 1 —— 消息都一样、码却不同,连按消息匹配都做不到。
+        return 1
     print(f"[+] {detail}"
           + (f"  (reason: {args.reason})" if getattr(args, "reason", "") else ""))
     return 0
