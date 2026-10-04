@@ -42,6 +42,16 @@ def _round_of(path: Path) -> int:
     return int(m.group(1)) if m else -1
 
 
+def _root_name(node: ast.AST) -> str | None:
+    """表达式最外层的那个变量名(`backup[t]` / `backup` / `x.y` 都算)
+
+    判断「写回去的东西是不是本函数变换出来的」,看的是变量本身。
+    """
+    while isinstance(node, (ast.Subscript, ast.Attribute)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else None
+
+
 def _writers_and_guards(path: Path):
     """分类「变换后写回」的函数,沿模块内调用图传递。
 
@@ -95,6 +105,47 @@ def _writers_and_guards(path: Path):
                 return True
         return False
 
+    def only_restores_original_bytes(node: ast.AST) -> bool:
+        """这个函数里的写**全是还原写**吗?
+
+        还原写 = `write_bytes(备份变量)`,而那个变量不是本函数里变换出来的。
+        它写的是改动前读出来的原始字节,**不可能**引入语法错误。
+
+        ## r83:上面那段 docstring 声称有这条豁免,代码里却从来没实现
+
+        `_sweep` 之所以一直没被误报,只是因为它当时恰好没调
+        `replace`/`split`/`join`。r83 给它加了一行 `"\n".join(...)` 去读
+        被改动文件的内容(校验变异声明要用),`transforms()` 立刻成立,
+        豁免的缺口就顶出来了 —— 判据开始靠**运气**而不是靠规则。
+
+        跟 r80 那条是同一个病:注释/文档描述了代码没有的行为,
+        于是「有这条规则」和「这条规则真的在跑」被当成了一回事。
+        """
+        writes = [sub for sub in ast.walk(node)
+                  if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute)
+                  and sub.func.attr in ("write_text", "write_bytes")]
+        if not writes:
+            return False
+        derived = set()
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Assign) and transforms(sub.value):
+                for t in sub.targets:
+                    if isinstance(t, ast.Name):
+                        derived.add(t.id)
+        for w in writes:
+            if w.func.attr != "write_bytes" or not w.args:
+                return False
+            root = _root_name(w.args[0])
+            # 写的是本函数里变换出来的内容 → 危险写,不能豁免
+            if root in derived:
+                return False
+            # 认不出来是什么(比如 `data.encode()`、拼接表达式)→ 也不能豁免。
+            # 豁免要 fail-closed:只有「明摆着是读原始字节存下来的那个变量」
+            # 才放行,其余一律当危险写。写松了危险写就从后门进来了。
+            if root is None:
+                return False
+        return True
+
     def callees(name: str, seen: set[str]) -> set[str]:
         out: set[str] = set()
         for n in ast.walk(funcs[name]):
@@ -119,6 +170,8 @@ def _writers_and_guards(path: Path):
     for name, node in funcs.items():
         if not transforms(node):
             continue
+        if only_restores_original_bytes(node):
+            continue
         if not writes_text(node):
             # 变换但不自己写 → 只要委托链上有守卫就算受保护
             if has_guard(name):
@@ -132,6 +185,93 @@ def test_there_are_mutcheck_scripts_to_check():
     """前提本身也要验 —— 别让「一个脚本都没有」变成恒真。"""
     assert len(SCRIPTS) >= 30, f"只找到 {len(SCRIPTS)} 个 mutcheck 脚本,数量不对"
     assert all(_round_of(p) > 0 for p in SCRIPTS), "有脚本名不符合 mutcheck_rNN.py 约定"
+
+
+# ---- r83:还原写豁免的正/负控制组 ----
+#
+# 豁免是「放宽」,放宽最容易被写成新的假绿。所以两条方向都得钉:
+# 真的还原写要放行,伪装成还原写的危险写必须**仍然**被逮住。
+
+_SNIPPETS = {
+    "真的还原写(放行)": '''
+def sweep(targets):
+    out = "\\n".join(t.read_text() for t in targets)
+    for t in targets:
+        try:
+            mutate(t)
+        finally:
+            t.write_bytes(backup[t])
+''',
+    "伪装成还原写的危险写(必须逮住)": '''
+def sweep(targets):
+    for t in targets:
+        data = t.read_text()
+        data2 = data.replace("a", "b")
+        t.write_bytes(data2.encode())
+''',
+    "变换后 write_text(必须逮住)": '''
+def sweep(path):
+    src = path.read_text()
+    path.write_text(src.replace("a", "b"))
+''',
+    "还原原始字节但同时还有一处危险写(必须逮住)": '''
+def sweep(targets):
+    for t in targets:
+        data = t.read_text().replace("a", "b")
+        t.write_bytes(data.encode())
+    for t in targets:
+        t.write_bytes(backup[t])
+''',
+}
+
+
+def _classify_snippet(src: str):
+    """把一段源码当成 mutcheck 脚本跑一遍分类器"""
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / "mutcheck_r99.py"
+        p.write_text(src, encoding="utf-8")
+        return _writers_and_guards(p)
+
+
+@pytest.mark.parametrize("name", sorted(_SNIPPETS))
+def test_restore_write_exemption_only_exempts_restores(name):
+    """还原写豁免:只放行**真**的还原写,其余照旧逮住"""
+    protected, dangerous = _classify_snippet(_SNIPPETS[name])
+    if name == "真的还原写(放行)":
+        assert not dangerous, (
+            f"真的还原写被误判成危险写:{sorted(dangerous)}"
+            " —— r78 的 docstring 声称有这条豁免,别让判据靠运气躲过去")
+    else:
+        assert dangerous, (
+            f"{name} 应当被判成危险写,却放过了 —— "
+            "豁免写宽了,危险写就从后门进来了")
+
+
+def test_every_modern_sweep_is_exempt_by_restore_not_by_luck():
+    """现代脚本的 `_sweep` 必须是**因为还原写**才过关,不是因为恰好没调 join
+
+    r83 就是被这个顶出来的:给 `_sweep` 加了一行 `"\n".join(...)`,
+    判据立刻报红,而它一直声称有豁免却从来没实现过。
+    """
+    offenders = []
+    for p in SCRIPTS:
+        if _round_of(p) < GUARD_FROM_ROUND:
+            continue
+        src = p.read_text(encoding="utf-8")
+        if "def _sweep" not in src:
+            continue
+        tree = ast.parse(src)
+        fn = next((n for n in tree.body
+                   if isinstance(n, ast.FunctionDef) and n.name == "_sweep"), None)
+        if fn is None:
+            continue
+        seg = ast.get_source_segment(src, fn) or ""
+        if "write_bytes" in seg and "read_bytes" not in seg:
+            offenders.append(p.name)
+    assert not offenders, (
+        f"这些 `_sweep` 写回去的不是改动前读出的原始字节:{offenders}\n"
+        "还原写豁免只对 `write_bytes(备份)` 成立")
 
 
 @pytest.mark.parametrize("path", SCRIPTS, ids=[p.stem for p in SCRIPTS])
