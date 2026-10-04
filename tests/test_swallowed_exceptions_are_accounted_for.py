@@ -9,7 +9,11 @@ docstring 自己写着「验证方式刻意**不依赖它跑完**」—— 意�
 
 r90 的问题本来是「这个形状是不是不止那两处」。实测结论:**不是**。
 
-## 实测:16 处站点 / 15 组,0 处是 r89 那种缺陷
+## 实测:17 处站点 / 16 组,0 处是 r89 那种缺陷
+
+(r92 把这个数从 16 推到 17:conftest 里新增了一处 `except (ImportError,
+ValueError): return False` —— 查 pytest-asyncio 装没装时的兜底。判据当场
+要求登记,登记理由已写在该条目上。)
 
 扫法是 AST(不是文本子串,r80 的规矩):`ExceptHandler` 的 body **只有一条**
 语句,且那条是 `pass` / `continue` / `return`。
@@ -118,6 +122,10 @@ def too_thin_reasons(reasons: dict) -> list:
 # 「为什么」,等于没登记。
 
 ACCOUNTED: dict[Site, str] = {
+    ("conftest.py", "_pytest_asyncio_installed", "(ImportError, ValueError)", "return", 1):
+        "r92 加的:查 pytest-asyncio 装没装。装了但 import 本身坏掉时,"
+        "当成没装、让 pytest 自己报「async 不受支持」—— 那样比崩在"
+        "conftest 里强,崩了整套判据会集体消失。登记在此以示有意",
     ("test_cli_advice_commandable.py", "_leftovers", "SystemExit", "return", 1):
         "argparse 遇到不认识的参数会 sys.exit;这里返回 None 表示「没有多余参数」,"
         "正是这条测试要判定的东西",
@@ -288,14 +296,18 @@ def test_a_thin_reason_is_rejected():
 def test_the_detector_finds_every_real_site():
     """检测器不许空转 —— 拿**现场**文件当正控制组,一处都不能漏"""
     found = swallowed_sites()
-    assert len(found) == 16, f"现场站点数不对:{len(found)}(逐条对一遍登记项)"
+    assert len(found) == 17, f"现场站点数不对:{len(found)}(逐条对一遍登记项)"
     by_file: dict[str, int] = {}
     for f, *_rest in found:
         by_file[f] = by_file.get(f, 0) + 1
     assert by_file.get("test_phase5.py") == 2, (
         f"test_phase5.py 有两处同形状,实得 {by_file.get('test_phase5.py')}"
         " —— 塌成一处就意味着「少登记一处」看不出来,正是判据不许恒真要防的")
-    assert all(f.startswith("test_") for f, *_rest in found), "扫到了非测试文件"
+    assert all(f.startswith("test_") or f == "conftest.py"
+               for f, *_rest in found), (
+        "扫到了既不是 test_* 也不是 conftest.py 的文件 —— 范围不对。"
+        "conftest.py 是 r92 起才进来的:它落在 tests/ 下、也被 pytest 加载,"
+        "里面写的 hook 同样会被静默接住异常,理应一起登记")
 
 
 def test_same_shape_sites_in_one_function_stay_separate():

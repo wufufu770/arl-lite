@@ -31,7 +31,10 @@ r23 实测发现:跑一次 `tests/test_devloop.py` + `tests/test_phase4.py`
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import importlib.util
+import inspect
 import shutil
 import tempfile
 from pathlib import Path
@@ -89,6 +92,54 @@ def _real_state_untouched_by_tests():
 
 def _snapshot() -> set[str]:
     return {p.name for p in Path(tempfile.gettempdir()).iterdir()}
+
+
+# ── async 测试:纯 stdlib 接管 ──
+#
+# ## 这 9 条红了几十轮,不是它们坏了
+#
+# `pyproject.toml` 里写着 `asyncio_mode = "auto"`,那是**给 pytest-asyncio
+# 用的配置项**。但 pytest-asyncio 在本机装不上(PEP 668 外部管理环境),
+# 于是 phase1/2/3 里那 9 条 `async def test_*` 一直以
+# 「async def functions are not natively supported」红着,被当成
+# 「已知基线」记了下来。
+#
+# r92 实测:一个 hook 接管之后,那三个文件 **21 passed / 0 failed**。
+# 它们从来没坏过 —— 只是一直没人跑它们。
+#
+# ## 为什么自己写而不是装插件
+#
+# 本仓的铁律是零第三方 pip 依赖(`no_thirdparty_import` 门禁守着),
+# 而 PEP 668 环境下也装不上。这个 hook 用的全是 stdlib:
+# `inspect.iscoroutinefunction` + `asyncio.run`。
+#
+# ## pytest-asyncio 装上了就让位
+#
+# 别跟它抢:它有更完整的语义(loop scope、fixture 生命周期那些)。
+# 判据是「装没装」,不是「我能不能跑」。
+
+def _pytest_asyncio_installed() -> bool:
+    try:
+        return importlib.util.find_spec("pytest_asyncio") is not None
+    except (ImportError, ValueError):  # pragma: no cover - 装坏了就当没装
+        return False
+
+
+def pytest_pyfunc_call(pyfuncitem):
+    """接管 `async def` 的测试函数。
+
+    非协程一律 `return None`,把控制权交回 pytest —— 这条是本 hook 的
+    安全性来源:它只在**真的是协程**的时候才插手。
+    """
+    if _pytest_asyncio_installed():
+        return None
+    func = pyfuncitem.obj
+    if not inspect.iscoroutinefunction(func):
+        return None
+    kwargs = {n: pyfuncitem.funcargs[n]
+              for n in pyfuncitem._fixtureinfo.argnames}
+    asyncio.run(func(**kwargs))
+    return True
 
 
 def _reap_created(created: list, base: Path | None = None) -> list:

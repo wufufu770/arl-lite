@@ -98,8 +98,8 @@ PINNED_HEAD_COVERED = (
 REASON_MIN = "    return [f\"{k}: {v!r}\" for k, v in reasons.items() if len(v.strip()) < 10]\n"
 REASON_MIN_LOOSE = "    return [f\"{k}: {v!r}\" for k, v in reasons.items() if len(v.strip()) < 1]\n"
 
-SITE_COUNT = '    assert len(found) == 16, f"现场站点数不对:{len(found)}(逐条对一遍登记项)"\n'
-SITE_COUNT_WRONG = '    assert len(found) == 15, f"现场站点数不对:{len(found)}(逐条对一遍登记项)"\n'
+SITE_COUNT = '    assert len(found) == 17, f"现场站点数不对:{len(found)}(逐条对一遍登记项)"\n'
+SITE_COUNT_WRONG = '    assert len(found) == 16, f"现场站点数不对:{len(found)}(逐条对一遍登记项)"\n'
 
 # 登记表里删掉 / 加一条
 ONE_ENTRY = (
@@ -138,9 +138,9 @@ CLAIMS = {
         ["len(v.strip()) < 1]"],
         ["len(v.strip()) < 10]"],
     ),
-    "M7-检测器数错写死成15": (
-        ["assert len(found) == 15,"],
+    "M7-检测器数错写死成16": (
         ["assert len(found) == 16,"],
+        ["assert len(found) == 17,"],
     ),
     "C1-新增站点那一侧改成忽略": (
         ["found = set(ACCOUNTED)  # 变异:只比登记侧,现场多出来的看不见"],
@@ -165,7 +165,7 @@ MUTANTS = [
      lambda p: _apply(p, ONE_ENTRY, ONE_ENTRY + PHANTOM_ENTRY), False, (CRIT,)),
     ("M6-理由下限从10字符放宽到1",
      lambda p: _apply(p, REASON_MIN, REASON_MIN_LOOSE), False, (CRIT,)),
-    ("M7-检测器数错写死成15",
+    ("M7-检测器数错写死成16",
      lambda p: _apply(p, SITE_COUNT, SITE_COUNT_WRONG), False, (CRIT,)),
 ]
 
