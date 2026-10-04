@@ -171,13 +171,25 @@
       "gate": "loc_budget",
       "reason": "第 57 轮修 export 静默丢数据(P0):arl_lite export 硬编码 limit=10000,12000 行只导出 10000 行、2000 行静默消失、命令还打印「exported to ...」退出 0。实测在 12000 行库上的 HTML 报告也一样只统计 10000 行。本轮给 Storage 加 fetch_all(返回 rows+total 两个数)、给 cmd_export 和 HTML 报告加逐张表报少行数 + 退出码非 0,净增 101 行(实打实的逻辑约 27 行,其余约 74 行是把这三处「为什么」写下来的注释与 docstring —— 每一处都在解释某个看起来可以省的写法为什么不能省:为什么不因为截断就拒绝导出、为什么退出码必须非 0、为什么警告要指名表名并说清少了多少行、为什么 total 必须和 rows 绑在同一个返回值里)。这个洞的性质是数据静默丢失且工具报成功,优先级 P0,不是可选的体验改进。",
       "round": 64
+    },
+    {
+      "at": "2026-10-04T12:13:26",
+      "changes": {
+        "total_loc": {
+          "from": 15958,
+          "to": 16269
+        }
+      },
+      "gate": "loc_budget",
+      "reason": "r71 给 MCP 错误面补 _error_text/_NOT_INITIALIZED 单一来源(+17 行),r70 已用满 294/300 容差。行数涨的是错误诊断文案和防回归注释,不是注水代码;砍注释凑行数是拿指标换知识。显式提额,进 code review 可审。",
+      "round": 67
     }
   ],
   "doc_freshness": 0,
   "loc_budget": {
     "devloop_code_loc": 2900,
     "devloop_loc": 2617,
-    "total_loc": 15958
+    "total_loc": 16269
   },
   "no_import_cycle": 0,
   "no_thirdparty_import": 0,

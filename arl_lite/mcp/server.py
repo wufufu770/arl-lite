@@ -26,6 +26,23 @@ def _reject_constant(name: str):
     raise ValueError(f"non-JSON constant: {name}")
 
 
+# 未 initialize 时的唯一错误文案来源。给 AI 客户端看,必须自带出路:
+# 只说「没初始化」而不说下一步做什么,调用方无从纠正。
+_NOT_INITIALIZED = "not initialized: send an 'initialize' request first"
+
+
+def _error_text(e: BaseException) -> str:
+    """把异常变成一句能照着改的文本 —— 异常类名 + 真实消息。
+
+    只回 `type(e).__name__` 等于把 handlers 里写好的诊断信息全丢掉:
+    「missing required argument: table」和「limit must be 1..1000」
+    会塌缩成同一句 `ValueError`,调用方无从分辨自己错在哪。
+    """
+    detail = str(e).strip()
+    head = f"tool error: {type(e).__name__}"
+    return f"{head}: {detail}" if detail else head
+
+
 class MCPServer:
     """极简 MCP server — stdio JSON-RPC 2.0
 
@@ -190,7 +207,7 @@ class MCPServer:
         if not self._initialized:
             return {
                 "jsonrpc": "2.0", "id": req_id,
-                "error": {"code": -32000, "message": "not initialized"},
+                "error": {"code": -32000, "message": _NOT_INITIALIZED},
             }
         return {
             "jsonrpc": "2.0", "id": req_id,
@@ -201,7 +218,7 @@ class MCPServer:
         if not self._initialized:
             return {
                 "jsonrpc": "2.0", "id": req_id,
-                "error": {"code": -32000, "message": "not initialized"},
+                "error": {"code": -32000, "message": _NOT_INITIALIZED},
             }
         name = params.get("name", "")
         args = params.get("arguments", {})
@@ -229,7 +246,7 @@ class MCPServer:
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "result": {
-                    "content": [{"type": "text", "text": f"tool error: {type(e).__name__}"}],
+                    "content": [{"type": "text", "text": _error_text(e)}],
                     "isError": True,
                 },
             }
@@ -352,7 +369,7 @@ class MCPServer:
                     log.exception("MCP handle_request crashed")
                     response = {
                         "jsonrpc": "2.0", "id": req.get("id") if isinstance(req, dict) else None,
-                        "error": {"code": -32603, "message": f"internal error: {type(e).__name__}"},
+                        "error": {"code": -32603, "message": f"internal error: {_error_text(e)}"},
                     }
                 if response is not None:
                     try:
