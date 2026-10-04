@@ -1682,7 +1682,20 @@ def build_parser() -> argparse.ArgumentParser:
         prog="arl-lite",
         description="灯塔 ARL 降级增强版:2G 内存友好的资产侦察工具",
     )
-    p.add_argument("--log-level", default="INFO", help="日志级别(默认: INFO)")
+    # r85:`--log-level` 原来没有 choices,靠 `getattr(logging, 值.upper(),
+    # logging.INFO)` 兜底。实测 `--log-level bogus` 的输出与 `--log-level INFO`
+    # **逐字相同**、rc=0、一个字都没提示 —— 用户打错字想开 DEBUG 排查问题,
+    # 却静默拿到 INFO。静默降级比降级本身更坏。
+    #
+    # `type=str.upper` 必须排在 `choices` 前面生效:argparse 先跑 type 再查
+    # choices,所以 `--log-level debug` 会被规范化成 "DEBUG" 之后才校验,
+    # 小写仍然合法(r85 实测过,别把它弄坏了)。而 `--log-level bogus`
+    # 变成标准的用法错误:rc=2,并列出全部合法值。
+    p.add_argument(
+        "--log-level", default="INFO", type=str.upper,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="日志级别,大小写均可(默认: INFO)",
+    )
     # 注:--workspace 不放全局,放每个子命令里,避免 argparse 冲突
     # 习惯上:`arl-lite run -t xxx -w foo` 这种写法要支持
 
@@ -2021,8 +2034,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     # 日志级别
+    # r85:原来这里是 `getattr(logging, args.log_level.upper(), logging.INFO)`。
+    # 有了 choices 之后 argparse 已经保证这个值是合法级别名,兜底只剩坏处 ——
+    # 它掩盖「值没对上」这件事,而那正是这条判据要消灭的静默降级。
     logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        level=args.log_level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
