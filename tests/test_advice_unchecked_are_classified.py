@@ -74,7 +74,9 @@ DEAD_UNCHECKED_CLASSES = ("散文收尾", "没给")
 # (`watch add <目标域名>` / `watch list -w <真实工作区>`),
 # 一条死路换成两条能跑的 —— 所以是「干净 -1、重验过 +2」,
 # 「死路」那一栏**仍然是 0**。
-PINNED_BUCKETS = {"干净": 100, "死路": 0, "重验过": 10, "查不动": 2}
+# 干净 100 -> 101:r72 给 MCP 补了出路文案 `arl-lite mcp -w <name>`
+# (arl_lite/mcp/server.py:48)。占位符替换成真实值后实测 rc=0,属正向新增。
+PINNED_BUCKETS = {"干净": 101, "死路": 0, "重验过": 10, "查不动": 2}
 PINNED_UNVERIFIED = {"重建后干净": 10}
 PINNED_UNCHECKED = {"占位符": 2}
 

@@ -43,6 +43,32 @@ def _error_text(e: BaseException) -> str:
     return f"{head}: {detail}" if detail else head
 
 
+# workspace 传不进来的出路。工具只能读启动时的 `arl-lite mcp -w`,
+# 说清楚这一点,比让调用方反复重试同一个参数有用。
+_WS_HINT = "workspace is fixed at server start; pass it via `arl-lite mcp -w <name>`"
+
+
+def _declared_args(tool: dict) -> list[str]:
+    """工具 schema 里声明过的参数名(唯一来源)。"""
+    schema = tool.get("inputSchema") or {}
+    return sorted((schema.get("properties") or {}))
+
+
+def _unknown_args(tool: dict, args: dict) -> list[str]:
+    """args 里 schema 没声明过的 key。"""
+    allowed = set(_declared_args(tool))
+    return sorted(k for k in args if k not in allowed)
+
+
+def _unknown_args_text(name: str, tool: dict, bad: list[str]) -> str:
+    allowed = _declared_args(tool)
+    text = (f"unknown argument(s) for {name}: {', '.join(bad)}; "
+            f"{name} accepts: {', '.join(allowed) if allowed else '(none)'}")
+    if "workspace" in bad:
+        text += f". {_WS_HINT}"
+    return text
+
+
 class MCPServer:
     """极简 MCP server — stdio JSON-RPC 2.0
 
@@ -231,6 +257,21 @@ class MCPServer:
             return {
                 "jsonrpc": "2.0", "id": req_id,
                 "error": {"code": -32602, "message": f"unknown tool: {name!s}"},
+            }
+
+        # schema 未声明的 key 一律报错。静默忽略比报错危险得多:
+        # 调用方传 `workspace: teamA` 拿到的是启动时 -w 那个工作区的数据,
+        # isError 还是 False —— AI 客户端会拿它当 teamA 的资产清单去汇报。
+        # 合法 key 从工具自己的 inputSchema 推导(唯一来源),不另抄一份名单,
+        # 于是 `workspace` / `tabel` / `keywordk` 这类问题一次全挡住。
+        bad = _unknown_args(self.tools[name], args)
+        if bad:
+            return {
+                "jsonrpc": "2.0", "id": req_id,
+                "result": {
+                    "content": [{"type": "text", "text": _unknown_args_text(name, self.tools[name], bad)}],
+                    "isError": True,
+                },
             }
 
         try:
