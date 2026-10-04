@@ -138,6 +138,40 @@ _DEFAULT_LOC_TOLERANCE = 300  # 单轮允许的代码增长(行)
 _DEVELOOP_CODE_LOC_LIMIT = 2400
 
 
+def _timeout_detail(prev_seconds: Any) -> str:
+    """`test_baseline` 超时时该说的话。
+
+    ## r91:600s 是**挂死检测器**,不是性能预算
+
+    `gates.py` 里那行 `timeout=600` 的注释写得很清楚:「兜底,防止 pytest
+    卡死」。它要回答的是「**卡住了吗**」,不是「跑得够快吗」。
+
+    但它原来的报错只有一句 `pytest timed out after 600s`。于是真挂死和
+    「这台机器今天慢」在读起来**完全一样**。
+
+    r88 实测吃过这个亏:全量实测 476.37s / 531.52s / 564.61s 三次都对得上
+    600s,首跑超时、单独重跑就过了。诊断它花了整整一轮,而且第一反应是
+    「是不是我这一轮改慢了」—— 那个 6%~11% 的余量当时根本没被记录,
+    **想查也没得查**。
+
+    所以这里把上一次成功用时写进基线,超时时带出来:
+      - 上次 473s,这次 600s 还没完 → 差得不多,先看是不是有别的进程抢 CPU
+      - 上次 80s,这次 600s 还没完 → 差得远,这更像真卡住了
+      - 基线里压根没有用时 → 明说「分不清」,而不是假装知道
+
+    没有把 600s 调大。提额要走 `devloop accept`,那不是改一句报错文案
+    能顺带决定的事。
+    """
+    if not isinstance(prev_seconds, (int, float)) or prev_seconds <= 0:
+        return ("pytest timed out after 600s(基线里没有上一次用时,"
+                "所以分不清是真卡死还是机器变慢)")
+    gap = 600 - prev_seconds
+    verdict = ("只差 %.0fs,多半是机器变慢而不是卡死 —— 先看有没有别的进程在抢 CPU"
+               % gap) if gap < 180 else (
+        "比上次多出 %.0fs 以上,更像真的卡住了,去看最后卡在哪条测试上" % gap)
+    return f"pytest timed out after 600s;上次成功用时 {prev_seconds:.0f}s,{verdict}"
+
+
 def baseline_path(repo: Path) -> Path:
     """baselines.json 的固定位置
 
@@ -464,12 +498,14 @@ class TestBaselineGate:
         base = load_baseline(repo).get(self.name, {})
         prev_failed = base.get("failed", 0)
         known = set(base.get("allowed_failures") or ())
+        prev_seconds = base.get("seconds")
 
         # -rf 把失败身份打进 summary;--tb=no 是门禁不需要 traceback,省时间
         cmd = [sys.executable, "-m", "pytest", "tests/", "-q", "--tb=no", "-rf"]
         if _has_pytest_timeout():
             cmd.append("--timeout=300")
 
+        started = time.monotonic()
         try:
             proc = subprocess.run(
                 cmd,
@@ -482,7 +518,7 @@ class TestBaselineGate:
             return GateResult(
                 name=self.name,
                 passed=False,
-                detail="pytest timed out after 600s",
+                detail=_timeout_detail(prev_seconds),
                 measured=-1,
                 baseline=prev_failed,
                 blocking=self.blocking,
@@ -514,7 +550,10 @@ class TestBaselineGate:
         failed = int(m.group("failed"))
         passed = int(m.group("passed") or 0)
         failed_ids = set(_FAILED_ID_RE.findall(output))
-        measured: dict = {"failed": failed, "passed": passed}
+        # 用时一并记进 measured:超时时它是**唯一**能让人分清「挂死」和
+        # 「变慢」的东西(r91 的由来,见 _timeout_detail)。
+        measured: dict = {"failed": failed, "passed": passed,
+                          "seconds": round(time.monotonic() - started, 1)}
 
         if not failed_ids:
             # 没拿到身份(例如 -rf 输出没解析出来):退回按总数判。
