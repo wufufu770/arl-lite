@@ -36,6 +36,11 @@ from .core.monitor import CHANGE_TYPES, Monitor as _Monitor
 
 _ASSET_TYPES = tuple(_Monitor._ASSET_TABLES)
 _ASSET_TYPES_TO_TABLE = dict(_Monitor._ASSET_TABLES)
+
+# 绝不可能出现在域名 / IP / URL 里的字符,`run` 的 target 边界检查用。
+# URL 里要出现这些字符也只会是 %20 / %22 / %3C 这种百分号编码形态,
+# 所以按字面出现就一定是手误。刻意保持最小集:拿不准的字符不往里加。
+_NEVER_IN_TARGET = frozenset(" \t\r\n<>\"'`")
 from .modules.registry import discover_modules
 
 log = logging.getLogger("arl_lite.cli")
@@ -276,6 +281,21 @@ def cmd_run(args) -> int:
         return 2
     if "\x00" in args.target:
         print("[!] target contains null byte", file=sys.stderr)
+        return 2
+    # 上面三条拦的是「一定错」,这条拦的是「一定不是域名/IP/URL」。
+    # 边界严格取可证明的最小集:这些字符**不可能**出现在主机名、IP 或 URL 里
+    # (URL 里要出现也只会是 %20/%22 这种百分号编码形态)。
+    # 刻意不拦「形状可疑但可能合法」的单标签(localhost/intranet-host 是内网
+    # 侦察的正当目标)和裸数字 —— 拿不准就不拦,免得误伤合法用法。
+    bad = sorted({c for c in args.target if c in _NEVER_IN_TARGET})
+    if bad:
+        shown = " ".join(repr(c) for c in bad)
+        print(f"[!] target contains character(s) that cannot appear in a domain, "
+              f"IP or URL: {shown}", file=sys.stderr)
+        # 举例只用形态,不给完整命令行:`run` 必然出网,把它写成建议会被
+        # 建议判据抓去验 rc=0,而网络不通时 rc=1(r68 的教训)。
+        print("    a target looks like `example.com`, `192.0.2.1`, "
+              "or `https://example.com/path`", file=sys.stderr)
         return 2
 
     storage = Storage(workspace=args.workspace)
