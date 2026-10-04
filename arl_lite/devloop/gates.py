@@ -468,10 +468,50 @@ class NoThirdPartyImportGate:
 # - 第一次跑会主动把当前 failed 数落进 baseline,让后续轮次有参考点
 
 
-_PYTEST_SUMMARY_RE = re.compile(
-    r"(?P<failed>\d+)\s+failed"  # "N failed"
-    r"(?:[^,\n]*?,\s*(?P<passed>\d+)\s+passed)?"  # 可选 ", M passed"
+# r93:实测 pytest 终局 summary 行的五种形态(pytest 8.x,2026-10-05):
+#
+#   有失败    "2 failed, 3 passed, 1 skipped in 0.03s"
+#   全绿      "1234 passed, 33 skipped, 9597 warnings, 77 subtests passed in 393.27s (0:06:33)"
+#   收集中断  "1 error in 0.16s"
+#   空目录    "no tests ran in 0.00s"
+#   全 skip   "2 passed, 1 skipped in 0.02s"
+#
+# 原来的正则要求出现 "N failed"。但 failed 是**可选**字段——全绿时 pytest
+# 根本不打印它。r92 修好 9 条基线失败、套件真的变成全绿之后,这个门禁反而
+# 判红:它惩罚的恰好是这套协议要的那个结果。detail 还写
+# "could not parse pytest summary",读起来像 pytest 崩了或环境坏了,而不是
+# 「你干成了」——一个在成功时刻说灾难话的防线,比没有防线更容易被忽略。
+#
+# 但**不能只把 failed 改成可选**。同一批实测里,收集中断("1 error in 0.16s")
+# 和空跑("no tests ran in 0.00s")同样没有 failed,一并放过去就是**假绿**:
+# 套件一条没跑而门禁报通过,那比假红坏得多。所以「没有 failed」必须分三路——
+# 全绿放行、收集中断与空跑一律报红并点名是哪一种、真解析不出来才报红。
+_PYTEST_SUMMARY_RE = re.compile(r"^.*\bin [\d.]+s\b.*$", re.M)
+_OUTCOME_COUNT_RE = re.compile(
+    r"(?P<n>\d+)\s+(?P<what>passed|failed|errors?|skipped|warnings|subtests)"
 )
+
+
+def _pytest_outcome(output: str) -> dict | None:
+    """从 pytest 输出里取终局判定要用的数;取不到返回 None。
+
+    取**最后**一行匹配 `in Ns` 的,不是第一行:测试自己打印的
+    "generated in 1.0s"、warnings 摘要里带秒数的行都可能先出现,
+    取第一行会把它们当成判定依据。
+    """
+    lines = _PYTEST_SUMMARY_RE.findall(output)
+    if not lines:
+        return None
+    tail = lines[-1]
+    if "no tests ran" in tail:
+        return {"failed": 0, "passed": 0, "errors": 0, "ran": False}
+    counts = {c.group("what"): int(c.group("n")) for c in _OUTCOME_COUNT_RE.finditer(tail)}
+    if not counts:
+        # 匹配到 "Finished in 0.05s" 这种有秒数没计数的行。宁可说读不懂,
+        # 也不能放过去——放过去就是「什么都没验却判绿」。
+        return None
+    return {"failed": counts.get("failed", 0), "passed": counts.get("passed", 0),
+            "errors": counts.get("error", 0) + counts.get("errors", 0), "ran": True}
 
 # 失败测试的完整身份("FAILED tests/x.py::test_y"),要 pytest 的 -rf 才会打。
 #
@@ -534,9 +574,10 @@ class TestBaselineGate:
             )
 
         output = proc.stdout + proc.stderr
-        m = _PYTEST_SUMMARY_RE.search(output)
-        if not m:
-            # 没匹配到 summary 行——可能 pytest 启动失败
+        outcome = _pytest_outcome(output)
+        if outcome is None:
+            # 真的认不出终局行——可能 pytest 启动失败、可能被 -x 打断。
+            # 保守方向是红。
             tail = "\n".join(output.splitlines()[-10:])
             return GateResult(
                 name=self.name,
@@ -547,17 +588,31 @@ class TestBaselineGate:
                 blocking=self.blocking,
             )
 
-        failed = int(m.group("failed"))
-        passed = int(m.group("passed") or 0)
+        failed, passed = outcome["failed"], outcome["passed"]
         failed_ids = set(_FAILED_ID_RE.findall(output))
         # 用时一并记进 measured:超时时它是**唯一**能让人分清「挂死」和
         # 「变慢」的东西(r91 的由来,见 _timeout_detail)。
-        measured: dict = {"failed": failed, "passed": passed,
+        measured: dict = {"failed": failed, "passed": passed, "errors": outcome["errors"],
                           "seconds": round(time.monotonic() - started, 1)}
 
+        # r93:「没有 failed」有两种相反含义,上面 _pytest_outcome 拆开了,
+        # 这里必须把坏的那两种**显式接出来**。它们和「解析失败」不是一回事:
+        # 解析失败是门禁瞎了,这两条是套件真没跑起来。后者若被读成
+        # failed=0 放过去,就是「一条没跑却报通过」——比假红坏得多。
+        if outcome["errors"] or not outcome["ran"]:
+            why = f"pytest 收集中断 {outcome['errors']} error(s),一条没跑起来" if outcome["errors"] else "pytest 一条测试都没跑(no tests ran)"
+            return GateResult(
+                name=self.name,
+                passed=False,
+                detail=f"{why}。这不是失败数判定,是门禁没验到任何东西,判红。",
+                measured=measured,
+                baseline=prev_failed,
+                blocking=self.blocking,
+            )
+
         if not failed_ids:
-            # 没拿到身份(例如 -rf 输出没解析出来):退回按总数判。
-            # 保守方向是红,所以总数涨了必须报。
+            # 没拿到身份(例如 -rf 输出没解析出来,或套件全绿压根没有失败):
+            # 退回按总数判。保守方向是红,所以总数涨了必须报。
             if failed > prev_failed:
                 return GateResult(
                     name=self.name,
@@ -571,10 +626,21 @@ class TestBaselineGate:
                     baseline=prev_failed,
                     blocking=self.blocking,
                 )
+            detail = f"failed={failed} (baseline={prev_failed}), passed={passed}"
+            # r93:这一支原先**不提示收紧名单**。r27 的身份模式那一支
+            # 会报 healed,但全绿时 failed_ids 为空、走的是这里,于是「9 条
+            # 全部修好」这种最该高兴的情况反而一声不吭,名单就一直躺着。
+            # 和 r86 是同一个毛病:声称双向的机制只实现了一半。
+            if known and not failed:
+                measured["allowed_failures"] = sorted(known)
+                detail += (
+                    f"; all {len(known)} baseline failure(s) now pass, "
+                    f"shrink allowed_failures: {'; '.join(sorted(known))}"
+                )
             return GateResult(
                 name=self.name,
                 passed=True,
-                detail=f"failed={failed} (baseline={prev_failed}), passed={passed}",
+                detail=detail,
                 measured=measured,
                 baseline=prev_failed,
                 blocking=self.blocking,
