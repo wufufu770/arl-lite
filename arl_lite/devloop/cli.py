@@ -113,7 +113,23 @@ def _cmd_claim(args) -> int:
         item_id=getattr(args, "item_id", None),
     )
     if it is None:
-        print("[i] nothing to claim (queue has no pending item)")
+        # 「指定的这一条不可领」和「队列真空」是两回事,塌缩成同一句会直接
+        # 骗到调用方:条目 id 打错、或那条已被别的 agent 领走时,队列里明明
+        # 还有一堆 pending,却报「queue has no pending item」—— 照这句话
+        # 走会误判整个循环的队列已空,转头去补种子,把活儿撂下。
+        item_id = getattr(args, "item_id", None)
+        if item_id:
+            print(f"[!] cannot claim {item_id}: no such item, or it is not "
+                  f"claimable (already done / dropped / claimed by someone else)",
+                  file=sys.stderr)
+            others = [i.id for i in _queue().load()
+                      if i.status in ("pending", "in_progress")
+                      and (i.owner or "") != owner]
+            if others:
+                print(f"    queue still has {len(others)} claimable item(s): "
+                      f"{', '.join(sorted(others)[:5])}", file=sys.stderr)
+        else:
+            print("[i] nothing to claim (queue has no pending item)")
         return 1
     print(f"[+] claimed {it.id} — {it.title}")
     print(f"    priority={it.priority} kind={it.kind} attempts={it.attempts}")
