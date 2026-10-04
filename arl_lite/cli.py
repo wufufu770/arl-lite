@@ -475,10 +475,13 @@ def cmd_export(args) -> int:
 
 
 def cmd_workspace_list(args) -> int:
-    # workspace list 不依赖某个具体 workspace,显示所有
-    # 但仍需要一个 Storage 实例来读 workspaces 表,用 "default" 即可
-    ws = getattr(args, "workspace", None) or "default"
-    storage = Storage(workspace=ws)
+    # workspace list 不依赖某个具体 workspace,显示所有。
+    # 但仍需要一个 Storage 实例来读 workspaces 表 —— 而 workspaces 表**只存在于
+    # default 库**里,其他工作区的库里没有这张表。
+    # 所以这里必须恒用 "default":用 args.workspace 会既凭空建出一个用户命名
+    # 的工作区(只读列表命令产生写库副作用),又只列出那个新库里的两条,
+    # 把 beta 之类的真实工作区从结果里弄丢。-w 在 help 里本就声明为「忽略」。
+    storage = Storage(workspace="default")
     rows = storage.list_workspaces()
     _print_table(rows, cols=["id", "name", "description", "ticket", "task_count", "last_active_at"])
     return 0
