@@ -29,6 +29,7 @@ r39 用**正确的窗口**:「上一轮 started_at → 现在」。
 """
 from __future__ import annotations
 
+import ast
 import subprocess
 import tempfile
 from pathlib import Path
@@ -189,23 +190,53 @@ def test_non_git_repo_audit_stays_quiet(tmp_path):
 
 # ── 判据本身 ──
 
+def _get_key(node, recv: str):
+    """结构上认出 `<recv>.get("<字面量键>")`,把那个键返回出来;认不出返回 None
+
+    r80:这条 helper 存在的理由是 `ast.get_source_segment` 返回**原文** ——
+    注释和 docstring 都在里面,拿它做子串判定,一行 `# prev.get("started_at")`
+    就能把真调用删掉还照样通过(实测过)。结构判定没有这个口子:
+    注释根本不是 AST 节点。
+    """
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == recv
+            and len(node.args) == 1
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)):
+        return node.args[0].value
+    return None
+
+
 def test_audit_window_is_since_the_previous_round_started():
     """窗口的起点必须是**上一轮 started_at**,不是上一轮 finished_at
 
     这个区别决定了 audit 会不会漏报:如果从 `finished_at` 起算,
     那么"上一轮跑完之后才提交"的正常情况,提交落在窗口**之外** ——
     正好把 29/34 的正常情况判成异常。
+
+    判据认 AST 节点,不认源码文本。r80 实测过原来那句
+    `assert 'prev.get("started_at")' in ast.get_source_segment(src, fn)`
+    是假绿的。
     """
-    import ast
     src = (REPO / "arl_lite" / "devloop" / "protocol.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.FunctionDef)
               and n.name == "audit_prev_round_commits")
-    seg = ast.get_source_segment(src, fn)
-    assert 'prev.get("started_at")' in seg, (
-        "窗口起点用的不是上一轮的 started_at"
+    assigns = [n for n in ast.walk(fn)
+               if isinstance(n, ast.Assign)
+               and any(getattr(t, "id", None) == "start" for t in n.targets)]
+    assert len(assigns) == 1, f"start 被赋值 {len(assigns)} 次,窗口起点不唯一"
+    key = _get_key(assigns[0].value, "prev")
+    assert key == "started_at", (
+        f"窗口起点取的是 prev 的 {key!r},不是 'started_at' —— "
+        f"实际写的是 {ast.unparse(assigns[0].value)!r}"
     )
-    assert 'prev.get("finished_at")' not in seg, (
-        "窗口起点用了 finished_at —— 会把「跑完之后才提交」判成异常"
-    )
+    # 另一半:整个函数里不许再从 prev 取 finished_at 来当窗口边界
+    fetched = {k for n in ast.walk(fn)
+               if (k := _get_key(n, "prev")) is not None}
+    assert "finished_at" not in fetched, (
+        "窗口起点用了 finished_at —— 会把「跑完之后才提交」判成异常")
+

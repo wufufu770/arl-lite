@@ -247,15 +247,37 @@ def test_limit_notice_and_need_are_shared_by_all_three_commands():
                 f"判定和文案,否则会各自漂")
 
 
+def _static_text(node) -> str:
+    """f-string 里那些**不是插值**的字面片段,按顺序拼起来
+
+    r80:原来这里用 `" of " in ast.unparse(n)` —— 那是在源码**拼写**里找,
+    等于把代码当文本。判据要问的是「这个 f-string 印出来长什么样」,
+    所以直接读它的 Constant 片段。
+    """
+    return "".join(v.value for v in node.values
+                   if isinstance(v, ast.Constant) and isinstance(v.value, str))
+
+
+def _inserts(node, name: str) -> bool:
+    """这个 f-string 里有没有真的插了 `name` 这个变量
+
+    注意是「插值」,不是「写着 `{name}` 这几个字」——
+    `f"{total}"` 里 `total` 是 FormattedValue,`f"{{total}}"` 里不是。
+    """
+    return any(isinstance(v, ast.FormattedValue)
+               and getattr(v.value, "id", None) == name
+               for v in node.values)
+
+
 def test_monitor_changes_no_longer_handwrites_its_own_notice():
     """`cmd_monitor_changes` 里不该再有手写的 `f\"[{shown} of {total}` 文案"""
     tree = ast.parse((REPO / "arl_lite" / "cli.py").read_text(encoding="utf-8"))
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.FunctionDef)
               and n.name == "cmd_monitor_changes")
-    handmade = [n.value for n in ast.walk(fn)
+    handmade = [ast.unparse(n) for n in ast.walk(fn)
                 if isinstance(n, ast.JoinedStr)
-                and " of " in ast.unparse(n) and "{total}" in ast.unparse(n)]
+                and _inserts(n, "total") and " of " in _static_text(n)]
     assert not handmade, (
         f"cmd_monitor_changes 里还有手写的总数文案:{handmade} —— "
         f"r55 那份手写已经被 r56 的共用函数取代了")

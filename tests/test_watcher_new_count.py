@@ -410,20 +410,31 @@ def test_run_target_has_no_handwritten_asset_table_tuple():
         f"而且两份不一致(3 元 vs 5 元)。")
 
 
+def _contract_refs(node):
+    """`node` 里所有**真的引用了** `Monitor._ASSET_TABLES` 的 AST 节点
+
+    r80:认节点不认文本。原来那句 `assert "Monitor._ASSET_TABLES" in ast.unparse(fn)`
+    是假绿的 —— unparse 会把字符串字面量原样留在结果里,所以一个
+    `_hint = "Monitor._ASSET_TABLES"` 就能把真调用换成手抄清单还照样通过
+    (r52 那个 bug 的原样形状,实测过)。
+    """
+    return [n for n in ast.walk(node)
+            if isinstance(n, ast.Attribute) and n.attr == "_ASSET_TABLES"
+            and isinstance(n.value, ast.Name) and n.value.id == "Monitor"]
+
+
 def test_both_asset_list_reads_come_from_the_contract_table():
     """数新增的清单和逐类检测的清单,来源必须是 `Monitor._ASSET_TABLES`"""
     tree = ast.parse((REPO / "arl_lite" / "core" / "watcher.py")
                      .read_text(encoding="utf-8"))
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.FunctionDef) and n.name == "_run_target")
-    src = ast.unparse(fn)
     # 派生出来的那个局部变量要真的来自契约表
-    assert "Monitor._ASSET_TABLES" in src, (
+    assert _contract_refs(fn), (
         "_run_target 里没引用契约表 —— 资产清单从别处来了")
     # 逐类检测那个循环也得走它(它是「数新增」和「做检测」唯一的公共来源)
     loops = [n for n in ast.walk(fn)
-             if isinstance(n, ast.For)
-             and "Monitor._ASSET_TABLES" in ast.unparse(n.iter)]
+             if isinstance(n, ast.For) and _contract_refs(n.iter)]
     assert loops, (
         "变更检测那个循环不再从契约表取 —— 它和数新增的清单会各自漂移")
 
@@ -455,5 +466,5 @@ def test_contract_table_and_detected_types_stay_in_step():
                if isinstance(n, ast.Assign)
                and any(getattr(t, "id", None) == "asset_tables" for t in n.targets)]
     assert len(assigns) == 1, f"asset_tables 被赋值 {len(assigns)} 次"
-    assert "Monitor._ASSET_TABLES" in ast.unparse(assigns[0].value), (
+    assert _contract_refs(assigns[0].value), (
         f"asset_tables 不是从契约表派生的:{ast.unparse(assigns[0].value)}")
