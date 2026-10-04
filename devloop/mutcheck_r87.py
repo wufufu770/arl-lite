@@ -60,6 +60,12 @@ docstring),M3/M6 换成了真能生效的写法,判据侧补上「刺激必须�
 临时区且符合 tmp* 命名」——**探针得先证明自己的 stimulus 落在该落的地方**,
 这是 r84 那条规矩的直接应用。
 
+r88 回补:第一版这里写的是「M2 就是 r87 第一版的原样」。M2 后来被证明是
+假变异、改名 C2 挪进了覆盖变异,但这段叙述和 `CLAIMS` 里那条 M2 声明
+都忘了跟着改 —— 于是脚本里出现了一个**指哪儿都指不到**的 M2。
+r88 加的 `test_every_claim_has_a_mutant` 当场逮住了 CLAIMS 那半边;
+这半边(散文)是人读的时候才发现的。**两处漏的是同一个错误**。
+
 另外顺手修了一个会掩盖问题的毛病:一条坏变异原来直接把整个 run 打断,
 后面的变异一条都没跑。现在报成 `BAD-MUTANT` 继续走 —— C1 那次就是这么
 暴露的。
@@ -129,10 +135,10 @@ CLAIMS = {
         ['        return {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}\n'],
         ['"TMPDIR": str(private)'],
     ),
-    "M2-快照目标写死成私有地(r87第一版的错)": (
-        ['where = Path(env["TMPDIR"])'],
-        ["where = self._child_tempdir(env)"],
-    ),
+    # r88:这个位置原来还有一条 "M2-快照目标写死成私有地(r87第一版的错)"。
+    # M2 实测是假变异(见上面那张表),改名成 C2 挪进覆盖变异时,两个列表
+    # 都改了,唯独这条声明忘了删 —— 留下一条指向不存在变异的 CLAIMS。
+    # r88 加的 `test_every_claim_has_a_mutant` 当场把它逮了出来。
     "M3-noise不再往真实tmp种噪音": (
         ["d = private_ref                  # 变异:不往真实 /tmp 种了"],
         ["d = tempfile.mkdtemp()          # 真实 /tmp,不是私有地"],

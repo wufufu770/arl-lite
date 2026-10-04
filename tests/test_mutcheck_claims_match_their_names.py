@@ -208,6 +208,35 @@ def test_every_mutant_has_a_claim():
     assert not gaps, f"这些变异没有声明:{gaps}"
 
 
+def test_every_claim_has_a_mutant():
+    """反过来也成立:每条声明都得有一个**真的存在的**变异
+
+    r88 补的另一半。上面那条 `test_every_mutant_has_a_claim` 守的是
+    「变异 ⊆ 声明」,方向是单向的 —— 于是「声明里有一条根本不对应任何变异」
+    可以畅通无阻。
+
+    r87 实测就是这么漏的:那个脚本把实现变异 M2 改名成 C2 挪进了覆盖变异,
+    列表改对了,`CLAIMS` 忘了改,留下一条指向不存在变异的声明。当时
+    全部判据全绿。
+
+    这跟 r83 逮到的是同一个病 —— 文档/声明描述了代码里没有的东西 ——
+    而且出在**专门治这个病的那套机制自己身上**。
+    """
+    ghosts = {}
+    for s in _must_enforce():
+        tree = ast.parse(s.read_text(encoding="utf-8"))
+        _, claims, _ = _module_globals(tree)
+        # 一个 CLAIM 键同时挂在两个列表上,也算「对应关系不实」
+        claimed = [n for n in claims if n not in mutant_names(tree)]
+        if claimed:
+            ghosts[s.name] = sorted(claimed)
+    assert not ghosts, (
+        f"这些声明指向的变异不存在于 MUTANTS/COVERAGE_MUTANTS:{ghosts}\n"
+        "多半是变异改名或挪了类别时忘了改声明。\n"
+        "留着它不会让任何变异被逮住,只会让读脚本的人去找一条不存在的变异。"
+    )
+
+
 def test_claims_have_a_non_empty_side():
     """声明不能两边都空 —— 那等于没写"""
     empty = {}
