@@ -253,7 +253,7 @@ def test_production_collectors_all_go_through_upsert(st):
                     "add_finding"):
             n += text.count(f".{api}(")
     assert n >= 20, (
-        f"只扫到 {n} 个 add_* 调用点 —— 扫��器本身可能失效了 "
+        f"只扫到 {n} 个 add_* 调用点 —— 扫描器本身可能失效了 "
         f"(2026-10 实测是 20+)"
     )
 

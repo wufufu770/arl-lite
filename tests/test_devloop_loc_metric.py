@@ -370,7 +370,7 @@ def test_gate_reports_which_fields_are_over(tmp_path):
 def test_both_fields_are_promoted_when_both_are_over(tmp_path):
     """两项都超了就都提 —— 过滤不能变成漏网
 
-    对照组:上面那条只测了"只提红的",这条测"该提的都提"��
+    对照组:上面那条只测了"只提红的",这条测"该提的都提"。
     只写前者的话,把 `_over` 写成永远空列表也能全绿。
     """
     from arl_lite.devloop.accept import accept_baseline

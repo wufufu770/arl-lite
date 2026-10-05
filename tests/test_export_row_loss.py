@@ -141,7 +141,7 @@ def test_the_warning_goes_to_stderr_where_logs_and_pipes_can_see_it(ws, tmp_path
     判据写错了:同一句话打两遍是纯噪音,而终端**本来就同时显示**
     stdout 和 stderr,所以「正在看命令的人看得见」这个目标靠 stderr
     已经达到了。真正需要 stderr 的是另一类场景:被 `tee` 进日志、
-    或者 stdout 被管道接走当数据用的时���。
+    或者 stdout 被管道接走当数据用的时候。
     """
     storage, _ = ws
     _bulk(storage, "domains", OVER)

@@ -162,7 +162,7 @@ def _plan_changes(
             old = current.get(key)
             new = measured.get(key)
             if old is None:
-                # baseline 里没有 → 回落���源码常量(若该常量是这次的判定依据)
+                # baseline 里没有 → 回落到源码常量(若该常量是这次的判定依据)
                 old = _SOURCE_DEFAULTS.get(key)
             # 两边都得是数字才有"大小"可言;字符串/None/bool 一律不动
             if not isinstance(old, (int, float)) or isinstance(old, bool):

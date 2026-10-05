@@ -225,7 +225,7 @@ def test_correlate_advice_mentions_where_the_full_set_lives(ws, fake_engine):
         f"没说全量在哪、怎么取:\n{line}")
 
 
-# ── 五、结构:截断和提示各只在���里 ──
+# ── 五、结构:截断和提示各只在一处实现 ──
 
 def test_the_limit_slice_lives_in_one_place_with_the_total_already_known():
     """`matched_total` 必须在 `hits[:limit]` **之前**取

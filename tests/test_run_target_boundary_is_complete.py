@@ -29,7 +29,7 @@ import pytest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REJECT_MARK = "cannot appear in a domain"
 
-# 逐个字符钉死:每个都必须单独被拒。把清单钉死,是为了防止有人为了���测试变绿
+# 逐个字符钉死:每个都必须单独被拒。把清单钉死,是为了防止有人为了让测试变绿
 # 而悄悄把字符集缩小(Key Decision 11:列表内容本身要钉死)。
 IMPOSSIBLE = [
     ("空格", "a b"),
