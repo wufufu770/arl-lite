@@ -325,6 +325,9 @@ def cmd_run(args) -> int:
     print(f"[+] workspace: {args.workspace}")
     print(f"[+] target: {args.target}")
     print(f"[+] modules: {modules}")
+    # r103:传了却没人用(Phase 2)——静默吞掉的话,用户只会以为它生效了
+    if args.preset:
+        print(f"[!] --preset {args.preset} 未实现(Phase 2),已忽略")
     print()
 
     async def _go():

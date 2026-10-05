@@ -96,6 +96,9 @@ class TaskRunner:
         Returns:
             聚合的 ModuleResult
         """
+        # r103:接下了但零引用——声明过「暂未实现」不等于可以静默
+        if preset:
+            log.warning(f"preset={preset!r} 未实现(Phase 2),已忽略")
         started = time.time()
         sources_total = len(modules or [])
         sources_ok = 0
