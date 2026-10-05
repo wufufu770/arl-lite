@@ -76,3 +76,4 @@ git log -1 --format=%B <hash>            # 某一轮的完整过程
 | r108 | `2cbefcb` | r108: 协议文档的门禁总表和实现脱节 67 轮 —— 7 条里 5 条的命令是虚构的 | 把 `docs/devloop-protocol.md` 的 5.1「七道门禁总表」和 |
 | r109 | `40a0a61` | r109: 完成标记的判定两处各写一份而且已经漂了 —— 判据看不见实现的真实行为 | 播种   arl_lite/devloop/queue.py:1153            detail.startswith("✅") |
 | r110 | `39c5815` | r110: 待办条目被劈成两行,下半截 974 字符对所有判据隐形 —— 而且它那条 verify 要求的正是它自己拒绝的做法 | r106 写 `backlog-index-stops-at-r52` 这条时把一行写成了两行:上半截 L88 是 |
+| r111 | `4a327cc` | r111: 引擎判完成读的是 queue.json 那份,而它和 backlog.md 差 11 条 —— 其中 5 条在引擎眼里「判断不了」,于是不拦 | 我原以为「CLAIMS 字面量纪律连踩两次(r109 写 `.strip()`、r110 写 `A_TAG`)」 |
