@@ -181,8 +181,21 @@ def test_mcp():
         if r and not r.get("result", {}).get("isError", True):
             text = r["result"]["content"][0]["text"]
             data = json.loads(text)
-            if isinstance(data, list) and len(data) >= 1:
-                ok(f"query_assets hosts: {len(data)} 行")
+            # r96:`query_assets` 的返回从**裸数组**换成了带截断信息的信封
+            # (`{rows, returned, total, truncated}`)。这是**有意的协议变更**,
+            # 不是回归 —— 改之前这个门禁如实报了出来:
+            #     regression! failed=0 → 1
+            #     tests/test_phase5.py::test_mcp
+            #
+            # 原来这里判 `isinstance(data, list)`,那是在钉**当时**的形状,
+            # 不是这个测试的意图 —— 它的意图是「query_assets 能把 hosts 行
+            # 带回来」。所以这里改成验信封,并**顺带把截断信息也钉上**:
+            # 断言变严了,不是放宽了。
+            if (isinstance(data, dict) and isinstance(data.get("rows"), list)
+                    and len(data["rows"]) >= 1
+                    and {"returned", "total", "truncated"} <= set(data)):
+                ok(f"query_assets hosts: returned={data['returned']}/"
+                   f"total={data['total']}, truncated={data['truncated']}")
             else:
                 fail(f"query_assets: type={type(data).__name__} data={str(data)[:200]}")
         else:
@@ -333,8 +346,10 @@ def test_mcp_e2e():
                     print(f"  ✗ initialize: {r1}")
                 if not r2.get("result", {}).get("isError", True):
                     data = json.loads(r2["result"]["content"][0]["text"])
-                    if isinstance(data, list):
-                        print(f"  ✓ query_assets: {len(data)} 行")
+                    # r96:同 4.3,`query_assets` 现在返回带截断信息的信封
+                    if isinstance(data, dict) and isinstance(data.get("rows"), list):
+                        print(f"  ✓ query_assets: {data['returned']}/"
+                              f"{data['total']} 行(truncated={data['truncated']})")
                     else:
                         print(f"  ✗ query_assets: {data}")
                 else:

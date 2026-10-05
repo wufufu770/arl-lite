@@ -234,6 +234,11 @@ async def scan(
         results = []
         async for r in scan_tcp(host, port_list, timeout=timeout_per_port):
             results.append(r)
+        # r104:closed/filtered/解析失败在结果里长得一模一样,这里如实说出来
+        # (只覆盖 python 分支;nmap 上面直接 return,同一个洞留给下一轮)
+        n, tot = len(results), len(port_list)
+        if n < tot:
+            return results, f"{tot - n}/{tot} 端口未判定(关闭/被过滤/超时无法区分),不等于端口关闭", "partial"
         return results, None, None
     except Exception as e:
         return [], f"{type(e).__name__}: {e}", "unknown"

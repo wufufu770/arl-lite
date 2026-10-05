@@ -1,6 +1,8 @@
 name: elasticsearch_public
 description: Elasticsearch 暴露公网(无认证)
 risk: 9
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: medium
 tags: [elasticsearch, exposure, data_leak]
 collect:
   - table: findings

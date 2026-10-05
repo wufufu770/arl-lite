@@ -35,6 +35,36 @@ from .. import __version__
 
 log = logging.getLogger("arl_lite.tui.app")
 
+# TUI 起不来时给用户的替代路径。**单一来源** —— 两处报错共用它,
+# 手抄两份必然漂(r60-r64 修的正是这类漂移出来的死路)。
+#
+# 三条实测得来的约束,每条都对应一个真跑出来的坑:
+#
+# 1) 必须带 `arl-lite` 前缀。判据 tests/test_cli_advice_commandable.py
+#    靠字面量前缀提取建议,写裸子命令(`query`)它一条都看不见 ——
+#    那正是这处死路能一路躲过 r60-r64 四轮的原因。
+#
+# 2) 必须能真跑。`arl-lite query` 缺必填的 table,rc=2 报
+#    "the following arguments are required: table",所以这里写具体表名。
+#
+# 3) 必须先有工作区。这条是全量测试时才逮到的:`arl-lite stats` 在
+#    **全新 HOME** 下 rc=1 报 "workspace not found: 'default'" ——
+#    而「装完还没跑过任何任务」正是新用户的默认处境。
+#    修法不是删掉建议(那是拿删建议掩盖能力缺失,r63 的规矩),
+#    是把出路一起给出来:`workspace list` 会自动建出 default。
+_NON_TUI_ALTERNATIVES = (
+    "改用这些子命令(均已实测可直接运行):\n"
+    "  arl-lite workspace list              # 首次使用先跑这条,会自动建出 default 工作区\n"
+    "  arl-lite stats                       # 资产概览\n"
+    "  arl-lite query domains               # 域名列表\n"
+    "  arl-lite query ports                 # 端口列表\n"
+    "  arl-lite query sites                 # 站点列表\n"
+    "  arl-lite query findings              # 指纹列表\n"
+    "  arl-lite query correlations          # 关联分析结果\n"
+    "  arl-lite query tasks                 # 任务历史\n"
+    "  arl-lite export                      # 导出现状"
+)
+
 
 # =========================
 # ANSI 控制
@@ -43,11 +73,6 @@ log = logging.getLogger("arl_lite.tui.app")
 def clear_screen() -> None:
     """清屏"""
     sys.stdout.write("\033[2J\033[H")
-    sys.stdout.flush()
-
-
-def move_to(row: int, col: int) -> None:
-    sys.stdout.write(f"\033[{row};{col}H")
     sys.stdout.flush()
 
 
@@ -199,8 +224,17 @@ def read_int(prompt: str, default: int | None = None,
 # =========================
 
 class Screen:
-    """一个 TUI 屏幕"""
+    """一个 TUI 屏幕基类:`name` + `items`,外加一份共用的按键循环。
+
+    r101:`MainScreen` 原来**没有**继承它,而是把 `loop` 整段手抄了一份
+    (那份代码上面还写着「与 Screen.loop 同款」)。实测两份已经漂了一点:
+    `MainScreen.loop` 把 `digits` 抽成了局部变量,`Screen.loop` 是内联的。
+    现在改成继承,只有一份实现 —— 决策 #9「两处手抄迟早漂」的第一个
+    真实实例,漂移已经发生了,只是这次漂的是排版不是语义。
+    """
     name: str = "Screen"
+    # 类级可变默认值:调用方**必须**在实例上赋 `self.items`,否则
+    # 所有 Screen 实例共用同一份列表。`MainScreen.__init__` 就是这么做的。
     items: list[tuple[str, Callable]] = []  # (label, handler)
 
     def render(self) -> None:
@@ -222,7 +256,8 @@ class Screen:
                 return
             if ch.isdigit():
                 rest = input()  # 该行剩余部分(等回车)
-                idx = int(ch + rest.strip()) - 1 if (ch + rest.strip()).isdigit() else int(ch) - 1
+                digits = ch + rest.strip()
+                idx = int(digits) - 1 if digits.isdigit() else int(ch) - 1
                 if 0 <= idx < len(self.items):
                     try:
                         self.items[idx][1]()
@@ -236,9 +271,8 @@ class Screen:
 # 主屏幕
 # =========================
 
-class MainScreen:
+class MainScreen(Screen):
     name = "arl-lite 主菜单"
-    items = []
 
     def __init__(self, storage):
         self.storage = storage
@@ -270,24 +304,10 @@ class MainScreen:
         print(colorize("  [q]   退出 TUI", "gray"))
         print()
 
-    def loop(self) -> None:
-        self.render()
-        while True:
-            # 序号+回车(与 Screen.loop 同款,保证两位数菜单项可达)
-            ch = read_key()
-            if ch in ("q", "Q", "\x03", "\x1b"):
-                return
-            if ch.isdigit():
-                rest = input()
-                digits = ch + rest.strip()
-                idx = int(digits) - 1 if digits.isdigit() else int(ch) - 1
-                if 0 <= idx < len(self.items):
-                    try:
-                        self.items[idx][1]()
-                    except Exception as e:
-                        error(f"操作失败: {type(e).__name__}: {e}")
-                        read_line("按回车继续...")
-                    self.render()
+    # `loop` 不在这里了 —— r101 之前它是被手抄了一份,现在继承 `Screen.loop`
+    # (那份抄件上面的注释还写着「与 Screen.loop 同款」,自证是抄的)。
+    # 两份已经漂过一次:`MainScreen.loop` 把 `digits` 抽成了局部变量,
+    # `Screen.loop` 是内联的。现在只有一份实现。
 
     # =========================
     # 操作实现
@@ -459,12 +479,12 @@ def run_tui(workspace: str = "default") -> None:
     from ..db.storage import Storage
 
     if termios is None or tty is None:
-        print("[!] TUI 仅支持 Unix/Linux(需要 termios)。"
-              "Windows 请用 query / stats / export 子命令。", file=sys.stderr)
+        print("[!] TUI 仅支持 Unix/Linux(需要 termios)。" + _NON_TUI_ALTERNATIVES,
+              file=sys.stderr)
         sys.exit(2)
     if not (hasattr(sys.stdin, "isatty") and sys.stdin.isatty()):
-        print("[!] TUI 需要交互终端(cron/管道下不可用)。"
-              "请用 query / stats / export 子命令。", file=sys.stderr)
+        print("[!] TUI 需要交互终端(cron/管道下不可用)。" + _NON_TUI_ALTERNATIVES,
+              file=sys.stderr)
         sys.exit(2)
 
     storage = Storage(workspace=workspace)

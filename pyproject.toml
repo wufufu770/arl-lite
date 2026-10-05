@@ -12,23 +12,41 @@ license = {text = "MIT"}
 authors = [{name = "arl-lite contributors"}]
 keywords = ["security", "reconnaissance", "asset-discovery", "osint", "cli"]
 
-# 核心依赖:全部标准库,零外部 pip 依赖
-# 增强依赖(可选):检测到则启用,否则降级
+# 依赖面:零。
+#
+# 这不是口号,是受门禁强制的结构事实:`arl_lite/**.py` 里没有任何
+# 第三方 import(`no_thirdparty_import` 门禁每轮扫描 84 个文件)。
+# 实测 2026-10:原先这里列的 7 个 `full` 可选依赖(typer/rich/httpx/
+# pyyaml/apscheduler/textual/openpyxl)import 次数**全是 0** ——
+# 没有任何代码会因它们的存在而走不同分支。它们是死元数据,已删除。
+#
+# 原因不只是"没用":留着会让 Dependabot / pip-audit 对 7 个与本项目
+# 无关的包报 CVE,把真正该看的告警淹掉。详见 docs/DEP_AUDIT.md。
+#
+# ## 如果将来要加可选依赖
+#
+# 必须同时给出三样东西,缺一不可:
+#   1. 启用分支(检测到就用)
+#   2. 缺失时的降级行为(明确到"降级后少做什么")
+#   3. 对应测试(验缺失时真的能降级,而不是启动就崩)
+#
+# 只声明不实现,比不声明更糟:它承诺了一个项目没有的能力。
 dependencies = []
 
 [project.optional-dependencies]
-full = [
-    "typer>=0.9",      # CLI 增强
-    "rich>=13",        # 终端美化
-    "httpx>=0.25",     # 异步 HTTP
-    "pyyaml>=6",       # 配置文件
-    "apscheduler>=3.10", # 周期任务
-    "textual>=0.50",   # TUI
-    "openpyxl>=3.1",   # Excel 导出
-]
+# 刻意为空。外部工具(subfinder/nmap/nuclei 等)**不是** pip 依赖 ——
+# 它们是外部二进制,通过 shutil.which 探测 + subprocess 调用,缺失时
+# 对应模块返回 success=False 并提示安装命令,不阻塞其他模块。
+# 那是另一个类别的依赖,声明在这里会造成误导。
+# 零 pip 依赖铁律在这里的执行方式:dependencies 恒为空。
+#
+# dev 里只列**本机能装上、且代码真的用到**的东西。r95 从这里删掉了
+# `pytest-asyncio>=0.21` —— 本机装不上(PEP 668),而那 9 条 async 测试
+# 从 r92 起已经由 tests/conftest.py 里的纯 stdlib hook 接管,不再需要它。
+# 「只声明不实现,比不声明更糟」是本文件上面那段注释的原话,而这一条
+# 当时正好违反它。
 dev = [
     "pytest>=7",
-    "pytest-asyncio>=0.21",
 ]
 
 [project.scripts]
@@ -39,3 +57,51 @@ include = ["arl_lite*"]
 
 [tool.setuptools.package-data]
 arl_lite = ["db/*.sql", "fingerprints/*.json"]
+
+[tool.pytest.ini_options]
+# r105:注册下面两个 mark。起因是 `tests/test_bench_wont_clobber_baseline.py:172`
+# 用了 `@pytest.mark.slow` 却从没注册过,于是**每一次全量跑**都带一条
+#     PytestUnknownMarkWarning: Unknown pytest.mark.slow
+# **这和上面记的 asyncio_mode 是同一个病**:一条每次都出现的告警等于没有
+# 告警 —— 人会脱敏,下一条真告警跟着被忽略。而这一次连「为什么留着它」
+# 都没人记得,因为它不在任何一条判据里,只是每次 summary 里多一行。
+#
+# `network` 是 r105 新加的:`tests/test_phase2.py` 里有两条测试真的打公网
+# API(9 个数据源 / 端到端链路),它们**红了先怀疑网络**。打上标签是为了
+# 让人能一条命令把它们摘出来单独跑:
+#     pytest tests/ -m "not network"
+# 注意:**门禁不按这个标签跳过它们** —— 跳过等于不验,那正是 r104 花一整轮
+# 改掉 portscan 那条测试的原因。标签只用来「让 flaky 的来源可查询」。
+markers = [
+    "slow: 慢测试(基准测试一类),不查功能对错",
+    "network: 需要外网才能跑 —— 红了先怀疑网络,别急着改代码",
+]
+
+# 这里**曾经**配着 `asyncio_mode = "auto"`,r95 删掉了。
+#
+# 那一行是给 pytest-asyncio 用的,而 pytest-asyncio 在本机装不上(PEP 668)。
+# 于是它从来只是让 pytest 每跑一次就报一次:
+#     PytestConfigWarning: Unknown config option: asyncio_mode
+# 实测:一次全量变异扫描(54 个脚本 / 446 条变异)要起 446 次 pytest,
+# **每一次**都带这条。**一条每次都出现的告警等于没有告警** —— 人会脱敏,
+# 下一条真告警跟着被忽略。
+#
+# 而那 9 条 async 测试确实需要有人接管,只是那个人不是 pytest-asyncio:
+# r92 起是 `tests/conftest.py` 里那个纯 stdlib 的 `pytest_pyfunc_call`。
+# 所以删掉这一行不影响它们跑 —— 全量实测 1291 collected / 1257 passed /
+# 34 skipped / 0 failed,和删之前一致。
+#
+# 顺便记一笔:这一行上面的注释原本写的是「9 个 async 测试全部被 skip 成
+# async def functions are not natively supported」—— **两处都是错的**。
+# 9 条测试早就被接管了(不是 skip),而这一行本身本机就不被识别。
+# 一段把现状说反了的注释,比没有注释更容易误导下一个人。
+#
+# ## 如果将来真装了 pytest-asyncio
+#
+# 它的默认模式是 strict,只接管打了 `@pytest.mark.asyncio` 的测试,所以
+# conftest 那个 hook 照旧会跑那 9 条;而一旦你显式配了
+# `asyncio_mode = "auto"`,hook 会主动让位(见 conftest 的
+# `_pytest_asyncio_installed`)。
+#
+# **这一段没能在本机实测** —— 装不上,手上没有数据。这里写的是按文档推的,
+# 不替它下结论。真装了的话请回来把这段改成实测结果。

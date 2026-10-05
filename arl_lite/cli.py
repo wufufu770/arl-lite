@@ -5,7 +5,7 @@ Phase 1 命令(纯 argparse,零外部依赖):
     arl-lite query domains
     arl-lite query sites --filter "title like '%admin%'"
     arl-lite search sites "admin"
-    arl-lite export json --workspace example.com
+    arl-lite export --format json --workspace example.com
     arl-lite workspace list
     arl-lite workspace create foo
     arl-lite stats
@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import logging
+import string
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -26,9 +27,20 @@ from typing import Any
 
 # 让 from arl_lite import ... 能用
 from . import __version__
-from .db.storage import Storage, get_default_workspace_root
+from .db.storage import EXPORT_ROW_CAP, Storage, get_default_workspace_root
 from .core.task_runner import TaskRunner
 from .core.signal_handler import GracefulShutdown
+# 词表只此一份:CLI 的 choices 从这里派生,不手写(见 build_parser 里
+# `monitor changes` 那处的说明)。手写的那份已经过期过一次。
+from .core.monitor import CHANGE_TYPES, Monitor as _Monitor
+
+_ASSET_TYPES = tuple(_Monitor._ASSET_TABLES)
+_ASSET_TYPES_TO_TABLE = dict(_Monitor._ASSET_TABLES)
+
+# 绝不可能出现在域名 / IP / URL 里的字符,`run` 的 target 边界检查用。
+# URL 里要出现这些字符也只会是 %20 / %22 / %3C 这种百分号编码形态,
+# 所以按字面出现就一定是手误。刻意保持最小集:拿不准的字符不往里加。
+_NEVER_IN_TARGET = frozenset(" \t\r\n<>\"'`")
 from .modules.registry import discover_modules
 
 log = logging.getLogger("arl_lite.cli")
@@ -78,7 +90,104 @@ def _ensure_workspace_exists(name: str) -> int:
     print(f"[!] workspace not found: {name!r}", file=sys.stderr)
     if available:
         print(f"    available: {sorted(available)}", file=sys.stderr)
+    else:
+        # 没有任何工作区时,只报一句「not found」等于把用户堵死 ——
+        # 全新安装的用户正是这个处境(实测 7 个只读子命令全都走这里:
+        # stats / query / search / export / diff / correlate / risk top,
+        # 每条都只有那一行报错,零出路)。
+        #
+        # 出路指向**用户本来就想做的事**,不是 workspace 子命令:
+        # 实测 `arl-lite run -t <target>` 在空环境下 rc=0 且自动建出
+        # default 工作区,之后这些只读命令就都跑得通了。
+        #
+        # 刻意**不**指向 `workspace create default`:实测在空环境下
+        # 它报「workspace 'default' already exists」rc=1 ——
+        # Storage 会先静默建库,于是最像样的那条出路本身是条错路。
+        # 也不指向 `workspace list`:它确实 rc=0,但让用户去"列一下
+        # 工作区"不是他此刻想做的事,那是绕路。
+        print("    这台机器上还没有任何工作区。先跑一次任务即可自动建出:",
+              file=sys.stderr)
+        print(f"        arl-lite run -t <target>", file=sys.stderr)
+        print("    (想换个名字就用 -w <name>;已有工作区可用时上面会列出)",
+              file=sys.stderr)
     return 1
+
+
+def _needs_total(shown: int, limit: int) -> bool:
+    """行数顶到 `--limit` 才**可能**被截断 —— 没顶到就不用付 COUNT 的钱
+
+    这条判定被 `query` / `search` / `monitor changes` 三处共用,理由同
+    `_limit_notice_text`:三处各写一遍,早晚会有一处忘了。
+    """
+    return shown >= limit
+
+
+def _limit_notice_text(shown: int, total: int | None, limit: int,
+                       noun: str = "row", how: str | None = None) -> str:
+    """被 `--limit` 截断时的说明。没截断时返回空串。
+
+    `noun` 是给用户看的量词(`change` / `row` / `rule`):模板共用,但
+    「200 个什么」得和命令的语境对得上 —— `monitor changes` 说 row
+    会让人以为是资产行。
+
+    `how` 是「要全看怎么办」的建议,**默认那句对多数命令成立**。
+    r58 踩过一次:它写着「要全看就调大 --limit,机器消费用 `--json`」,
+    而 `correlate` 根本没有 `--json` —— 共用文案照抄到不适用的语境上,
+    就是给用户一条不存在的出路。宁可少说一句,也不能说错。
+
+    ## 为什么要有这么一个共用函数(r56)
+
+    `--limit` 是一类横切问题:`query` / `search` / `monitor changes` /
+    `correlate` 全都默认截到 50 条,而它们原本**一个提示都不给** ——
+    `search` 连「显示了 50 条」都不说。r55 先在 `monitor changes` 上
+    手写了一份,本轮把另外两条也接进来,那份手写必须收掉:
+    **两处手抄同一段提示,迟早漂**(决策 #9)。
+
+    ## `total` 可以是 `None`
+
+    `None` 的意思是「**没数出来**」,不是「零条」。`Storage.count_search`
+    在 FTS5 出错时返回 `None`,因为那时 `search` 会退回 LIKE 搜索 ——
+    两个集合不同,拿不出一个诚实的总数。这时明说「总数未知」。
+    把「查不到」说成「是 0」,等于把一次查询失败伪装成空结果
+    (r47 的 `_ASSET_LABEL_FIELDS` 同一个病)。
+
+    ## 没截断时不啰嗦
+
+    每次都喊「只显示了最新 50 条」,等到真被截断时这句话就不值钱了。
+    """
+    if total is None:
+        return (f"[i] {shown} {noun}(s) shown; total UNKNOWN "
+                f"(计数查询失败,不猜 —— 见上面的 warning)")
+    if total > shown:
+        # 不说「最新 N 条」:那是 `ORDER BY id DESC` 的措辞,而 `correlate`
+        # 是按 risk 降序取的(高风险在前)—— 共用文案照抄「最新」就是在
+        # 骗人。两条命令都是降序取前 N,去掉它不损失任何信息。
+        advice = how or "要全看就调大 --limit,机器消费用 --json"
+        return (f"[i] {shown} of {total} {noun}(s) "
+                f"(只显示了 {shown} 条;--limit {limit}。{advice})")
+    # 没截断时**也**说总数:「200 条,以下是全部」是有用信息,
+    # 而「静默地给全了」让用户分不清「这就是全部」和「恰好没超 limit」。
+    return f"[i] {total} {noun}(s)"
+
+
+def _print_table_limited(rows: list[dict], total: int | None, limit: int,
+                         cols: list[str] | None = None,
+                         noun: str = "row") -> None:
+    """印表格 + 被 `--limit` 截断时的说明。判定和文案都走上面那两个共用函数。"""
+    if not rows:
+        print("(empty)")
+        return
+    if cols is None:
+        cols = list(rows[0].keys())
+    widths = {c: max(len(c), max(len(str(r.get(c, ""))) for r in rows)) for c in cols}
+    sep = "  "
+    print(sep.join(c.ljust(widths[c]) for c in cols))
+    print(sep.join("-" * widths[c] for c in cols))
+    for r in rows:
+        print(sep.join(str(r.get(c, "")).ljust(widths[c]) for c in cols))
+    notice = _limit_notice_text(len(rows), total, limit, noun)
+    if notice:
+        print(notice)
 
 
 def _print_table(rows: list[dict], cols: list[str] | None = None) -> None:
@@ -173,6 +282,21 @@ def cmd_run(args) -> int:
     if "\x00" in args.target:
         print("[!] target contains null byte", file=sys.stderr)
         return 2
+    # 上面三条拦的是「一定错」,这条拦的是「一定不是域名/IP/URL」。
+    # 边界严格取可证明的最小集:这些字符**不可能**出现在主机名、IP 或 URL 里
+    # (URL 里要出现也只会是 %20/%22 这种百分号编码形态)。
+    # 刻意不拦「形状可疑但可能合法」的单标签(localhost/intranet-host 是内网
+    # 侦察的正当目标)和裸数字 —— 拿不准就不拦,免得误伤合法用法。
+    bad = sorted({c for c in args.target if c in _NEVER_IN_TARGET})
+    if bad:
+        shown = " ".join(repr(c) for c in bad)
+        print(f"[!] target contains character(s) that cannot appear in a domain, "
+              f"IP or URL: {shown}", file=sys.stderr)
+        # 举例只用形态,不给完整命令行:`run` 必然出网,把它写成建议会被
+        # 建议判据抓去验 rc=0,而网络不通时 rc=1(r68 的教训)。
+        print("    a target looks like `example.com`, `192.0.2.1`, "
+              "or `https://example.com/path`", file=sys.stderr)
+        return 2
 
     storage = Storage(workspace=args.workspace)
     runner = TaskRunner(storage=storage, workspace_id=storage.workspace_id)
@@ -201,6 +325,9 @@ def cmd_run(args) -> int:
     print(f"[+] workspace: {args.workspace}")
     print(f"[+] target: {args.target}")
     print(f"[+] modules: {modules}")
+    # r103:传了却没人用(Phase 2)——静默吞掉的话,用户只会以为它生效了
+    if args.preset:
+        print(f"[!] --preset {args.preset} 未实现(Phase 2),已忽略")
     print()
 
     async def _go():
@@ -242,7 +369,12 @@ def cmd_query(args) -> int:
     if args.format == "json":
         _print_json(rows)
     else:
-        _print_table(rows)
+        # `count_rows` 走 `_query_where`,和 `query` 同一份条件 ——
+        # `--filter` 是**用户传的** SQL,所以共用尤其要紧:总数必须是
+        # 同一个筛选下的条数,否则报出的是个看起来精确的假数字(r56)。
+        total = (storage.count_rows(args.table, filter_sql=args.filter)
+                 if _needs_total(len(rows), args.limit) else len(rows))
+        _print_table_limited(rows, total, args.limit)
     return 0
 
 
@@ -254,8 +386,17 @@ def cmd_search(args) -> int:
     if args.format == "json":
         _print_json(rows)
     else:
-        _print_table(rows)
+        # 只有行数顶到 limit 时才去数总数 —— 没顶到显然没截断(r56)
+        total = (storage.count_search(args.table, args.keyword)
+                 if _needs_total(len(rows), args.limit) else len(rows))
+        _print_table_limited(rows, total, args.limit)
     return 0
+
+
+# `export` 要导哪些表。这是**一份清单**,r57 之前它是个字面量列表,
+# 写死在这行 `for` 里 —— 加表和「这张表有没有被截断」不在同一个地方。
+_EXPORT_TABLES = ("domains", "hosts", "ports", "sites", "findings",
+                  "tasks", "source_status", "correlations")
 
 
 def cmd_export(args) -> int:
@@ -263,8 +404,17 @@ def cmd_export(args) -> int:
         return 1
     storage = Storage(workspace=args.workspace)
     data: dict = {}
-    for table in ["domains", "hosts", "ports", "sites", "findings", "tasks", "source_status", "correlations"]:
-        data[table] = storage.query(table, limit=10000)
+    # r57:每张表的真实行数。`query` 只给得出「取到多少」,而 rows
+    # 看不出自己是不是完整的 —— 过去 `limit=10000` 硬写在这里,
+    # 12000 行只导出 10000 行,命令还打印「exported to ...」退出 0。
+    # `fetch_all` 把「一共多少」绑进返回值,这里就不可能漏掉它。
+    totals: dict[str, int] = {}
+    for table in _EXPORT_TABLES:
+        rows, total = storage.fetch_all(table)
+        data[table] = rows
+        totals[table] = total
+    clipped = {t: (totals[t], len(data[t])) for t in _EXPORT_TABLES
+               if totals[t] > len(data[t])}
     fmt = getattr(args, "format", "json")
     output = getattr(args, "output", None)
     if output:
@@ -322,14 +472,39 @@ def cmd_export(args) -> int:
 
     if output:
         print(f"[+] {fmt} exported to {output}")
+
+    # r57:数据不全要说出来,而且**退出码非 0**。
+    #
+    # 为什么不因为截断就拒绝导出:文件已经写了一半,硬失败等于让用户
+    # 什么都拿不到,还得自己想办法重来 —— 那是替用户做了决定。
+    #
+    # 为什么退出码必须非 0:`export` 会被 CI 和定时任务调用,退出码 0
+    # 意味着脚本认为一切正常,这个不完整的文件会流进下游分析/迁移/归档,
+    # 结论是错的而没人知道。人和自动化都得看见,所以是「导 + 说 + 报失败」。
+    if clipped:
+        print(f"[!] 导出的数据**不完整** —— 以下表超过了 "
+              f"{EXPORT_ROW_CAP} 行上限,只取到了前 {EXPORT_ROW_CAP} 行:",
+              file=sys.stderr)
+        for table in sorted(clipped):
+            total, got = clipped[table]
+            print(f"      {table}: 库里 {total} 行,只导出 {got} 行"
+                  f"(少了 {total - got} 行)", file=sys.stderr)
+        print(f"[!] 文件已写出,但**不要**当成完整数据集用。两种拿全量的办法:"
+              f"(1) 分表分批 —— arl-lite query {sorted(clipped)[0]} --limit 10000 "
+              f"逐段导出;(2) 把 db.storage.EXPORT_ROW_CAP 调到够大,再导一次 "
+              f"(fetch_all 会分页取,内存占用不会跟着涨)。", file=sys.stderr)
+        return 1
     return 0
 
 
 def cmd_workspace_list(args) -> int:
-    # workspace list 不依赖某个具体 workspace,显示所有
-    # 但仍需要一个 Storage 实例来读 workspaces 表,用 "default" 即可
-    ws = getattr(args, "workspace", None) or "default"
-    storage = Storage(workspace=ws)
+    # workspace list 不依赖某个具体 workspace,显示所有。
+    # 但仍需要一个 Storage 实例来读 workspaces 表 —— 而 workspaces 表**只存在于
+    # default 库**里,其他工作区的库里没有这张表。
+    # 所以这里必须恒用 "default":用 args.workspace 会既凭空建出一个用户命名
+    # 的工作区(只读列表命令产生写库副作用),又只列出那个新库里的两条,
+    # 把 beta 之类的真实工作区从结果里弄丢。-w 在 help 里本就声明为「忽略」。
+    storage = Storage(workspace="default")
     rows = storage.list_workspaces()
     _print_table(rows, cols=["id", "name", "description", "ticket", "task_count", "last_active_at"])
     return 0
@@ -420,27 +595,48 @@ def cmd_stats(args) -> int:
     return 0
 
 
+def _parse_since(value: str) -> str:
+    """`7d` / `24h` / ISO 时间 → ISO 起点串
+
+    ## 为什么要抽成函数(r51)
+
+    它原先内联在 `cmd_diff` 里。r51 要给 `monitor changes --since` 和
+    `monitor prune --older-than` 用同一个语义,而**复制第二份**就是
+    r45 那条教训的重演(同一张表两个来源迟早漂)。所以一份就够,三处共用。
+
+    ## 「能 parse 就当时间」那种写法为什么不要
+
+    原实现的 ISO 分支把原串原样传下去,不自己校验。实测那样**也是**安全的
+    —— 下游 `diff_new_since` 会拒(`--since garbage` 返回 exit 2)。但那是
+    碰巧下游记得校验:一个自己不校验的解析器,安全完全挂在「每个下游都记得」
+    上。所以这里自己先过一道 `parse_ts`,拒绝不了就地报错,给的是这一条
+    命令自己的话。
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("must be a non-empty string")
+    from .core.monitor import parse_ts
+    if value.endswith("d") or value.endswith("h"):
+        unit = "days" if value.endswith("d") else "hours"
+        n = int(value[:-1])
+        if n < 0:
+            raise ValueError(f"{unit} must be >= 0, got {n}")
+        delta = timedelta(days=n) if unit == "days" else timedelta(hours=n)
+        return (datetime.utcnow() - delta).isoformat()
+    dt = parse_ts(value)
+    if dt is None:
+        raise ValueError(f"not a recognised window or timestamp: {value!r}")
+    return dt.isoformat()
+
+
 def cmd_diff(args) -> int:
     if _ensure_workspace_exists(args.workspace):
         return 1
     storage = Storage(workspace=args.workspace)
     # 解析 since:7d / 24h / ISO 时间
-    since_raw = args.since
     try:
-        if since_raw.endswith("d"):
-            days = int(since_raw[:-1])
-            if days < 0:
-                raise ValueError(f"days must be >= 0, got {days}")
-            since = (datetime.utcnow() - timedelta(days=days)).isoformat()
-        elif since_raw.endswith("h"):
-            hours = int(since_raw[:-1])
-            if hours < 0:
-                raise ValueError(f"hours must be >= 0, got {hours}")
-            since = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
-        else:
-            since = since_raw
+        since = _parse_since(args.since)
     except ValueError as e:
-        print(f"[!] invalid --since '{since_raw}': {e}", file=sys.stderr)
+        print(f"[!] invalid --since '{args.since}': {e}", file=sys.stderr)
         print(f"    valid: '7d' / '24h' / '2026-09-01'", file=sys.stderr)
         return 2
 
@@ -479,10 +675,26 @@ def cmd_correlate(args) -> int:
     hits.sort(key=lambda h: -h.risk)
     # 过滤 min_risk
     hits = [h for h in hits if h.risk >= args.min_risk]
+    # `min_risk` 是用户**主动**要求的筛选,不是截断;`limit` 才是隐式的
+    # 上界。所以提示要说「因 limit 少了多少」,基准是过了 min_risk 之后的数,
+    # 不是引擎命中的总数(首行那句已经报过后者了)。
+    matched_total = len(hits)
     hits = hits[:args.limit]
 
+    # r58:`--limit` 截掉了多少必须说出来。首行 `[+] 60 hits` 是**引擎命中
+    # 总数**,和下面列出的行数不是一回事 —— 两个数字挨着出现却没人解释
+    # 差在哪,用户只会以为列出来的那 50 条就是全部(和 r50 那条
+    # 「两个数字并排出现却没人解释差在哪」是同一个形状)。
+    _limit_notice = _limit_notice_text(len(hits), matched_total, args.limit,
+                                       "correlation",
+                                       how="要全看就调大 --limit(命中全都在 "
+                                           "correlations 表里,也能用 "
+                                           "arl-lite query correlations 看)")
+    if _limit_notice:
+        print(_limit_notice)
+
     if not hits:
-        print("[i] no correlations found (target too clean? run 'arl-lite run' first)")
+        print("[i] no correlations found (target too clean? run 'arl-lite run -t <target>' first)")
         return 0
 
     print()
@@ -494,7 +706,103 @@ def cmd_correlate(args) -> int:
             print(f"{color}{line}\033[0m")
         else:
             print(line)
+
+    # 通知。notify_correlation 此前是死代码 —— 有定义、有导出、只有测试在调,
+    # 关联命中永远不外发。规则自己的 tags(rce/unauth/data_leak...)也一直被
+    # 丢掉,通知里只剩一个风险等级。
+    notified = _notify_correlations(args, hits, matched_total)
+    if notified is not None:
+        print()
+        print(notified)
     return 0
+
+
+def _notify_correlations(args, hits, total: int | None = None) -> str | None:
+    """把关联命中推给 webhook;返回给人看的汇总行,没配置则返回 None
+
+    配置沿用项目既有约定:**由调用方注入**(Watcher 也是
+    `Watcher(storage, webhook_config=...)`),不在这里凭空造一个。
+
+    ## `total` 是「本该推多少条」(r58)
+
+    `hits` 是**已经按 `--limit` 截断过**的。汇总行原来写的是
+    `notified {ok}/{len(hits)}` —— 那个分母是截断后的数,所以 60 条命中
+    推了 50 条时它会说「notified 50/50」,**主动说谎**。
+
+    比谎报更实际的问题是:通知是**发给别人的**。收通知的人没有终端输出
+    可看,不知道少推了什么,也不会追问。所以这里必须把「共多少、推了多少、
+    还剩多少」一起说出去。
+
+    推的**条数**仍然有上界(几十条就够淹掉一个 webhook 了),但那个上界
+    必须是**明说**的,不能是看起来像「这就是全部」的假象。
+    """
+    if not getattr(args, "notify", False):
+        return None
+    cfg = getattr(args, "webhook", None)
+    if cfg is None:
+        # CLI 入口:从 --webhook-url 现场构造。Watcher 那边仍然是注入的,
+        # 这里只是 CLI 参数的落点,不该让它去读全局配置文件。
+        url = getattr(args, "webhook_url", "") or ""
+        if not url:
+            return "[!] --notify given but no --webhook-url provided"
+        try:
+            from .notify import WebhookConfig
+            cfg = WebhookConfig(
+                url=url,
+                provider=getattr(args, "webhook_provider", "ntfy") or "ntfy",
+            )
+        except Exception as e:
+            return f"[!] invalid webhook config: {e}"
+    if not getattr(cfg, "url", "") and getattr(cfg, "provider", "") != "local":
+        # r99:原来是无条件查 url。但 `local` provider **本来就不需要 URL**
+        # (它只写日志不发 HTTP),于是「注入了一个合法的 local 配置」会被
+        # 这里判死并报成「--notify given but no webhook url」——
+        # 一句和真实原因无关的话,而且这个分支在本地调试时天天走到。
+        return "[!] --notify given but no webhook url"
+
+    from .notify import notify_correlation
+
+    ok = 0
+    failed = 0
+    skipped = 0
+    for h in hits:
+        payload = h.to_dict() if hasattr(h, "to_dict") else dict(h.__dict__)
+        # r99:门限先自己问一遍。`notify()` 里也会问,但它把「被门限挡下」
+        # 和「发出去了但失败」都返回 False —— 汇总行于是把
+        # **压根没发出去**说成「failed」。实测(r99 修之前):
+        #
+        #     hit 有 severity 吗: False          <- CorrelationHit 根本没这字段
+        #     -> '[i] notified 0/1 correlation(s) (1 failed)'
+        #
+        # 那不是投递失败,是通知在发出**之前**就没了。用户看到这个会去查
+        # 网络、查 token、查 webhook 地址 —— 而真正的原因是门限。
+        #
+        # 所以这里先问一遍门限,把两种「没发出去」分开报:
+        # skipped = 被门限挡下(配置如此,不是故障)
+        # failed  = 真的尝试了但没成(网络/服务端)
+        if not cfg.should_notify(payload.get("severity", "info")):
+            skipped += 1
+            continue
+        try:
+            if notify_correlation(cfg, payload):
+                ok += 1
+            else:
+                failed += 1
+        except Exception as e:  # 单条失败不该中断整批
+            log.warning("notify_correlation(%s) failed: %s",
+                        getattr(h, "rule_name", "?"), e)
+            failed += 1
+    line = f"[i] notified {ok}/{len(hits)} correlation(s)"
+    if total is not None and total > len(hits):
+        line += (f" —— 共命中 {total} 条,按 --limit 只推了前 {len(hits)} 条,"
+                 f"其余 {total - len(hits)} 条**没有推**"
+                 f"(它们在命令输出和 correlations 表里)")
+    if skipped:
+        line += (f" ({skipped} 条低于 min_severity={cfg.min_severity!r},"
+                 f"**没有尝试发送**)")
+    if failed:
+        line += f" ({failed} failed)"
+    return line
 
 
 def cmd_monitor_add(args) -> int:
@@ -506,6 +814,11 @@ def cmd_monitor_add(args) -> int:
     if args.interval is not None and args.interval <= 0:
         print(f"[!] --interval must be > 0 (got {args.interval})", file=sys.stderr)
         return 2
+    # r97:工作区不存在就停手。`Storage()` 会**静默自动创建**工作区,
+    # 所以拼错一个 `-w` 的实测后果不是「报错」,而是磁盘上凭空多出一个
+    # 垃圾工作区,并且它会出现在之后每一次 `workspace list` 里。
+    if _ensure_workspace_exists(args.workspace):
+        return 1
     storage = Storage(workspace=args.workspace)
     m = Monitor(storage)
     try:
@@ -519,6 +832,8 @@ def cmd_monitor_add(args) -> int:
 
 def cmd_monitor_list(args) -> int:
     from .core.monitor import Monitor
+    if _ensure_workspace_exists(args.workspace):
+        return 1
     storage = Storage(workspace=args.workspace)
     monitors = Monitor(storage).list()
     if not monitors:
@@ -527,12 +842,31 @@ def cmd_monitor_list(args) -> int:
     print(f"[i] {len(monitors)} monitor(s):")
     for m in monitors:
         status = "✓" if m.get("enabled") else "✗"
-        print(f"  [{status}] #{m['id']} {m['target']:30} type={m['monitor_type']:10} interval={m['interval_seconds']}s last_run={m.get('last_run_at') or 'never'}")
+        # `last_change_count` 一起显示:r54 之前它被写进去了却**零消费点**
+        # (全项目只在 schema 和那条 UPDATE 里出现过),所以既没人能确认它
+        # 写对了,也没人能发现它写错了。r50 的教训是「只进日志不够,要落在
+        # 用户下次还会看的地方」—— 这一列本来就存在,只是没人看。
+        #
+        # 没跑过的显示 `never` 而不是 0:那一列的 schema DEFAULT 是 0,
+        # 而「从没跑过」和「跑了、这轮没变更」是两回事,都印 0 就把前者
+        # 伪装成了后者 —— 用户会以为这个 target 已经监控过了。
+        if m.get("last_run_at") is None:
+            changes_txt = "never"
+        else:
+            changes_txt = str(m.get("last_change_count") or 0)
+        print(f"  [{status}] #{m['id']} {m['target']:30} type={m['monitor_type']:10} "
+              f"interval={m['interval_seconds']}s last_run={m.get('last_run_at') or 'never'} "
+              f"changes={changes_txt}")
     return 0
 
 
 def cmd_monitor_remove(args) -> int:
     from .core.monitor import Monitor
+    # r97:见 `cmd_monitor_add` 的同一段注释。删除命令去**建出**一个工作区
+    # 尤其荒唐 —— 实测 `monitor remove nosuch -w TYPO` 会打印
+    # 「workspace 'TYPO' created」并留下一个持久垃圾目录。
+    if _ensure_workspace_exists(args.workspace):
+        return 1
     storage = Storage(workspace=args.workspace)
     m = Monitor(storage)
     arg = str(args.id_or_target).strip()
@@ -555,6 +889,10 @@ def cmd_monitor_remove(args) -> int:
 
 def cmd_monitor_enable(args) -> int:
     from .core.monitor import Monitor
+    # r97:见 `cmd_monitor_add` 的同一段注释。实测这一条尤其荒唐 ——
+    # 它一边打印「monitor #1 not found」,一边把拼错的工作区建了出来。
+    if _ensure_workspace_exists(args.workspace):
+        return 1
     storage = Storage(workspace=args.workspace)
     enabled = not args.disable
     ok = Monitor(storage).enable(args.id, enabled)
@@ -565,19 +903,317 @@ def cmd_monitor_enable(args) -> int:
     return 2
 
 
+# 给人看的资产标识:hash 前缀对人没有意义,而身份字段本来就在快照里。
+# 认不出来就回退到 hash —— 宁可难看,也不能什么都不显示。
+_ASSET_LABEL_FIELDS = {
+    "domain": ("domain",),
+    "host": ("host", "ip"),
+    "port": ("ip", "port", "protocol"),
+    "site": ("url",),
+    "finding": ("cve", "title", "description"),
+}
+
+# `diff` 为 NULL 的**正常**情形:这两种变更本来就只有单边快照,没有可比的
+# 另一边。写明白是为了让「本来就没有」和「该有却没存下来」在输出上分得开。
+_SINGLE_SIDED = {
+    "NEW_ASSET": "首次入库,只有 after 快照 —— 本来就没有 before 可比",
+    "DISAPPEARED": "资产消失,只有 before 快照 —— 本来就没有 after 可比",
+}
+
+
+def _row_json(row: dict, key: str) -> dict:
+    """把一行里的 JSON 文本列读成 dict;读不出来就返回空 dict
+
+    读不出来**不抛** —— 展示层因为一条坏数据就整个崩掉,那是拿报表换进程。
+    """
+    raw = row.get(key)
+    if not raw:
+        return {}
+    try:
+        v = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return v if isinstance(v, dict) else {}
+
+
+def _change_label(storage, row: dict, cache: dict | None = None) -> str:
+    """这一行是人看的资产标识
+
+    ## 为什么不直接用 hash 前缀
+
+    `68cd3922cdc45da2` 对人没有意义,而身份字段本来就在库里。
+
+    ## 为什么**查表优先**,快照只当兜底
+
+    字段级变更的 `before_value`/`after_value` **只装变动的那一个字段**
+    (`{"ip": "2.2.2.2"}`),里面没有资产身份。只看快照的话,host 的
+    标识会退化成 `ip` —— 而 ip 正是会变的那个字段,于是「标识」每次
+    都跟着变,比给个稳定 hash 还误导人。所以顺序是:表 → 快照 → hash。
+
+    代价:表里是**当前**值,不是变更当时的值。身份字段(host/domain/url)
+    本身是稳定的,所以这不构成问题;真变了的话,变的是被报告的那个字段。
+
+    查不到就往下退,三级都不抛 —— 展示层因为一条坏数据崩掉不值当。
+    但「退」不等于「闷着」:行不存在是正常的(资产可能已删),静默;
+    **SQL 报错**(标识列名写错 / 表没了)要 `log.warning` —— 实测过这条
+    退化路径,旧代码的 `except: pass` 让它零警告地退化成 hash。
+    """
+    h = row.get("asset_hash", "")
+    at = row.get("asset_type", "")
+    key = (at, h)
+    fields = _ASSET_LABEL_FIELDS.get(at, ())
+    if cache is not None and key in cache:
+        return cache[key]
+
+    def _found(v) -> str:
+        if cache is not None:
+            cache[key] = str(v)
+        return str(v)
+
+    table = _ASSET_TYPES_TO_TABLE.get(at)
+    if table and fields:
+        try:
+            with storage._conn() as conn:
+                got = conn.execute(
+                    f"SELECT {', '.join(fields)} FROM {table} WHERE hash = ?",
+                    (h,)).fetchone()
+        except Exception as e:      # noqa: BLE001
+            # 静默降级比降级本身更坏。实测:标识列名写错 → SQL 抛
+            # OperationalError → 旧的 `except: pass` 全吞 → 输出退化成
+            # hash 前缀,全程零警告,用户只会以为「标识本来就长这样」。
+            # 注意这和「行不存在」(`got is None`)是两回事:后者是正常
+            # 的(资产可能已删),走下面的快照兜底,不算异常。
+            log.warning(
+                "monitor changes: 读 %s 的标识列 %s 失败(%s: %s),"
+                "标识回退到快照/hash —— 列名写错或表结构变了?",
+                table, ", ".join(fields), type(e).__name__, e)
+            got = None
+        if got:                      # None = 行不存在,正常,静默往下退
+            for f in fields:
+                v = got[f]
+                if v not in (None, ""):
+                    return _found(v)
+    for src in ("after_value", "before_value"):
+        payload = _row_json(row, src)
+        for f in fields:
+            v = payload.get(f)
+            if v not in (None, ""):
+                return _found(v)
+    return str(h)[:16]
+
+
+def _change_lines(row: dict) -> list[str]:
+    """一行变更的详情,可能有多行(多字段各一行)
+
+    ## 为什么 NULL 的 diff 要写明白,而不是显示成空
+
+    `NEW_ASSET` / `DISAPPEARED` 只有一个快照,`diff` 是 NULL 是**正常的**。
+    如果只是什么都不显示,那「本来就没有可比的」和「本该存却没存下来」
+    看起来一模一样 —— 后者是 bug,前者是设计。分不开就等于看不见。
+    """
+    raw = row.get("diff")
+    if not raw:
+        ct = row.get("change_type", "")
+        return ["(无字段级 diff:" + _SINGLE_SIDED.get(
+            ct, "这一条本该有 diff 却没存下来 —— 这是异常") + ")"]
+    try:
+        d = json.loads(raw)
+    except (TypeError, ValueError):
+        return ["(diff 解析不出来,原样无法展示)"]
+    if not isinstance(d, dict) or not d:
+        return ["(diff 是空的)"]
+    out = []
+    for field, ch in d.items():
+        if not isinstance(ch, dict) or "before" not in ch or "after" not in ch:
+            out.append(f"{field}: (结构异常,渲染不了)")
+            continue
+        out.append(f"{field}: {_fmt(ch['before'])} → {_fmt(ch['after'])}")
+    return out
+
+
+def _fmt(v) -> str:
+    """一个值怎么印给人看。None 印成 ∅ 而不是 None —— 后者像 bug"""
+    if v is None:
+        return "∅"
+    if v == "":
+        return "(空串)"
+    s = str(v)
+    return s if len(s) <= 60 else s[:57] + "..."
+
+
+def _split_identity(asset_type: str, value: str) -> tuple:
+    """`--asset` 给的名字 → `_ASSET_IDENTITY` 要的分段身份
+
+    ## 为什么不「看着像 hash 就当 hash」
+
+    那是个启发式,而启发式猜错时**不报错**:一个恰好是 16 位十六进制的域名
+    会被当成 hash,于是查出来是空的,用户以为「它没变过」。所以规则写成
+    无歧义的两条:给了 `--type` 就一定按名字解释;没给就只接受 16 位 hash,
+    不是就报错并告诉人加 `--type`。
+
+    ## port 为什么要 rsplit
+
+    用户的写法是 `1.1.1.1:443` 或 `web.example.com:443`,而 IPv6 是
+    `2001:db8::1:443` —— 从左边切第一个冒号会把地址切烂。从**右边**切
+    最后一段才是端口,这也是唯一对三种写法都成立的位置。
+
+    ## findings 为什么直接拒绝
+
+    它的身份是 target、finding_type、title 三段用竖线拼的,而用户心里的
+    「这个 finding」是 `target`。要用户背内部格式才能过滤一个功能,那不叫
+    功能 —— 宁可明说「这条不支持按名字,给裸 hash」。
+    """
+    if asset_type in ("domain", "host", "site"):
+        return (value,)
+    if asset_type == "port":
+        host, sep, port = value.rpartition(":")
+        if not sep or not host or not port.isdigit():
+            raise ValueError(
+                f"port 的 --asset 写法是 host:port(比如 1.1.1.1:443),"
+                f"给的是 {value!r}")
+        return (host, port)
+    raise ValueError(
+        f"--type {asset_type} 不支持按名字过滤(身份是多段复合的),"
+        f"请直接给 16 位资产 hash")
+
+
+def _resolve_asset_hash(storage, value: str, asset_type: str | None) -> str:
+    """`--asset` 的取值 → 资产 hash
+
+    算 hash 的形状归 `db.storage._ASSET_IDENTITY` 一家,这里只负责把
+    **用户写的一个字符串**拆成它要的那几段 —— 拆错了报出来,不猜。
+    """
+    if not asset_type:
+        v = value.strip().lower()
+        if len(v) == 16 and all(c in string.hexdigits for c in v):
+            return v
+        raise ValueError(
+            f"--asset {value!r} 不带 --type 时只能是 16 位资产 hash;"
+            f"要按名字过滤请加 --type(如 --type host)")
+    from .db.storage import compute_asset_hash
+    table = _ASSET_TYPES_TO_TABLE[asset_type]
+    parts = _split_identity(asset_type, value)
+    return compute_asset_hash(storage.workspace_id, table, *parts)
+
+
 def cmd_monitor_changes(args) -> int:
-    from .core.monitor import list_changes
+    from .core.monitor import count_changes, list_changes
     if args.limit is not None and args.limit <= 0:
         print(f"[!] --limit must be > 0 (got {args.limit})", file=sys.stderr)
         return 2
+    if _ensure_workspace_exists(args.workspace):
+        return 1
     storage = Storage(workspace=args.workspace)
-    rows = list_changes(storage, asset_type=args.type, change_type=args.change_type, limit=args.limit)
+    asset_hash = None
+    if getattr(args, "asset", None):
+        try:
+            asset_hash = _resolve_asset_hash(storage, args.asset, args.type)
+        except ValueError as e:
+            print(f"[!] {e}", file=sys.stderr)
+            return 2
+    since = None
+    # `is not None` 而不是真值判断:`--since ''` 看着像「用户要求了个时间窗」,
+    # 而真值判断会把它当成「没给」,于是**静默返回全部** —— 用户以为筛过了。
+    # 空串该被 _parse_since 当成非法值拒掉,而不是悄悄放宽。
+    if getattr(args, "since", None) is not None:
+        try:
+            since = _parse_since(args.since)
+        except ValueError as e:
+            print(f"[!] invalid --since '{args.since}': {e}", file=sys.stderr)
+            print("    valid: '7d' / '24h' / '2026-10-01'", file=sys.stderr)
+            return 2
+    rows = list_changes(storage, asset_type=args.type,
+                        change_type=args.change_type, limit=args.limit,
+                        asset_hash=asset_hash, since=since)
+    if getattr(args, "json", False):
+        # 机器消费:payload 原样带出去,不经过给人看的那些渲染/截断。
+        # 想要 diff 就自己 parse,想要标签就自己取。
+        cache: dict = {}   # (asset_type, hash) -> 标识
+        print(json.dumps(
+            [{"change_type": r["change_type"], "asset_type": r["asset_type"],
+              "asset_hash": r["asset_hash"],
+              "label": _change_label(storage, r, cache),
+              "detected_at": r.get("detected_at", ""),
+              "before_value": _row_json(r, "before_value"),
+              "after_value": _row_json(r, "after_value"),
+              "diff": _row_json(r, "diff"), "detail": _change_lines(r)}
+             for r in rows], ensure_ascii=False, indent=2))
+        return 0
     if not rows:
         print("[i] no changes")
         return 0
-    print(f"[i] {len(rows)} change(s):")
+    # 文案和判定都走共用函数(r56):r55 刚在**那里**手写了一份同样的提示,
+    # 而 `--limit` 截断是一类横切问题 —— 两处手抄同一段话,迟早漂(决策 #9)。
+    total = len(rows)
+    if _needs_total(len(rows), args.limit):
+        total = count_changes(storage, asset_type=args.type,
+                              change_type=args.change_type,
+                              asset_hash=asset_hash, since=since)
+    notice = _limit_notice_text(len(rows), total, args.limit, "change")
+    if notice:
+        print(notice)
+    cache: dict = {}
     for r in rows:
-        print(f"  [{r['change_type']:18}] {r['asset_type']:10} {r['asset_hash'][:16]} {r.get('detected_at', '')}")
+        print(f"  [{r['change_type']:18}] {r['asset_type']:10} "
+              f"{_change_label(storage, r, cache):32} {r.get('detected_at', '')}")
+        for line in _change_lines(r):
+            print(f"      {line}")
+    return 0
+
+
+def cmd_monitor_prune(args) -> int:
+    """删掉过期的变更记录
+
+    ## 为什么默认不删
+
+    删除的安全默认值是「什么都不做」。给删除命令加一个 `--dry-run` 标志,
+    等于**默认就删** —— 少打一个字母就没了。所以这里是反过来的:默认只数,
+    真删必须显式加 `--yes`。
+
+    ## 工作区必须已经存在(r97)
+
+    一个**清理**命令凭空建出一个工作区是说不通的:实测
+    `monitor prune --older-than 30d -w TYPO` 报 **rc=0** 说成功,
+    同时在磁盘上留下一个叫 TYPO 的垃圾工作区。没有东西可清理的时候,
+    正确答案是「没有可清理的」,不是「顺手建一个」。
+
+    ## 为什么必须把「基线判据会变」说出来
+
+    `is_baseline_noise` 读的就是这张表,而且读**全部历史**。删掉旧行等于
+    把它的输入截短:很久以前抖过几次的资产,清理之后就不再被当成抖动。
+    这大概率是好事(那本来就是记着的局限),但它意味着**同一批数据在清理
+    前后会得到不同的答案** —— 「误报率实测」这类测量因此在某天悄悄失去
+    可比性。所以这里明说,而不是让用户自己发现。
+    """
+    from .core.monitor import prune_changes
+    # r97:工作区必须已经存在。理由见 docstring 那段 —— 清理命令凭空建出
+    # 一个工作区,还报 rc=0。
+    if _ensure_workspace_exists(args.workspace):
+        return 1
+    storage = Storage(workspace=args.workspace)
+    try:
+        cutoff = _parse_since(args.older_than)
+    except ValueError as e:
+        print(f"[!] invalid --older-than '{args.older_than}': {e}",
+              file=sys.stderr)
+        print("    valid: '90d' / '720h' / '2026-07-01'", file=sys.stderr)
+        return 2
+    dry = not args.yes
+    try:
+        r = prune_changes(storage, cutoff, dry_run=dry)
+    except ValueError as e:
+        print(f"[!] {e}", file=sys.stderr)
+        return 2
+    verb = "会删掉" if dry else "已删掉"
+    print(f"[i] {verb} {r['matched']} 条早于 {r['cutoff']} 的变更记录"
+          f"(workspace={args.workspace})")
+    if dry:
+        print(f"[i] 这是试算,什么都没删。要真删请加 --yes")
+    if r["matched"]:
+        print(f"[!] 注意:这会**改变基线判据的输入**。`is_baseline_noise` 读的是"
+              f"这张表的全部历史,清理掉 {r['deleted'] if not dry else r['matched']} "
+              f"条之后,很久以前抖过几次的资产可能不再被当成抖动 ——"
+              f"「误报率实测」这类测量在清理前后不可直接比较。")
     return 0
 
 
@@ -589,6 +1225,13 @@ def cmd_tui(args) -> int:
 
 def cmd_risk_summary(args) -> int:
     from .core.risk_score import risk_summary
+    # 与同族的 cmd_risk_top 保持一致:只读命令不静默建工作区。
+    # 实测零工作区下 `risk top` rc=1 报 workspace not found,
+    # 而 `risk summary` 却 rc=0、静默建出 default、并打印一份
+    # 「全 0 概览」—— 同一份数据、同一个 workspace 名下两条路
+    # 给出互相矛盾的答案,用户没法判断自己的数据是不是真没了。
+    if _ensure_workspace_exists(args.workspace):
+        return 1
     storage = Storage(workspace=args.workspace)
     s = risk_summary(storage)
     print(f"[+] workspace '{args.workspace}' 风险概览")
@@ -622,7 +1265,7 @@ def cmd_risk_top(args) -> int:
     storage = Storage(workspace=args.workspace)
     risks = compute_asset_risks(storage)[:limit]
     if not risks:
-        print("[i] no risks (run 'arl-lite run' + 'arl-lite correlate' first)")
+        print("[i] no risks (run 'arl-lite run -t <target>' + 'arl-lite correlate' first)")
         return 0
     print(f"[+] top {len(risks)} high-risk assets:")
     use_color = _use_color()
@@ -656,6 +1299,129 @@ def cmd_tools_list(args) -> int:
             desc = (getattr(cls, "description", "") or "")[:50]
             print(f"    - {name:12} v{ver}  tools=[{tools}]  {desc}")
     return 0
+
+
+def _resolve_bench_out(args, default_path: str) -> tuple:
+    """两个 bench 共用:决定报告往哪写,以及**要不要写**。
+
+    ## 为什么默认不写
+
+    默认路径 `docs/PERF_BASELINE.md` / `docs/FP_RATE.md` 是**版本库里已提交的
+    文件**(`git ls-files` 确认)。早先这里直接 `write_report(默认路径)`,
+    于是任何人跑一次 `arl-lite perf-bench --scale small` 就会把 medium 档的
+    基线整表换成 small 档 —— 退出码 0,一句提示都没有,而 `git diff` 出来是一张
+    看起来完全正常的表格。最要命的是 `core/perf_bench.py` 的用法段**自己**
+    写着「`arl-lite perf-bench --scale small` 快速冒烟」:照文档走就毁基线。
+
+    所以安全默认值取「什么都不做」:不写,说清为什么不写、怎么才能写,退出码非 0。
+    数字照样打在 stdout(测量本身没白做),毁的是文件不是信息。
+    写完再警告等于已经毁了 —— 和 r53 那次「max(0) 把丢失夹成 0」是同一个形状,
+    顺序不能反。
+
+    返回 (路径 or None, 旧档位 or None, 是否显式 --in-place)。
+    """
+    from pathlib import Path as _P
+
+    explicit = (getattr(args, "out", "") or "").strip()
+    if explicit:
+        return _P(explicit), None, False
+    if not getattr(args, "in_place", False):
+        return None, None, False
+    path = _P(default_path)
+    old_scale = None
+    if path.exists():
+        # 读旧基线记的档位,只在规模档这一层做对照 —— 别的行随实现演进会变,
+        # 拿它们做 diff 只会天天误报。
+        for line in path.read_text(encoding="utf-8").splitlines()[:8]:
+            if "规模档" in line:
+                parts = line.split("**")
+                if len(parts) >= 2:
+                    old_scale = parts[1]
+                break
+    return path, old_scale, True
+
+
+def _refuse_to_clobber(default_path: str) -> None:
+    print(f"[!] 未写入 {default_path} —— 那是版本库里已提交的基线,默认不覆盖。",
+          file=sys.stderr)
+    print("    要写到别处:  --out <路径>", file=sys.stderr)
+    print(f"    确定要覆盖它: --in-place", file=sys.stderr)
+    print("    (档位不同的覆盖会另外提示 —— 不同规模的数字不可比)", file=sys.stderr)
+
+
+def cmd_perf_bench(args) -> int:
+    """跑核心流水线性能基线,默认只测不写;要写得显式说。
+
+    全程离线且不碰网络:负载是按真实 schema 形状合成的数据,
+    测的是存储写入 / 规则引擎 / 置信度 / 风险打分这四段。
+    测不到的部分(子域名枚举、HTTP 探测)写在报告的「局限」里。
+
+    默认跑 3 次取中位数 —— 单次测量会被 GC 和磁盘缓存干扰,
+    那种抖动画进趋势线只会误导下一个人。
+    """
+    from .core import perf_bench as pb
+
+    scale = getattr(args, "scale", "medium") or "medium"
+    repeat = int(getattr(args, "repeat", 3) or 3)
+    rep = pb.run_repeated(scale=scale, repeat=repeat)
+
+    out, old_scale, in_place = _resolve_bench_out(args, "docs/PERF_BASELINE.md")
+    if out is None:
+        _refuse_to_clobber("docs/PERF_BASELINE.md")
+
+    print(f"[i] scale={rep.scale}  repeat={repeat}  "
+          f"{rep.total_rows} 行  {rep.total_seconds:.2f}s  "
+          f"峰值 {rep.peak_kb / 1024:.1f} MB")
+    print(f"[i] {rep.rules} 条规则 / {rep.hits} 个命中")
+    for p in sorted(rep.phases, key=lambda x: -x.seconds)[:5]:
+        rps = f"{p.rows_per_sec:,.0f} 行/s" if p.rows_per_sec else "-"
+        print(f"   {p.name:36s} {p.seconds:7.3f}s  {rps}")
+
+    if out is None:
+        return 2
+    if in_place and old_scale and old_scale != rep.scale:
+        # 只警告不拦:有人可能就是要换档重设基线(比如团队固定跑 small)。
+        # 拦死会逼人改去手写文件,那更糟。但必须喊出来 —— 规模不同的数字
+        # 和原基线不可比,这是基线存在的意义。
+        print(f"[!] 旧基线是 {old_scale} 档,这次是 {rep.scale} 档 —— "
+              f"两者不可比,趋势线会断。", file=sys.stderr)
+    pb.write_report(out, rep)
+    print(f"[+] 报告已写入 {out}")
+    return 0
+
+
+def cmd_fp_bench(args) -> int:
+    """离线跑规则集误报率基准,产出 docs/FP_RATE.md
+
+    全程离线:样本是人工构造的受控数据,不需要真实目标、不需要网络。
+    """
+    from .core import fp_bench as fb
+
+    results = fb.run_bench()
+    rep = fb.analyze(results)
+
+    out, _, _ = _resolve_bench_out(args, "docs/FP_RATE.md")
+    if out is None:
+        _refuse_to_clobber("docs/FP_RATE.md")
+
+    print(f"[i] {len(results)} case(s) run, rules={len(rep.per_rule)}")
+    print(f"[i] 误报率 {rep.fp_rate:.1%} ({rep.total_fp}/{rep.total_opportunities})"
+          f"  召回 {rep.recall:.1%} ({rep.total_tp}/{rep.total_tp + rep.total_fn})")
+    for r in results:
+        if r.false_positives:
+            print(f"  FP {r.case.name}: {', '.join(sorted(r.false_positives))}")
+        if r.false_negatives:
+            print(f"  FN {r.case.name}: {', '.join(sorted(r.false_negatives))}")
+        if r.error:
+            print(f"  !! {r.case.name}: {r.error}")
+    # 崩掉的样本必须让命令失败 —— 少跑几个样本却报 0% 误报率,
+    # 比误报本身更危险
+    failed = any(r.error for r in results)
+    if out is None:
+        return 1 if failed else 2
+    fb.write_report(out, rep)
+    print(f"[+] report written to {out}")
+    return 1 if failed else 0
 
 
 def cmd_notify_test(args) -> int:
@@ -697,6 +1463,49 @@ def cmd_notify_test(args) -> int:
     return 1
 
 
+def _watch_state_file(workspace: str) -> Path:
+    """watch 目标清单的落盘路径 —— **按工作区分目录**。
+
+    原来 4 个 cmd_watch_* 各自硬编码 `~/.arl-lite/watch/watch.json`,
+    两处手抄必然漂(契约只能有一个来源)。r70 之后按工作区切分:
+        ~/.arl-lite/watch/<workspace>/watch.json
+
+    为什么必须切分:目标清单原本是全局的、结果却写进工作区。
+    两个工作区并存时,`watch list` 把所有目标混在一起列(实测),
+    而 `watch start` 把它们**全部**写进 default ——
+    用户没法让 A 工作区的目标只跑在 A 上,那比没有工作区更糟。
+    `Watcher` 本身接受任意 storage(arl_lite/core/watcher.py),
+    能力一直都在,缺的只是 CLI 这层参数与路径。
+
+    迁移按 r62 的规矩:**什么都不做**。旧路径还在就不动它,
+    用户显式跑 `watch add` 时才写新路径 —— 不静默搬数据,
+    免得搬错了用户连原来那份都找不回来。
+    """
+    return Path.home() / ".arl-lite" / "watch" / workspace / "watch.json"
+
+
+def _legacy_watch_state_file() -> Path:
+    """r70 之前那一份全局 watch.json —— 只用来提示,不再读写。"""
+    return Path.home() / ".arl-lite" / "watch" / "watch.json"
+
+
+def _warn_about_legacy_watch_state(workspace: str) -> None:
+    """旧格式还在就提醒一次,但**不自动迁移**(r62:默认什么都不做)。"""
+    legacy = _legacy_watch_state_file()
+    if not legacy.exists():
+        return
+    try:
+        if json.loads(legacy.read_text(encoding="utf-8")):
+            print(f"[i] 检测到旧格式的 watch 清单 {legacy}。", file=sys.stderr)
+            print(f"    watch 现在按工作区存,本工作区({workspace})的清单是:",
+                  file=sys.stderr)
+            print(f"        {_watch_state_file(workspace)}", file=sys.stderr)
+            print("    旧文件不会自动迁移(免得搬错后连原来那份都找不回来)。"
+                  "想沿用它请自行拷贝。", file=sys.stderr)
+    except Exception:
+        pass
+
+
 def cmd_watch_add(args) -> int:
     """添加 watch target"""
 
@@ -708,11 +1517,9 @@ def cmd_watch_add(args) -> int:
         print(f"[!] watch target too long: {len(args.target)} > 1000", file=sys.stderr)
         return 2
 
-    storage = Storage(workspace=args.workspace if hasattr(args, "workspace") else "default")
-    # 单进程内:复用全局 watcher 状态(简化)
-    state_dir = Path.home() / ".arl-lite" / "watch"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    state_file = state_dir / "watch.json"
+    _warn_about_legacy_watch_state(args.workspace)
+    state_file = _watch_state_file(args.workspace)
+    state_file.parent.mkdir(parents=True, exist_ok=True)
 
     targets = []
     if state_file.exists():
@@ -729,10 +1536,17 @@ def cmd_watch_add(args) -> int:
         "target": args.target,
         "modules": modules or ["dns", "whois", "subfinder", "crtsh"],
         "interval_seconds": args.interval,
+        # 运行态也落盘:之前只存 3 个字段,进程重启后 watcher 不知道
+        # 上次什么时候跑的,会立刻重复扫一遍,周期越短越容易打爆数据源
+        "last_run": None,
+        "next_run": None,
+        "last_status": None,
     }
-    targets = [t for t in targets if t["target"] != args.target]
+    targets = [t for t in targets if t.get("target") != args.target]
     targets.append(entry)
-    state_file.write_text(json.dumps(targets, indent=2, ensure_ascii=False))
+    state_file.write_text(
+        json.dumps(targets, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     print(f"[+] watch: added {args.target} (interval={args.interval}s)")
     print(f"    state: {state_file}")
     return 0
@@ -740,15 +1554,17 @@ def cmd_watch_add(args) -> int:
 
 def cmd_watch_remove(args) -> int:
     """移除 watch target"""
-    state_dir = Path.home() / ".arl-lite" / "watch"
-    state_file = state_dir / "watch.json"
+    _warn_about_legacy_watch_state(args.workspace)
+    state_file = _watch_state_file(args.workspace)
     if not state_file.exists():
         print("[!] no watch state")
         return 1
-    targets = json.loads(state_file.read_text())
+    targets = json.loads(state_file.read_text(encoding="utf-8"))
     before = len(targets)
-    targets = [t for t in targets if t["target"] != args.target]
-    state_file.write_text(json.dumps(targets, indent=2, ensure_ascii=False))
+    targets = [t for t in targets if t.get("target") != args.target]
+    state_file.write_text(
+        json.dumps(targets, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     if len(targets) < before:
         print(f"[+] removed {args.target}")
         return 0
@@ -757,13 +1573,52 @@ def cmd_watch_remove(args) -> int:
 
 
 def cmd_watch_list(args) -> int:
-    """列出 watch targets"""
-    state_dir = Path.home() / ".arl-lite" / "watch"
-    state_file = state_dir / "watch.json"
+    """列出 watch targets
+
+    ## r97 撤回了加在这里的守卫,原因记在这里免得下一个人再加回来
+
+    r97 的初版结论是「`watch list -w prod` 报 rc=0 +『没有 watch target』
+    是一句假话」,于是给本命令加了 `_ensure_workspace_exists` 守卫。
+    **那个结论是错的。** 实测:
+
+        watch add a.example.com -w teamA   →  rc=0
+          建出 ~/.arl-lite/watch/teamA/watch.json
+          **工作区目录一个都没建**
+
+    watch 全系的 `-w` 是**给 watch 清单用的标签**,不是工作区引用 ——
+    r70 早就把 `cmd_watch_add` 里那个没用的 `Storage()` 删了。
+    在这个契约下,`watch list -w prod` 说「工作区 'prod' 下没有 watch
+    target」是**真的**:那个标签底下确实一个 target 都没有。
+    工具没法知道用户想的是 `default`,那不叫说谎,那叫照实回答。
+
+    守卫加在这里还制造了一个**自相矛盾**,是它被撤回的直接原因:
+
+        watch add -w teamA   → rc=0,清单落盘
+        watch list -w teamA  → rc=1,「workspace not found」
+
+    同一个名字,加得进去列不出来,而清单就在磁盘上。
+    **加进去能成功的名字,必须列得出来。**
+
+    真要统一退出码,该动的是 `cmd_watch_start`(清单不存在时它 rc=1)，
+    而不是把 `list` 改成拒绝。那是另一件事,不在 r97 里做 ——
+    硬改会让 `test_legacy_state_is_reported_but_never_moved` 变红，
+    而「清单为空」本来就不是错误状态。
+    """
+    _warn_about_legacy_watch_state(args.workspace)
+    state_file = _watch_state_file(args.workspace)
     if not state_file.exists():
-        print("[i] no watch targets (use `arl-lite watch add` first)")
+        # 「占位符 + 真实值」混排会拼出一条根本不存在的命令:
+        # 建议判据(test_cli_advice_commandable.py)会抠出
+        # `arl-lite watch add <target> -w <workspace>` 并拿占位符去重建,
+        # 拼出 `watch add first -w ...`,argparse 报「多余参数 ['first']」。
+        # 那不是判据的毛病 —— 是这条文案本来就不可执行。
+        # 拆成两步写清楚:先说做什么,再说带哪个参数。
+        print(f"[i] 工作区 {args.workspace!r} 下没有 watch target", file=sys.stderr)
+        print("    先添加一个(两步):", file=sys.stderr)
+        print("        arl-lite watch add <目标域名>", file=sys.stderr)
+        print(f"        arl-lite watch list -w {args.workspace}", file=sys.stderr)
         return 0
-    targets = json.loads(state_file.read_text())
+    targets = json.loads(state_file.read_text(encoding="utf-8"))
     if not targets:
         print("[i] watch list empty")
         return 0
@@ -772,6 +1627,18 @@ def cmd_watch_list(args) -> int:
         modules = ",".join(t.get("modules", []) or []) or "(default)"
         interval = t.get("interval_seconds", 86400)
         print(f"  - {t['target']:30} modules={modules} interval={interval}s")
+        last_run = t.get("last_run")
+        if last_run:
+            print(f"    last_run={last_run} status={t.get('last_status') or '-'}")
+        # 截断留痕要出现在用户**还会再看的地方**,不只在日志里。
+        # 累计丢弃数不为 0 就说明有变更永远没进 asset_changes(r50:丢掉是
+        # 永久的,因为下一轮的检测窗口起点已经越过它们的 first_seen)。
+        dropped = t.get("dropped_change_count") or 0
+        if dropped:
+            last_dropped = t.get("last_dropped_change_count") or 0
+            print(f"    [!] 累计有 {dropped} 条变更因写入上限没进 asset_changes"
+                  f"(最近一轮 {last_dropped} 条,且不会补上)"
+                  f" —— `monitor changes` 看到的记录是不完整的")
     return 0
 
 
@@ -779,18 +1646,26 @@ def cmd_watch_start(args) -> int:
     """启动 watch 调度器(同步跑,Ctrl+C 退出)"""
     from .core.watcher import Watcher
 
-    state_dir = Path.home() / ".arl-lite" / "watch"
-    state_file = state_dir / "watch.json"
+    # r70:这里原来写的是
+    #   `Storage(workspace=getattr(args, "workspace", "default"))`
+    # 而 watch 全系的 argparse **从来没注册过 -w** —— 那个属性永远不存在,
+    # getattr 兜底恒生效,于是 `watch start` 永远写进 default 工作区。
+    # 用户没有任何办法让它写去别处,而不报任何错(实测:
+    # `watch add example.com -w teamA` 直接 rc=2 unrecognized arguments,
+    #  那是 add 的表现;start 这边连参数都不认,只是默默写错地方)。
+    # 现在 -w 真的存在了,读它就是真的。
+    _warn_about_legacy_watch_state(args.workspace)
+    state_file = _watch_state_file(args.workspace)
     if not state_file.exists():
-        print("[!] no watch state")
+        print(f"[!] no watch state (workspace {args.workspace!r})")
         return 1
     targets_data = json.loads(state_file.read_text())
     if not targets_data:
-        print("[!] no watch targets")
+        print(f"[!] no watch targets (workspace {args.workspace!r})")
         return 1
 
-    storage = Storage(workspace=getattr(args, "workspace", "default"))
-    w = Watcher(storage)
+    storage = Storage(workspace=args.workspace)
+    w = Watcher(storage, state_path=state_file)
     skipped = 0
     for t in targets_data:
         # 历史坏 entry(如空 target)跳过并告警,不中断整个 watch
@@ -800,7 +1675,18 @@ def cmd_watch_start(args) -> int:
             skipped += 1
             continue
         try:
-            w.add(target, modules=t.get("modules"), interval_seconds=t.get("interval_seconds", 86400))
+            wt = w.add(
+                target,
+                modules=t.get("modules"),
+                interval_seconds=t.get("interval_seconds", 86400),
+            )
+            # 恢复持久化的运行态:不恢复的话 next_run 为空 → watcher 认为
+            # "从没跑过" → 重启后立刻重复扫一遍,把数据源打爆
+            if isinstance(t, dict):
+                for key in ("last_run", "next_run", "last_count", "run_count", "new_count"):
+                    val = t.get(key)
+                    if val is not None:
+                        setattr(wt, key, val)
         except (ValueError, TypeError) as e:
             log.warning(f"watch: skipping invalid entry {target!r}: {e}")
             skipped += 1
@@ -874,15 +1760,38 @@ def cmd_mcp(args) -> int:
 # ============================================
 
 def build_parser() -> argparse.ArgumentParser:
+    # r99:等级表从 notify 模块取,不在这里再抄一份。原来 `--min-severity`
+    # 的 choices 是手抄的字面量,而 `WebhookConfig` 的默认门限是另一个值 ——
+    # 同一个旋钮两个默认值(决策 #9)。
+    # 延迟 import:cli 不该为了建 parser 就把通知层拖进来。
+    from .notify.webhook import SEVERITY_ORDER
+    _SEVERITY_CHOICES = list(SEVERITY_ORDER)
     p = argparse.ArgumentParser(
         prog="arl-lite",
         description="灯塔 ARL 降级增强版:2G 内存友好的资产侦察工具",
     )
-    p.add_argument("--log-level", default="INFO", help="日志级别(默认: INFO)")
+    # r85:`--log-level` 原来没有 choices,靠 `getattr(logging, 值.upper(),
+    # logging.INFO)` 兜底。实测 `--log-level bogus` 的输出与 `--log-level INFO`
+    # **逐字相同**、rc=0、一个字都没提示 —— 用户打错字想开 DEBUG 排查问题,
+    # 却静默拿到 INFO。静默降级比降级本身更坏。
+    #
+    # `type=str.upper` 必须排在 `choices` 前面生效:argparse 先跑 type 再查
+    # choices,所以 `--log-level debug` 会被规范化成 "DEBUG" 之后才校验,
+    # 小写仍然合法(r85 实测过,别把它弄坏了)。而 `--log-level bogus`
+    # 变成标准的用法错误:rc=2,并列出全部合法值。
+    p.add_argument(
+        "--log-level", default="INFO", type=str.upper,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="日志级别,大小写均可(默认: INFO)",
+    )
     # 注:--workspace 不放全局,放每个子命令里,避免 argparse 冲突
     # 习惯上:`arl-lite run -t xxx -w foo` 这种写法要支持
 
     sub = p.add_subparsers(dest="command", required=True)
+
+    # devloop — 自持迭代协议
+    from .devloop.cli import add_devloop_parser
+    add_devloop_parser(sub)
 
     # run
     pr = sub.add_parser("run", help="跑一个扫描任务")
@@ -955,7 +1864,50 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("-w", "--workspace", help="工作空间名", default="default")
     pc.add_argument("-l", "--limit", type=int, default=50, help="最多显示多少条(>0)")
     pc.add_argument("--min-risk", type=int, default=0, help="最小风险等级(0-10)")
+    pc.add_argument(
+        "--notify", action="store_true",
+        help="把命中推给 webhook(需要 --webhook-url)",
+    )
+    pc.add_argument(
+        "--webhook-url", default="", help="webhook 地址(配合 --notify 使用)",
+    )
+    pc.add_argument(
+        "--webhook-provider", default="ntfy",
+        help="ntfy / slack / generic / local(默认 ntfy)",
+    )
     pc.set_defaults(func=cmd_correlate)
+
+    # fp-bench(离线误报率基准)
+    pfb = sub.add_parser(
+        "fp-bench",
+        help="离线跑规则集误报率基准(默认只测不写,加 --in-place 才写 docs/FP_RATE.md)",
+    )
+    pfb.add_argument("--out", default="", help="报告输出路径(不给就不写)")
+    pfb.add_argument(
+        "--in-place", action="store_true",
+        help="显式允许覆盖已提交的 docs/FP_RATE.md",
+    )
+    pfb.set_defaults(func=cmd_fp_bench)
+
+    # perf-bench(核心流水线性能基线)
+    ppb = sub.add_parser(
+        "perf-bench",
+        help="跑核心流水线性能基线(默认只测不写,加 --in-place 才写 docs/PERF_BASELINE.md)",
+    )
+    ppb.add_argument("--out", default="", help="报告输出路径(不给就不写)")
+    ppb.add_argument(
+        "--in-place", action="store_true",
+        help="显式允许覆盖已提交的 docs/PERF_BASELINE.md(档位不同会另外警告)",
+    )
+    ppb.add_argument(
+        "--scale", default="medium", choices=["small", "medium", "large"],
+        help="数据规模档(默认 medium)",
+    )
+    ppb.add_argument(
+        "--repeat", type=int, default=3,
+        help="跑几次取中位数(默认 3)。单次测量会被 GC 和磁盘缓存干扰",
+    )
+    ppb.set_defaults(func=cmd_perf_bench)
 
     # monitor(资产监控)
     pm = sub.add_parser("monitor", help="资产监控管理")
@@ -984,13 +1936,38 @@ def build_parser() -> argparse.ArgumentParser:
     pme.set_defaults(func=cmd_monitor_enable)
 
     pmc = pm_sub.add_parser("changes", help="看变更事件")
-    pmc.add_argument("-t", "--type", choices=["domain", "host", "port", "site", "finding"],
+    # 这两个 choices **从契约表派生**,不手写。
+    #
+    # 手写过,后果实测过:`--change-type ADDRESS_CHANGED` 被 argparse
+    # 直接拒绝(exit 2),而错误信息只列那 6 个旧值,看起来像是这个类型
+    # 根本不存在。同一张契约表当时有三份来源 —— `core/monitor.py`(真的)、
+    # `schema.sql` 的注释(已被测试钉住)、这里(没人管)。
+    # 同一张表有两个来源,迟早会漂;三个只是漂得更晚一点。
+    # 列表**不在** help 文本里再写一遍:argparse 的 usage 行本来就从
+    # `choices` 渲染出完整取值,再抄一份等于给自己造第二处会漂移的地方
+    # (r45 的第一版就正好栽在这:choices 派生了,help 却写死旧列表)。
+    pmc.add_argument("-t", "--type", choices=sorted(_ASSET_TYPES),
                     help="资产类型")
-    pmc.add_argument("-c", "--change-type", choices=["NEW_ASSET", "DISAPPEARED", "TITLE_CHANGED",
-                                                     "TECH_CHANGED", "FINGERPRINT_CHANGED", "STATUS_CHANGED"],
+    pmc.add_argument("-c", "--change-type", choices=list(CHANGE_TYPES),
                     help="变更类型")
     pmc.add_argument("-l", "--limit", type=int, default=50, help="最多显示多少条")
+    pmc.add_argument("--asset", help="只看这一个资产的变更。给名字要配 --type"
+                                    "(如 --type host --asset web.example.com);"
+                                    "不给 --type 时只接受 16 位 hash")
+    pmc.add_argument("--since", help="只看这个时间点之后的变更,如 7d / 24h / 2026-10-01")
+    pmc.add_argument("--json", action="store_true",
+                    help="输出 JSON(payload 原样,供机器消费)")
     pmc.add_argument("-w", "--workspace", help="工作空间名", default="default")
+
+    # 清理:默认只数不删(见 cmd_monitor_prune 的文档)
+    pmp = pm_sub.add_parser(
+        "prune", help="删掉过期的变更记录(默认只试算,加 --yes 才真删)")
+    pmp.add_argument("--older-than", required=True,
+                     help="删掉早于这个时间点的记录,如 90d / 720h / 2026-07-01")
+    pmp.add_argument("--yes", action="store_true",
+                     help="真的要删(不加就是试算)")
+    pmp.add_argument("-w", "--workspace", help="工作空间名", default="default")
+    pmp.set_defaults(func=cmd_monitor_prune)
     pmc.set_defaults(func=cmd_monitor_changes)
 
     # tui(交互式终端)
@@ -1096,7 +2073,10 @@ def build_parser() -> argparse.ArgumentParser:
     pnft = pnf_sub.add_parser("test", help="发测试通知")
     pnft.add_argument("--url", help="webhook URL")
     pnft.add_argument("--provider", default="generic", choices=["generic", "ntfy", "slack", "local"])
-    pnft.add_argument("--min-severity", default="info", choices=["info", "low", "medium", "high", "critical"])
+    pnft.add_argument("--min-severity", choices=list(_SEVERITY_CHOICES),
+                      default=_SEVERITY_CHOICES[0],
+                      help=(f"只发送不低于该等级的通知(默认 "
+                            f"{_SEVERITY_CHOICES[0]},与 WebhookConfig 同一个来源)"))
     pnft.add_argument("--timeout", type=int, default=10)
     pnft.set_defaults(func=cmd_notify_test)
 
@@ -1107,15 +2087,25 @@ def build_parser() -> argparse.ArgumentParser:
     pwaa.add_argument("target", help="目标域名/IP")
     pwaa.add_argument("-m", "--modules", help="逗号分隔 module 列表")
     pwaa.add_argument("--interval", type=int, default=86400, help="重跑间隔秒(默认 86400=24h)")
+    # r70:watch 全系补 -w。cmd_watch_start 一直在读 args.workspace,
+    # 而这里从来没注册过 —— 属性永远不存在,结果恒落 default 工作区。
+    pwaa.add_argument("-w", "--workspace", help="工作空间名", default="default")
     pwaa.set_defaults(func=cmd_watch_add)
     pwar = pwa_sub.add_parser("remove", help="移除 watch target")
     pwar.add_argument("target", help="目标")
+    pwar.add_argument("-w", "--workspace", help="工作空间名", default="default")
     pwar.set_defaults(func=cmd_watch_remove)
     pwal = pwa_sub.add_parser("list", help="列出 watch targets")
+    pwal.add_argument("-w", "--workspace", help="工作空间名", default="default")
     pwal.set_defaults(func=cmd_watch_list)
     pwas = pwa_sub.add_parser("start", help="启动 watch 调度器(前台运行,Ctrl+C 停止)")
+    pwas.add_argument("-w", "--workspace", help="工作空间名", default="default")
     pwas.set_defaults(func=cmd_watch_start)
     pwap = pwa_sub.add_parser("stop", help="停止 watch 调度器")
+    # watch stop 是同步模式下的空操作(cmd_watch_stop 只打印「去 Ctrl+C」),
+    # 不碰任何工作区。按本仓既有约定(见 `workspace list -w`)如实标注为忽略,
+    # 别让 help 写着「工作空间名」暗示它真的选工作区。
+    pwap.add_argument("-w", "--workspace", help="(忽略)watch stop 不作用于任何工作区", default="default")
     pwap.set_defaults(func=cmd_watch_stop)
 
     # version
@@ -1135,8 +2125,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     # 日志级别
+    # r85:原来这里是 `getattr(logging, args.log_level.upper(), logging.INFO)`。
+    # 有了 choices 之后 argparse 已经保证这个值是合法级别名,兜底只剩坏处 ——
+    # 它掩盖「值没对上」这件事,而那正是这条判据要消灭的静默降级。
     logging.basicConfig(
-        level=getattr(logging, args.log_level.upper(), logging.INFO),
+        level=args.log_level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )

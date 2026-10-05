@@ -184,7 +184,7 @@ def cmd_ai_explain(args, storage: "Storage | None" = None) -> int:
         if available_ids:
             print(f"[!] correlation #{corr_id} not found. available: {available_ids[:10]}", file=sys.stderr)
         else:
-            print(f"[!] no correlations in workspace {args.workspace} (run arl-lite correlate first)", file=sys.stderr)
+            print(f"[!] no correlations in workspace {args.workspace} (run arl-lite correlate)", file=sys.stderr)
         return 2
 
     data_json = to_json({

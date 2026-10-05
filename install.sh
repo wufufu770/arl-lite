@@ -25,10 +25,45 @@ echo "[✓] Python $PYTHON_VERSION"
 echo
 echo "==> 安装 arl-lite"
 cd "$SCRIPT_DIR"
-pip install --user -e . 2>&1 | tail -3 || {
-    echo "[!] pip install 失败,尝试 --break-system-packages"
-    pip install --break-system-packages -e . 2>&1 | tail -3
-}
+
+# 实测踩过的坑:原来写的是 `pip install ... 2>&1 | tail -3 || { ... }`。
+# 管道的退出码取自**最后一个命令**(tail),而 tail 永远成功 ——
+# 于是 pip 失败也被 `||` 放行,`set -e` 更是完全抓不到:
+# PEP 668 拒了安装,脚本照样 rc=0 往下走,用户以为装好了。
+#
+# 修法:不接管道,把输出重定向进临时文件,再按 pip 自己的
+# 退出码分支。日志放在 $TMPDIR 而不是仓库里 —— 放仓库里的话,
+# 脚本被中断就会留下一个没清掉的 .pip-install.log,而它**不在
+# .gitignore 里**,下次 `git add -A` 就把安装日志提交进版本库。
+# 清日志时把 rm 的输出丢掉:本机 rm 走回收站,会打一行
+# "moved to trash" 混进安装输出里,用户会以为那是安装的一部分。
+# 判据 tests/test_readme_install_path.py 会检查安装输出里
+# 不出现这类无关行。
+PIP_LOG="${TMPDIR:-/tmp}/arl-lite-pip-install.$$.log"
+_drop_log() { rm -f "$PIP_LOG" >/dev/null 2>&1 || true; }
+trap '_drop_log' EXIT
+if pip install --user -e . >"$PIP_LOG" 2>&1; then
+    tail -3 "$PIP_LOG"
+else
+    echo "[!] pip install --user 失败,尝试 --break-system-packages"
+    if pip install --break-system-packages -e . >"$PIP_LOG" 2>&1; then
+        tail -3 "$PIP_LOG"
+    else
+        tail -5 "$PIP_LOG" >&2
+        _drop_log
+        echo "[!] 两条 pip 路径都失败。可跳过安装,直接用:" >&2
+        echo "    PYTHONPATH=. python3 -m arl_lite version" >&2
+        exit 1
+    fi
+fi
+_drop_log
+
+# 装完必须能真的跑起来,否则「成功」是假的(PEP 668 环境尤其容易)
+if ! python3 -c "import arl_lite" 2>/dev/null; then
+    echo "[!] 安装后仍无法 import arl_lite,不算成功。" >&2
+    echo "    可跳过安装,直接用: PYTHONPATH=. python3 -m arl_lite version" >&2
+    exit 1
+fi
 
 # 3. (可选)安装 subfinder
 if command -v subfinder &> /dev/null; then

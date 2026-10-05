@@ -1,6 +1,8 @@
 name: bt_panel_public
 description: 宝塔面板暴露公网(常见默认/弱密码)
 risk: 7
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: medium
 tags: [baota, panel, exposure, brute_force]
 collect:
   - table: findings

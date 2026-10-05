@@ -1,0 +1,27 @@
+name: cms_asset_diversity
+description: workspace 内识别到 ≥ 2 个不同 CMS(资产多样性信号)
+risk: 5
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: low
+# 必须 ≥ 2 个 CMS 指纹才算一条信号。
+#
+# 这条规则原先叫 multiple_cms_same_ip,WHERE 只有
+#   finding_type='fingerprint' AND severity='info' AND title IN (...)
+# —— **完全没有聚合**。于是一个孤零零的 WordPress 指纹就触发,
+# 报出来的却是"同一资产多 CMS 识别"。名字和逻辑对不上。
+#
+# 引擎的 count_min 是 workspace 级的(findings 的 target 是 URL,
+# 未必能可靠推出 IP),所以按"workspace 内 CMS 资产多样性"来定义,
+# 并把名字改成和实际行为一致。真正要 per-IP 分组得先给引擎加
+# group_by 能力,那是另一个量级的改动。
+count_min: 2
+tags: [cms, asset_diversity, network]
+collect:
+  - table: findings
+    where: "finding_type = 'fingerprint' AND severity = 'info' AND title IN ('WordPress', 'Drupal', 'Joomla', 'Discuz', 'phpBB', 'vBulletin', 'Typeico', 'Magento', 'PrestaShop')"
+headline: "💡 workspace 内识别到 {count} 个 CMS 指纹(资产多样性,留意未维护实例)"
+advice: |
+  1. 确认这些 CMS 都是授权部署
+  2. 定期更新所有 CMS 到最新版本
+  3. 删掉未使用的 CMS 实例
+  4. 注意:本条只统计 workspace 内总数,不区分是否同一台主机

@@ -1,6 +1,8 @@
 name: swagger_public
 description: Swagger UI 暴露公网(API 文档泄露)
 risk: 5
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: medium
 tags: [swagger, api_doc, exposure]
 collect:
   - table: findings

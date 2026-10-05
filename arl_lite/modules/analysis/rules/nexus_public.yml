@@ -1,6 +1,8 @@
 name: nexus_public
 description: Nexus Repository 暴露(代码包/依赖风险)
 risk: 7
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: medium
 tags: [nexus, package, code_leak]
 collect:
   - table: findings

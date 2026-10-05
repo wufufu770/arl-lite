@@ -1,0 +1,26 @@
+name: db_asset_diversity
+description: workspace 内识别到 ≥ 2 个数据库服务(集中暴露风险)
+risk: 8
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: low
+# 必须 ≥ 2 个数据库指纹才算一条信号。
+#
+# 这条规则原先叫 multiple_db_same_ip,WHERE 只有
+#   title IN ('Redis','MongoDB',...)  —— **完全没有聚合**,
+# 于是一个孤零零的 Redis 指纹就触发,报出来却是"同一目标多数据库"。
+# 误报率实测(arl-lite fp-bench)把它列进了正样本上的误报。
+#
+# 引擎的 count_min 是 workspace 级的(findings 的 target 是 URL,
+# 未必能可靠推出 IP),所以按"workspace 内数据库资产多样性"定义,
+# 名字改成和实际行为一致。
+count_min: 2
+tags: [database, network, exposure, data_leak]
+collect:
+  - table: findings
+    where: "title IN ('Redis', 'MongoDB', 'ElasticSearch', 'MySQL', 'PostgreSQL', 'Oracle', 'Neo4j', 'InfluxDB')"
+headline: "⚠️ workspace 内 {count} 个数据库服务(集中暴露风险,注意是否同一台主机)"
+advice: |
+  1. 评估集中化风险(一次入侵 = 全部数据)
+  2. 不同数据库用不同网络隔离
+  3. 备份 + 异地容灾
+  4. 注意:本条只统计 workspace 内总数,不区分是否同一台主机

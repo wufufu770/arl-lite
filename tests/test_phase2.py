@@ -20,6 +20,8 @@ import os
 import sys
 import tempfile
 import time
+
+import pytest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -57,8 +59,14 @@ def fail(msg: str):
 # Test 1: 9 数据源 integration(不依赖 module,只测 integration 层)
 # =============================================================
 
+@pytest.mark.network
 async def test_9_sources_integration():
-    print("\n[Test 1] 9 数据源 integration(纯 HTTP 集成)")
+    # r105:这条**真的打公网 API**(crtsh / rapiddns / hackertarget …),
+    # fixture 换不成 —— 它们是第三方服务,本机造不出来。所以打 network 标记,
+    # 让「红了先怀疑网络」这件事可查询:
+    #     pytest tests/ -m "not network"
+    # **门禁不按这个标记跳过它** —— 跳过等于不验。取舍见 backlog 同名条目。
+    print("\n[Test 1] 9 数据源 integration(纯 HTTP 集成,依赖公网)")
     target = "example.com"
     sources = [
         ("crtsh", crt_collect),
@@ -102,33 +110,67 @@ async def test_9_sources_integration():
 # =============================================================
 
 async def test_portscan_integration():
-    print("\n[Test 2] portscan 集成(nmap 优先 / Python fallback)")
-    results, err, etype = await scan("example.com", ports="80,443,22,21,8080", prefer="auto")
-    assert etype is None, f"unexpected err: {err} ({etype})"
-    assert isinstance(results, list)
-    # 至少 example.com:80 和 :443 应该 open
-    ports_found = {r["port"] for r in results}
-    assert 80 in ports_found or 443 in ports_found, \
-        f"example.com 80/443 should be open, got {ports_found}"
-    ok(f"portscan found {len(results)} ports, {ports_found}")
+    # r104 重写:原来这里打的是**公网** example.com,并断言「80 或 443 必须开着」。
+    # 那不是集成测试,那是**把公网当 fixture** —— 红了没人分得清是代码坏了
+    # 还是网络抖了。r103 收尾时 `test_baseline` 就是被它弄红的,而四组对照
+    # (单跑 5 次 / a-p 1093 条 / 全量 1387 条 / 收集阶段钩子里)证明波动来自
+    # 外网,和被测代码无关。**一个会随机红的门禁等于没有门禁**:基线是 0 失败,
+    # 这种测试红一次就得有人去提基线,而 `--update-baseline` 那个后门正是在
+    # 这种时候最容易被用上。所以先把 fixture 换成本机的。
+    print("\n[Test 2] portscan 集成(本机 listener 造 open/closed,不依赖外网)")
+    import socket as _s
 
-    # 验证字段
-    for r in results:
-        assert "host" in r
-        assert "port" in r
-        assert r["state"] == "open"
-        assert r["service"] in ("http", "https", "ssh", "ftp", "http-proxy", "unknown")
-    ok("portscan 字段齐全 (host/port/state/service)")
+    srv = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    open_port = srv.getsockname()[1]          # 开着:connect 会成功
 
-    # 端口解析
-    assert parse_ports("80,443") == [80, 443]
-    assert parse_ports("1-3") == [1, 2, 3]
-    assert parse_ports("80,443,8000-8002") == [80, 443, 8000, 8001, 8002]
-    ok("parse_ports 解析 '80,443' / '1-3' / '80,443,8000-8002' 正确")
+    probe = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    closed_port = probe.getsockname()[1]      # 确定关闭:bind 后立刻 close
+    probe.close()
 
-    # nmap 检测
-    nmap_available = check_nmap()
-    ok(f"check_nmap: {nmap_available}")
+    try:
+        results, err, etype = await scan(
+            "127.0.0.1", ports=f"{open_port},{closed_port}",
+            prefer="python", timeout_per_port=1.0,
+        )
+        # 关键断言(r104 的核心):**有一个端口没判定出来,就不许报成功**。
+        # 改前这里只有 `assert etype is None`,而改前 etype 恒为 None ——
+        # 哪怕 5 个端口一个都没探到,它照样「成功」。
+        assert etype is not None, (
+            f"扫了 2 个端口只认出 {sorted(r['port'] for r in results)} 个,"
+            f"etype 却还是 None —— 那是 r104 之前那个静默"
+        )
+        assert err and "未判定" in err, (
+            f"没判定出来的端口必须说出来,不能只给一个类型名:{err!r}"
+        )
+        ports_found = {r["port"] for r in results}
+        assert ports_found == {open_port}, (
+            f"只该认出本机那个 listener,实际 {ports_found}"
+            f"(closed={closed_port} 不该在里面)"
+        )
+        ok(f"portscan: open={ports_found},未判定已如实上报({err})")
+
+        # 验证字段
+        for r in results:
+            assert "host" in r
+            assert "port" in r
+            assert r["state"] == "open"
+            assert r["service"] in ("http", "https", "ssh", "ftp", "http-proxy", "unknown")
+        ok("portscan 字段齐全 (host/port/state/service)")
+
+        # 端口解析
+        assert parse_ports("80,443") == [80, 443]
+        assert parse_ports("1-3") == [1, 2, 3]
+        assert parse_ports("80,443,8000-8002") == [80, 443, 8000, 8001, 8002]
+        ok("parse_ports 解析 '80,443' / '1-3' / '80,443,8000-8002' 正确")
+
+        # nmap 检测
+        nmap_available = check_nmap()
+        ok(f"check_nmap: {nmap_available}")
+    finally:
+        srv.close()
 
 
 # =============================================================
@@ -191,25 +233,86 @@ def test_fingerprint_engine():
 # =============================================================
 
 async def test_httpx_probe_integration():
-    print("\n[Test 4] httpx_probe 集成(纯 urllib)")
+    # r105:原来这里 probe("example.com") 并且断言 title == "Example Domain"。
+    # 那是**把公网页面的内容当成了契约** —— example.com 的标题哪天改了,
+    # 这条就红,而它红的原因和被测代码一点关系都没有。r104 已经把 portscan
+    # 那条的 fixture 换成本机,这条是同一个病的第二处。
+    print("\n[Test 4] httpx_probe 集成(纯 urllib,本机 HTTP server)")
+    import socket as _s_module
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
     from arl_lite.integrations.httpx_probe import probe
 
-    results = []
-    async for site in probe("example.com", ports=[80, 443], timeout=10):
-        results.append(site)
-    assert len(results) >= 1, "example.com:80/443 至少 1 个有响应"
-    for r in results:
-        assert r["status"] == 200, f"example.com 应该是 200, 实际 {r['status']}"
-        assert r["title"] == "Example Domain", f"title 应该是 'Example Domain', 实际 '{r['title']}'"
-        assert r["url"].startswith("http")
-    ok(f"httpx_probe 命中 {len(results)} 个站点,titles 正确")
+    # 本机 fixture 只能起在 _build_targets 的 web_ports 白名单端口上
+    # (80/443/8080/8443/8000/8008/8888/9000/9090/7001/5601/9200/9300/5984)。
+    # 随机端口会被它**一个 target 都不生成** —— 那测的是「压根没扫」,
+    # 不是「扫了没响应」,两回事。首版就栽在这儿:随机端口 → results=[]。
+    # 顺带记一笔:白名单本身就是 r106 的待办 —— 内网资产跑在 3000/5000
+    # 这类端口上的服务,httpx 现在扫不到,而 docstring 只说「看起来像 web」。
 
-    # 失败:无效 host
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = (b"<html><head><title>Local Fixture</title></head>"
+                    b"<body>hi</body></html>")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):   # 别把访问日志喷进测试输出
+            pass
+
+    srv = None
+    for _p in (8080, 8000, 8888, 9000, 8008, 9090):
+        try:
+            srv = HTTPServer(("127.0.0.1", _p), _Handler)
+            break
+        except OSError:
+            continue
+    if srv is None:
+        pytest.skip("web_ports 白名单里的本机端口全被占了 —— 起不了 fixture")
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        results = []
+        async for site in probe("127.0.0.1", ports=[port], schemes=["http"], timeout=5):
+            results.append(site)
+        assert len(results) == 1, f"本机 fixture 恰好该命中 1 个,实际 {results}"
+        r = results[0]
+        assert r["status"] == 200, f"本机 fixture 应该是 200,实际 {r['status']}"
+        assert r["title"] == "Local Fixture", (
+            f"title 提取错了:'{r['title']}'")
+        assert r["url"].startswith("http://127.0.0.1"), r["url"]
+        ok(f"httpx_probe 命中 {len(results)} 个站点,title/status/url 正确")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    # 失败:连不上就不许有结果。
+    # 原来用 `nonexistent.invalid.host`,靠的是 DNS 解析失败 —— 那仍要问
+    # 本机 DNS 服务器。改成一个**本机确定关闭的端口**,连 DNS 都不碰。
+    # 端口同样要在白名单里,否则 _build_targets 连 target 都不生成 ——
+    # 那测的就不是「连不上」而是「压根没扫」,两回事。
+    dead_port = None
+    for _p in (8080, 8000, 8888, 9000, 8008, 9090):
+        _s = _s_module.socket(_s_module.AF_INET, _s_module.SOCK_STREAM)
+        try:
+            _s.bind(("127.0.0.1", _p))
+        except OSError:
+            _s.close()
+            continue
+        _s.close()          # bind 成功 = 此刻没人占,但我们主动让出来
+        dead_port = _p
+        break
+    if dead_port is None:
+        pytest.skip("web_ports 白名单里的本机端口全被占了")
     results = []
-    async for site in probe("nonexistent.invalid.host", ports=[80], timeout=5):
+    async for site in probe("127.0.0.1", ports=[dead_port], schemes=["http"], timeout=2):
         results.append(site)
-    assert len(results) == 0
-    ok("无效 host 不返回假阳性")
+    assert len(results) == 0, f"连不上的端口不该有结果:{results}"
+    ok("连不上的端口不返回假阳性")
 
 
 # =============================================================
@@ -239,8 +342,10 @@ def test_module_discovery():
 # Test 6: 端到端(子域 → 端口 → 站点 → 指纹)
 # =============================================================
 
+@pytest.mark.network
 async def test_e2e_chain():
-    print("\n[Test 6] 端到端侦察链(子域 → 端口 → 站点 → 指纹)")
+    # r105:同上,Stage 1 的子域来源是公网 API。同样换不成 fixture。
+    print("\n[Test 6] 端到端侦察链(子域 → 端口 → 站点 → 指纹,依赖公网)")
 
     tmp = tempfile.mkdtemp()
     s = Storage("e2e-phase2", tmp)

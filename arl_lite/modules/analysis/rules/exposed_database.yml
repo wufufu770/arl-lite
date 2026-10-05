@@ -1,10 +1,19 @@
 name: exposed_database
 description: 数据库服务暴露在公网
 risk: 9
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: high
 tags: [exposure, database, network]
 collect:
+  # state = 'open' 不能省。
+  # 误报率实测发现:一个 state='closed' 的 6379 端口照样触发本规则,
+  # 报出"数据库服务暴露在公网" —— 而那个端口根本没开。
+  # 同目录的 port_high_risk 一直带着这个条件,只有本规则漏了。
+  #
+  # 这条规则的 confidence 是 high,靠的是"端口级事实"这个前提;
+  # 端口没开时那个前提根本不成立,high 也就名不副实。
   - table: ports
-    where: "port IN (3306, 5432, 6379, 27017, 9200, 1433, 5984, 2379, 7000, 7001, 1521, 11211, 33060, 5433)"
+    where: "port IN (3306, 5432, 6379, 27017, 9200, 1433, 5984, 2379, 7000, 7001, 1521, 11211, 33060, 5433) AND state = 'open'"
 headline: "⚠️ 数据库服务暴露在公网: {ip}:{port} ({service})"
 advice: |
   1. 确认该数据库是否真的需要公网访问

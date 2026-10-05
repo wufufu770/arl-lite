@@ -121,7 +121,11 @@ async def _probe(url: str, timeout: int) -> PathResult:
 
 
 def _is_interesting(status: int, path: str, length: int, body_hash: str) -> bool:
-    """启发式:哪些 path 算 interesting"""
+    """启发式:哪些**响应**算 interesting。判定**只看 status**。
+
+    `path`/`length`/`body_hash` 调用方完整传入但函数体零引用(soft-404
+    启发式预留,Phase 2)。r103 前写的是「哪些 path 算 interesting」。
+    """
     # 2xx 永远 interesting
     if 200 <= status < 300:
         return True
@@ -134,9 +138,9 @@ def _is_interesting(status: int, path: str, length: int, body_hash: str) -> bool
     # 405 算(方法禁用但路径存在)
     if status == 405:
         return True
-    # 500 算(可能存在但 server error)
+    # 5xx **不算**:通常是 service 挂了(原注释写「500 算」,与下一行打架)
     if status in (500, 502, 503):
-        return False  # 通常是 service 挂了
+        return False
     return False
 
 

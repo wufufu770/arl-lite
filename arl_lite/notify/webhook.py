@@ -28,9 +28,27 @@ from dataclasses import dataclass, field
 
 log = logging.getLogger("arl_lite.notify")
 
-# 严重等级阈值(只 notify 严重事件)
-DEFAULT_MIN_SEVERITY = "high"  # high / critical
-SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+# 严重等级阈值。等级表与默认值都只有这一处定义 —— CLI 的 `--min-severity`
+# 的 choices 和默认值都从它派生。原来两边各写各的:argparse 写 "info"、
+# 这里写 "high",**同一个旋钮两个默认值**(决策 #9)。
+#
+# 实测后果不只是「不一致」:三个发送方发的 severity 全在 "high" 之下,
+# 于是它们**结构上一条都发不出去** ——
+#   notify_task_done        → "info"(无错)/ "medium"(有错)
+#   notify_critical_finding → finding.get("severity", "info")
+#   notify_correlation      → CorrelationHit **压根没有 severity 字段**,恒 "info"
+#
+# 而 `notify test` 走 argparse(门限 info)报「sent OK」,`correlate --notify`
+# 走这里(门限 high)一条不发 —— 同一个 URL、同一个 provider、两个门限。
+# `notify test` 是用户唯一的验证手段,它说通了用户就认为通知配好了。
+#
+# 取 CLI 一直对外承诺的 "info":用户显式传了 `--notify --webhook-url`,
+# 那就是**已经同意收通知**,再拿一个他从没看见过的门限去拦,拦掉的是本意。
+# 要静默只要高危,自己写 `--min-severity high`。
+DEFAULT_MIN_SEVERITY = "info"
+SEVERITY_ORDER = ("info", "low", "medium", "high", "critical")
+SEVERITY_RANK = {name: i for i, name in enumerate(SEVERITY_ORDER)}
+assert set(SEVERITY_RANK) == set(SEVERITY_ORDER)   # 写错了当场炸,别静默
 
 
 def is_valid_url(url: str) -> bool:
@@ -248,18 +266,41 @@ def notify_correlation(
     correlation: dict,
     target: str = "",
 ) -> bool:
-    """关联分析命中通知"""
+    """关联分析命中通知
+
+    ## 规则自己的 tags 必须带出去
+
+    `correlations` 表里存了每条规则的 `tags`(rce / unauth / data_leak /
+    database ...),`CorrelationHit` 也带着它们一路传过来 —— 但这里原来
+    只按 risk 派生出 `link` / `fire` / `warning`,**把规则自己的标签全丢了**。
+
+    丢掉的后果是通知只剩"这条有风险",看不出是什么风险。ntfy 的
+    `Tags` header 既是 emoji 来源也是订阅过滤键,带上语义标签才能
+    按 `rce` 之类的关键词订阅。
+
+    ## 顺序:风险标记在前
+
+    ntfy 只取前 5 个 tag(`tags[:5]`)。风险标记是视觉信号(🔥/⚠️),
+    语义标签是过滤用的,所以标记优先占位,标签填剩余槽位。
+    """
     severity = correlation.get("severity", "info")
     rule_name = correlation.get("rule_name", "?")
     risk = correlation.get("risk", 0)
     headline = correlation.get("headline", "")
     target = target or correlation.get("target", "")
 
+    # 1) 风险标记优先 —— ntfy 按顺序取前 5 个,emoji 挤掉的是最靠后的标签
     tags = ["link"]
     if risk >= 9:
         tags.append("fire")
     elif risk >= 7:
         tags.append("warning")
+
+    # 2) 再补规则自己的标签。存进 correlations 表时是 JSON 字符串,
+    #    这里两种形态都收 —— 调用方可能直接传 list(内存里的 hit),
+    #    也可能传 dict(从库里读出来的行)。
+    tags += _correlation_tags(correlation.get("tags"))
+
     return notify(
         config,
         title=f"[ARL] Correlation: {rule_name} (risk {risk})",
@@ -268,6 +309,41 @@ def notify_correlation(
         tags=tags,
         extra={"correlation": correlation},
     )
+
+
+def _correlation_tags(raw) -> list[str]:
+    """从 correlation 的 tags 字段里取出干净、去重、保序的标签列表
+
+    raw 可能是:
+    - list[str]              —— 内存里的 CorrelationHit
+    - JSON 字符串 '["a","b"]' —— save_correlations 存进 DB 的形态
+    - None / 其他            —— 一律当作没有
+
+    去重是必须的:规则里写了 `tags: [rce, rce]` 或和风险标记同名时,
+    不去重会把同一个 tag 塞两遍,白占 ntfy 的 5 个槽位。
+    """
+    items: list = []
+    if isinstance(raw, str):
+        try:
+            items = json.loads(raw) if raw.strip() else []
+        except (json.JSONDecodeError, ValueError):
+            log.debug("_correlation_tags: 解析失败 %r", raw[:80])
+            return []
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        return []
+
+    out: list[str] = []
+    for t in items:
+        if not isinstance(t, str):
+            continue
+        s = t.strip()
+        # 逗号会破坏 ntfy 的 Tags 头(逗号是分隔符),换成分号
+        s = s.replace(",", ";").replace("\n", " ").replace("\r", " ")
+        if s and s not in out:
+            out.append(s)
+    return out
 
 
 def notify_task_done(

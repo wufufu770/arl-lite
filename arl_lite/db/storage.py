@@ -25,6 +25,9 @@ from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime
 
+from .errors import DUPLICATE as _DUPLICATE
+from .errors import classify_integrity_error as _classify_integrity_error
+
 log = logging.getLogger("arl_lite.storage")
 
 # 本存储层自有 SQL 的默认执行预算(秒)。作用:挡住 WITH RECURSIVE 无限
@@ -32,6 +35,25 @@ log = logging.getLogger("arl_lite.storage")
 # correlation_engine._guarded_query 临时收紧到 5s,用完恢复本值。
 # 取 120s 给 bulk_insert 这类长批量操作留足余量。
 _SQL_DEFAULT_BUDGET_SECONDS = 120.0
+
+# 「把整张表取出来」时的行数上限。它**不是** `Storage.query` 的上限
+# (那仍是硬 10000,见 `query` 自己的校验),而是「导出/报告这类要全表
+# 的场景」用的那一份 —— 过去这个 10000 直接写死在 `cmd_export` 里,
+# 超了静默丢数据还报成功(r57)。
+#
+# 上限本身不是问题,**超了不说**才是。`fetch_all` 强制把「一共多少行」
+# 一起返回,让调用方不可能无意间丢掉这个数。
+EXPORT_ROW_CAP = 10000
+
+# `Storage.query` 的单次行数护栏。这**不是**语义约束,是内存护栏 ——
+# 它防的是「误传一个巨大 limit 把整张表 list 化」。docstring 里只写了
+# 「最大行数」,没说为什么是这个数,而 r59 查实了这个数当年**没有任何
+# 文档**支撑:它和 `EXPORT_ROW_CAP` 各自硬编码了一遍 10000,耦合却不同源,
+# 于是「调高 EXPORT_ROW_CAP」这条建议一执行就撞死(见 `fetch_all`)。
+#
+# 所以护栏留一个**名字**,而「要全表」的需求由 `fetch_all` **分页**满足:
+# 每页仍在护栏内,页数随便 —— 内存占用是单页的量级,不是全表的量级。
+_QUERY_PAGE_LIMIT = 10000
 
 # 默认 schema 路径
 DEFAULT_SCHEMA = Path(__file__).parent / "schema.sql"
@@ -50,19 +72,178 @@ def compute_hash(*parts: str) -> str:
     return hashlib.sha256(joined.encode()).hexdigest()[:16]
 
 
+# 段的**默认值**:对应 `add_*` 形参的默认值,不是一个新概念。`add_finding` 的
+# `title` 形参默认就是 `""`,所以那一段有默认值 —— 批量入库省略它时必须落到
+# 和 `add_finding` 同一个 hash 上,否则同一批资产从两条路进来会变成两个。
+# (r49 实测:一开始这里没默认值,`bulk_insert` 省略 title 会直接报错,而
+#  `add_finding` 省略它没事 —— 两条路对同一条数据的答案不一致。)
+_REQUIRED = object()
+
+# 资产的「身份」= 拿哪几段拼成去重键。词表只此一份:入库(`add_*` → `_upsert_asset`)、
+# 批量入库(`bulk_insert`)和按名字反查(CLI 的 `monitor changes --asset`)
+# 都必须走 `compute_asset_hash`。手写第二份的后果不是「多几行代码」,
+# 是**两处各自漂**:r45 清掉过 CLI 的 choices 硬编码词表,下一轮我自己又写了份
+# `_ASSET_LABEL_FIELDS`,同一个毛病。
+#
+# 键是**表名**(复数),不是 asset_type(单数),和 `_MUTABLE_TEXT` / `_MUTABLE_PLAIN`
+# 保持一致 —— `db` 不 import `core`,所以 asset_type↔表名的映射归
+# `Monitor._ASSET_TABLES` 所有,本模块只按表名说话。两侧的键集合由
+# tests/test_monitor_changes_filter.py 双向钉住。
+#
+# 值的形状是 `(列名..., 分隔符, 默认值...)`。**列名指的是「这一段的值在表行的
+# 哪一列」**,不是 `add_*` 的形参名 —— ports 的形参叫 `host`,但列名是 `ip`
+# (`add_port` 写的就是 `fields={"ip": host}`)。这么定是为了让 `bulk_insert`
+# 能**按名字**从一行里把身份取出来,不用再写一份 if-else。
+#
+# 传参仍是**按位置**的,所以列名只用于「段数对不对」的检查和批量入库时按列取值,
+# 不参与计算 —— `compute_asset_hash(1, "ports", "1.1.1.1", 443)` 和
+# `compute_asset_hash(1, "ports", "1.1.1.1", "443")` 等价。
+_ASSET_IDENTITY: dict[str, tuple[tuple[str, ...], str, tuple]] = {
+    "domains": (("domain",), "", (_REQUIRED,)),
+    "hosts": (("host",), "", (_REQUIRED,)),
+    "ports": (("ip", "port"), ":", (_REQUIRED, _REQUIRED)),
+    "sites": (("url",), "", (_REQUIRED,)),
+    "findings": (("target", "finding_type", "title"), "|",
+                 (_REQUIRED, _REQUIRED, "")),
+}
+
+
+def compute_asset_hash(workspace_id: int, table: str, *identity) -> str:
+    """这个资产的 hash。`table` 是表名(`domains`/`hosts`/…),不是 asset_type。
+
+    ## 段可以为空,但不能是 `None`
+
+    `add_finding` 的 `title` 默认就是 `""`,所以空值是合法身份的一部分。
+    但 `None` 表示**调用方根本没给这一段** —— 少一段照样能算出一个 16 位
+    hash,于是资产被静默存成另一个身份。`None` 报错,`""` 放行。
+
+    ## 关于 workspace_id:它在 hash 里,但**今天恒等于 1**
+
+    写法是 `compute_hash(str(workspace_id), 去重键)`,看着像「hash 是工作区
+    作用域的」。实测不是:每个工作区是**独立的 db 文件**(`<root>/<name>/data.db`),
+    每个文件里的 `workspaces` 表只有自己那一行,所以 `workspace_id` 永远是 1。
+    后果:同一个域名在两个工作区**算出来是同一个 hash**。
+
+    这不构成问题 —— `UNIQUE(workspace_id, hash)` 约束也是**按文件**的,
+    两边本来就碰不到一起。但别把「工作区作用域」当保证写进别处:哪天改成
+    一个库放多个工作区,`workspace_id` 才会真的开始变,而那时任何漏掉它的
+    「按名字算 hash」会静默算出对不上的值。`db` 不该替这个布局变化买单,
+    所以参数留着,注释说清现状。
+    """
+    spec = _ASSET_IDENTITY.get(table)
+    if spec is None:
+        raise ValueError(
+            f"unknown asset table: {table!r} "
+            f"(known: {', '.join(sorted(_ASSET_IDENTITY))})")
+    names, sep, _defaults = spec
+    if len(identity) != len(names):
+        raise ValueError(
+            f"{table} 的身份是 {len(names)} 段"
+            f"({' + '.join(names)}),给了 {len(identity)} 段:"
+            f" {', '.join(str(i) for i in identity)}")
+    for name, v in zip(names, identity):
+        if v is None:
+            raise ValueError(
+                f"{table} 的身份段 {name!r} 是 None —— 调用方没给这一段。"
+                f"想用默认值请显式传(见 _ASSET_IDENTITY),"
+                f"空串和 None 不是一回事。")
+    return compute_hash(str(workspace_id), sep.join(str(p) for p in identity))
+
+
+def asset_identity_of_row(workspace_id: int, table: str, row: dict) -> str:
+    """从一行**表数据**里算资产 hash —— 身份按列名从 row 里取,缺的用默认值
+
+    给 `bulk_insert` 用:那里的输入是 dict 而不是形参,只能按列名取。
+    列名和默认值都住在 `_ASSET_IDENTITY` 里,所以这和 `add_*` 走的是**同一份**
+    定义,不再是第二份 if-else。
+
+    ## 缺列为什么不能用 `''` 一律顶上
+
+    那样一个真的漏了身份列的行会算出一个「看起来很正常」的 hash,然后被存成
+    某个别的资产。`title` 这种**本来就有默认值**的段才允许缺,其余的段缺了
+    就是调用方漏了,报错(`NOT NULL` 约束最后也会拦,但那时报的是约束名,
+    不是「你少了 host 这一段」)。
+    """
+    spec = _ASSET_IDENTITY.get(table)
+    if spec is None:
+        raise ValueError(
+            f"{table!r} 不在 _ASSET_IDENTITY 里,没法按行算身份。"
+            f"要么它不是资产表(那就别给它算 hash),要么该往表里补一份定义。")
+    names, _sep, defaults = spec
+    parts = []
+    for name, default in zip(names, defaults):
+        if name in row:
+            parts.append(row[name])
+        elif default is _REQUIRED:
+            raise ValueError(
+                f"{table} 的行缺身份列 {name!r} —— 这一段没有默认值,"
+                f"补上它,或者调用方是漏传了。")
+        else:
+            parts.append(default)
+    return compute_asset_hash(workspace_id, table, *parts)
+
+
 # 用户提供的 SQL 片段(WHERE 子句)里禁止出现的写操作关键字。
 # 检查在"剥离字符串字面量之后"的残留上做词边界匹配:
 # 这样 `domain LIKE '%update%'` 不再误拦,而裸的 `drop table x` 仍然拦截。
 # WITH 也禁:recursive CTE 可以在只读语句里无限循环,规则引擎有 5s 预算兜底,
 # 用户 filter 直接禁掉最省心。
+#
+# UNION / UNION ALL 是**读操作**,不加会漏过一次真泄漏:
+#   filter = "1=1) UNION SELECT title,1,99 FROM findings --"
+# 拼进 `SELECT * FROM domains WHERE workspace_id=? AND (<filter>) ORDER BY id`
+# 之后, 括号闭合 + 注释吃掉尾部 → findings 表内容被 UNION 进结果集。
+# 实测确认能读到别表数据(finding 的 title 泄漏), 不是理论风险。
+# 写操作关键字拦不住它, 所以必须显式禁。
 _FORBIDDEN_SQL_KEYWORDS = (
     "DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE",
     "ATTACH", "DETACH", "PRAGMA", "VACUUM", "REPLACE", "WITH",
+    "UNION",
 )
 
 
+def strip_sql_comments(sql: str) -> str:
+    """把 SQL 注释整段替换成空格
+
+    为什么必须做: SQLite 支持 `un/**/ion` 这种注释分隔的关键字,
+    而 check_filter_sql 靠 \\b 词边界匹配拦关键字——
+    `un/**/ion` 被当成两个独立的词放行, 实测能绕过去。
+    注释还能吃掉行尾, 配合括号闭合就是完整注入。
+
+    替换成空格而非空串是为保持偏移量, 这样报错信息里的列号
+    才对得上原文。
+    """
+    out: list[str] = []
+    i, n = 0, len(sql)
+    while i < n:
+        two = sql[i : i + 2]
+        if two == "--":
+            while i < n and sql[i] != "\n":
+                out.append(" ")
+                i += 1
+        elif two == "/*":
+            out.append("  ")
+            i += 2
+            while i < n and sql[i : i + 2] != "*/":
+                out.append(" ")
+                i += 1
+            if i < n:
+                out.append("  ")
+                i += 2
+        else:
+            out.append(sql[i])
+            i += 1
+    return "".join(out)
+
+
 def strip_sql_literals(sql: str) -> str:
-    """把 SQL 里的 '...' / "..." 字面量替换成 ?,支持 '' 转义"""
+    """把 SQL 里的 '...' / "..." 字面量替换成 ?,支持 '' 转义
+
+    顺序很关键: **先剥注释, 再剥引号**。反过来的话, 引号里的
+    `--` 或 `/*` 会被误当注释, 把本该保留的字面量截断——
+    `domain = '--not a comment'` 就会变成 `domain = '          '`。
+    """
+    sql = strip_sql_comments(sql)
     out: list[str] = []
     i, n = 0, len(sql)
     while i < n:
@@ -90,13 +271,29 @@ def check_filter_sql(filter_sql: str) -> None:
 
     规则:
     - 不允许多语句(;)
-    - 字符串字面量之外不允许写操作关键字(词边界匹配)
+    - 字符串字面量之外不允许出现危险关键字
+
+    为什么要两轮扫描(去空白版 + 原样版):
+      SQLite 把 `un/**/ion` 当成 `union` 执行, 而注释已被我们替换成
+      空格 → `un      ion`。只用原样版扫描, \\b 词边界看到的是两个独立的
+      词, 会放行。所以先扫一版"所有空白压成单个空格再删掉"的文本,
+      把被注释拆开的关键字也粘回一个词。
+      再扫一版原样的, 是为了拦住 `union` 出现在字面量之外的各种形态。
     """
     residue = strip_sql_literals(filter_sql)
     if ";" in residue:
         raise ValueError("filter must be a single expression (';' not allowed)")
-    upper = residue.upper()
+
     import re as _re
+
+    # 第一轮:压掉所有空白, 抓被注释/换行拆开的关键字
+    squashed = _re.sub(r"\s+", "", residue).upper()
+    for kw in _FORBIDDEN_SQL_KEYWORDS:
+        if kw in squashed:
+            raise ValueError(f"filter contains forbidden keyword: {kw}")
+
+    # 第二轮:保留边界的原样扫描, 防止上面的压空白产生误判之外的绕过
+    upper = residue.upper()
     for kw in _FORBIDDEN_SQL_KEYWORDS:
         if _re.search(rf"\b{kw}\b", upper):
             raise ValueError(f"filter contains forbidden keyword: {kw}")
@@ -112,6 +309,8 @@ class Storage:
     """
 
     def __init__(self, workspace: str = "default", workspace_root: Path | None = None):
+        # 「字段变了」回调,由 core 层注册(db 不认识 core,见分层规则)
+        self._on_field_change = None
         # 拒绝路径穿越 / 绝对路径
         if not workspace or not workspace.strip():
             raise ValueError("workspace name must not be empty")
@@ -185,10 +384,10 @@ class Storage:
             "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='correlations'"
         ).fetchall()
         idx_names = {r["name"] for r in idx}
-        if any("correlations_uniq" in n for n in idx_names):
-            return  # 已经有 unique index
+        has_unique = any("correlations_uniq" in n for n in idx_names)
 
-        # 1. 补缺列(从 v0.2 → v0.3)
+        # 列迁移无条件跑:即使 unique index 已存在,后加的置信度列
+        # 依然需要补上(否则新代码写不进去,旧库永远缺列)
         cur_cols = {row["name"] for row in conn.execute("PRAGMA table_info(correlations)").fetchall()}
         # 迁移列 → 字面量 SQL 映射(列名/类型是代码写死的常量,不走 f-string 拼接)
         needed = {
@@ -198,6 +397,11 @@ class Storage:
             "advice": "ALTER TABLE correlations ADD COLUMN advice TEXT",
             "tags": "ALTER TABLE correlations ADD COLUMN tags TEXT",
             "rule_description": "ALTER TABLE correlations ADD COLUMN rule_description TEXT",
+            # v0.7.9: 置信度三件套(见 core/confidence.py)
+            "confidence": "ALTER TABLE correlations ADD COLUMN confidence INTEGER DEFAULT 50",
+            "confidence_level": "ALTER TABLE correlations ADD COLUMN confidence_level TEXT",
+            "confidence_status": "ALTER TABLE correlations ADD COLUMN confidence_status TEXT",
+            "confidence_factors": "ALTER TABLE correlations ADD COLUMN confidence_factors TEXT",
         }
         for col, sql in needed.items():
             if col not in cur_cols:
@@ -207,14 +411,32 @@ class Storage:
                 except Exception as e:
                     log.warning(f"failed to add column {col}: {e}")
 
+        if has_unique:
+            return  # 列已补齐,unique 也在,无事可做
+
         # 1b. sites 表补 server 列(关联分析 istio_no_auth 规则需要)
         site_cols = {row["name"] for row in conn.execute("PRAGMA table_info(sites)").fetchall()}
-        if "server" not in site_cols:
-            try:
-                conn.execute("ALTER TABLE sites ADD COLUMN server TEXT")
-                log.info("migrated: sites ADD COLUMN server")
-            except Exception as e:
-                log.warning(f"failed to add sites.server: {e}")
+        # 迁移列 → 字面量 SQL(不走 f-string 拼接,列名是代码写死的常量)
+        site_needed = {
+            "server": "ALTER TABLE sites ADD COLUMN server TEXT",
+            # v0.7.10: TLS 证书(资产归属判定的核心维度)
+            "cert_sha256": "ALTER TABLE sites ADD COLUMN cert_sha256 TEXT",
+            "cert_issuer_cn": "ALTER TABLE sites ADD COLUMN cert_issuer_cn TEXT",
+            "cert_issuer_org": "ALTER TABLE sites ADD COLUMN cert_issuer_org TEXT",
+            "cert_subject_cn": "ALTER TABLE sites ADD COLUMN cert_subject_cn TEXT",
+            "cert_san": "ALTER TABLE sites ADD COLUMN cert_san TEXT",
+            "cert_not_after": "ALTER TABLE sites ADD COLUMN cert_not_after TEXT",
+            "cert_expired": "ALTER TABLE sites ADD COLUMN cert_expired INTEGER DEFAULT 0",
+            "cert_self_signed": "ALTER TABLE sites ADD COLUMN cert_self_signed INTEGER DEFAULT 0",
+            "cert_days_left": "ALTER TABLE sites ADD COLUMN cert_days_left INTEGER",
+        }
+        for col, sql in site_needed.items():
+            if col not in site_cols:
+                try:
+                    conn.execute(sql)
+                    log.info(f"migrated: sites ADD COLUMN {col}")
+                except Exception as e:
+                    log.warning(f"failed to add sites.{col}: {e}")
 
         # 2. 删重复(保留 id 最大的)— 现在 target 列存在了
         try:
@@ -501,13 +723,20 @@ class Storage:
     _MUTABLE_TEXT: dict[str, tuple[str, ...]] = {
         "domains": ("resolved_ip",),
         "hosts": ("ip",),
-        "sites": ("title", "server", "tech", "scheme", "ip"),
+        # 证书字段放 TEXT 类:证书换了(SAN/issuer 变)但新值可能为空,
+        # 空值不该把已知的旧证书信息抹掉。cert_expired/self_signed/days_left
+        # 放 PLAIN —— 状态变了就是变了,不能被"新值为空"掩盖。
+        "sites": (
+            "title", "server", "tech", "scheme", "ip",
+            "cert_sha256", "cert_issuer_cn", "cert_issuer_org",
+            "cert_subject_cn", "cert_san", "cert_not_after",
+        ),
         "ports": ("version", "banner"),
         "findings": ("description", "evidence", "cve", "reference_url", "severity"),
     }
     _MUTABLE_PLAIN: dict[str, tuple[str, ...]] = {
         "ports": ("state", "service", "protocol"),
-        "sites": ("status_code",),
+        "sites": ("status_code", "cert_expired", "cert_self_signed", "cert_days_left"),
     }
 
     def _upsert_asset(
@@ -515,8 +744,7 @@ class Storage:
         table: str,
         workspace_id: int,
         task_id: int,
-        unique_key: str,
-        hash_key: str,
+        identity: tuple,
         fields: dict,
         module: str,
         confidence: int = 50,
@@ -528,11 +756,17 @@ class Storage:
         - 修复并发 TOCTOU(两线程同时插同一新资产撞 UNIQUE)
         - 修复重扫不刷新业务字段(端口永 open / resolved_ip 永 None)
 
+        `identity` 是**分段**的身份(ports 传 `(host, port)`),怎么拼由
+        `compute_asset_hash` 独占。以前这里是 `unique_key` + `hash_key` 两个
+        参数,后者在函数体里**从来没被读过**(r48 实测:5 个调用点传了,零引用),
+        而且 5 处传的还都和 `unique_key` 同值 —— 纯冗余。现在一个参数就够,
+        而且段的形状和 CLI 的 `monitor changes --asset` 共用同一份定义。
+
         Returns:
             True=新插入, False=已存在(仅刷新)
         """
         now = datetime.utcnow().isoformat()
-        asset_hash = compute_hash(str(workspace_id), unique_key)
+        asset_hash = compute_asset_hash(workspace_id, table, *identity)
 
         cols = ["workspace_id", "task_id", "hash", "confidence", "risk",
                 "module", "first_seen", "last_seen", "discovered_at"]
@@ -554,8 +788,12 @@ class Storage:
         update_clause = ", ".join(sets)
 
         with self._conn() as conn:
+            # `SELECT *` 而不是 `SELECT 1`:这一行本来就是「看这个 hash 在不在」,
+            # 顺手把旧行取出来就够 —— **旧行就是上一轮扫描的状态**,字段级变更
+            # 检测的快照因此不需要新表(r44 实测:加 `SELECT *` 不增加往返次数,
+            # 同一句查询而已)。
             existing = conn.execute(
-                f"SELECT 1 FROM {table} WHERE hash = ?", (asset_hash,)
+                f"SELECT * FROM {table} WHERE hash = ?", (asset_hash,)
             ).fetchone()
             conn.execute(
                 f"""INSERT INTO {table} ({', '.join(cols)}) VALUES ({placeholders})
@@ -564,9 +802,57 @@ class Storage:
             )
             if existing:
                 log.debug(f"upsert: {table} hash={asset_hash} first_seen kept, refreshed")
+                changes = self._detect_field_changes(existing, fields,
+                                                    text_cols, plain_cols)
+                if changes and self._on_field_change is not None:
+                    try:
+                        self._on_field_change(table, existing["hash"], changes)
+                    except Exception as e:      # noqa: BLE001 - 旁路,不能拖垮入库
+                        log.warning("field change not recorded (%s): %s", table, e)
                 return False
             log.debug(f"upsert: {table} hash={asset_hash} (new insert)")
             return True
+
+    def _detect_field_changes(self, old, fields: dict,
+                              text_cols, plain_cols) -> dict:
+        """这次 upsert 真的改动了哪些字段 —— **只回答「变了什么」**
+
+        ## 判据必须和上面那句 UPDATE 一致
+
+        TEXT 类字段的 UPDATE 是 `COALESCE(NULLIF(new, ''), old)` ——
+        **空值不覆盖旧值**。所以新值为空时存着的值没变,不算。
+        判据若直接比新旧值,一次采集失败(模块超时、解析不出来)
+        就会刷出一整片「这个资产的 IP 被清空了」的假告警。
+
+        ## 比身份不比相等
+
+        `True == 1` 在 Python 里为真,`!=` 会把「布尔字段改成数字」
+        整条吞掉 —— 变更记了,却没人看得见。
+
+        ## 这个方法不知道「变了」意味着什么
+
+        哪个字段对应哪种变更类型、要不要算基线噪声,那是 core 层的
+        知识。`db` 不 import `core`(见 tests/test_architecture.py 的
+        分层规则),所以它只交出 diff,由 `set_field_change_sink`
+        注册进来的回调去解释。
+        """
+        out = {}
+        for k, new in fields.items():
+            if k not in plain_cols and k not in text_cols:
+                continue
+            old_v = old[k] if k in old.keys() else None
+            effective = new if (k in plain_cols or new) else old_v
+            if (type(effective).__name__, effective) != (type(old_v).__name__, old_v):
+                out[k] = {"before": old_v, "after": effective}
+        return out
+
+    def set_field_change_sink(self, fn) -> None:
+        """注册「字段变了」的回调(生产路径由 core.task_runner 接上)
+
+        没注册就只是不记变更,不会报错 —— 采集照常进行。字段级检测
+        是**旁路**:它挂了不能拖垮入库,没挂也不该拦住入库。
+        """
+        self._on_field_change = fn
 
     # ---------- 批量入库(Phase 7 性能优化)----------
 
@@ -648,19 +934,15 @@ class Storage:
                         if ts_col in valid_cols:
                             row.setdefault(ts_col, now)
                     if "hash" in valid_cols and "hash" not in row:
-                        # 自动用表典型 unique key 算 hash
-                        # 注意:列名 alias 已生效,ports 表此时键是 ip(不是 host)
-                        if table == "findings":
-                            unique = f"{row.get('target', '')}|{row.get('finding_type', '')}|{row.get('title', '')}"
-                        elif table == "ports":
-                            unique = f"{row.get('ip', '')}:{row.get('port', '')}"
-                        elif table == "sites":
-                            unique = row.get("url", "")
-                        elif table == "correlations":
-                            unique = f"{row.get('rule_name', '')}|{row.get('target', '')}"
-                        else:
-                            unique = row.get("host") or row.get("domain") or row.get("name") or str(i)
-                        row["hash"] = compute_hash(str(self.workspace_id), unique)
+                        # 身份怎么拼归 `_ASSET_IDENTITY` 一家(和 `add_*` 用的
+                        # 是同一份),按**列名**从这一行里取,不再是本文件里
+                        # 第二份 if-else。
+                        #
+                        # 白名单里 correlations 没有 hash 列,压根到不了这里
+                        # —— 原来那个 `elif table == "correlations"` 分支
+                        # 是死代码,和 r48 删掉的 `hash_key` 死参数同一类。
+                        row["hash"] = asset_identity_of_row(
+                            self.workspace_id, table, row)
 
                     if on_conflict == "ignore":
                         cols = list(row.keys())
@@ -673,9 +955,12 @@ class Storage:
                             )
                             inserted += 1
                         except sqlite3.IntegrityError as e:
-                            msg = str(e).lower()
-                            if "unique" in msg or "conflict" in msg:
-                                # UNIQUE 冲突 = 重复,跳过
+                            # 分类必须按错误码,不能按报文:
+                            # 报文里带列名/约束表达式,叫 unique_flag 的
+                            # NOT NULL 列会被 `"unique" in msg` 误判成
+                            # 重复,于是被静默 skip 掉——丢数据还不报错。
+                            # 详见 arl_lite/db/errors.py
+                            if _classify_integrity_error(e) == _DUPLICATE:
                                 skipped += 1
                             else:
                                 # 其他约束(NOT NULL / FK / CHECK) = 真错
@@ -733,8 +1018,7 @@ class Storage:
         workspace_id = self.workspace_id
         return self._upsert_asset(
             "domains", workspace_id, task_id,
-            unique_key=domain,
-            hash_key=domain,
+            identity=(domain,),
             fields={
                 "domain": domain,
                 "source": source,
@@ -769,8 +1053,7 @@ class Storage:
         workspace_id = self.workspace_id
         return self._upsert_asset(
             "hosts", workspace_id, task_id,
-            unique_key=host,
-            hash_key=host,
+            identity=(host,),
             fields={
                 "host": host,
                 "ip": ip,
@@ -811,8 +1094,7 @@ class Storage:
         workspace_id = self.workspace_id
         return self._upsert_asset(
             "ports", workspace_id, task_id,
-            unique_key=f"{host}:{port}",
-            hash_key=f"{host}:{port}",
+            identity=(host, port),
             fields={
                 "ip": host,  # schema 字段是 ip,但接受域名也行
                 "port": port,
@@ -891,11 +1173,9 @@ class Storage:
         if severity not in KNOWN_SEVERITY:
             severity = "info"
         workspace_id = self.workspace_id
-        unique = f"{target}|{finding_type}|{title}"
         return self._upsert_asset(
             "findings", workspace_id, task_id,
-            unique_key=unique,
-            hash_key=unique,
+            identity=(target, finding_type, title),
             fields={
                 "module": source,
                 "finding_type": finding_type,
@@ -930,12 +1210,21 @@ class Storage:
         module: str = "httpx",
         confidence: int = 50,
         risk: int = 0,
+        # TLS 证书(可选,非 https 站点为空)—— 资产归属判定的核心维度
+        cert_sha256: str | None = None,
+        cert_issuer_cn: str | None = None,
+        cert_issuer_org: str | None = None,
+        cert_subject_cn: str | None = None,
+        cert_san: str | None = None,
+        cert_not_after: str | None = None,
+        cert_expired: int = 0,
+        cert_self_signed: int = 0,
+        cert_days_left: int | None = None,
     ) -> bool:
         workspace_id = self.workspace_id
         return self._upsert_asset(
             "sites", workspace_id, task_id,
-            unique_key=url,
-            hash_key=url,
+            identity=(url,),
             fields={
                 "url": url,
                 "host": host,
@@ -946,6 +1235,15 @@ class Storage:
                 "server": server,
                 "status_code": status_code,
                 "tech": tech,
+                "cert_sha256": cert_sha256,
+                "cert_issuer_cn": cert_issuer_cn,
+                "cert_issuer_org": cert_issuer_org,
+                "cert_subject_cn": cert_subject_cn,
+                "cert_san": cert_san,
+                "cert_not_after": cert_not_after,
+                "cert_expired": cert_expired,
+                "cert_self_signed": cert_self_signed,
+                "cert_days_left": cert_days_left,
             },
             module=module,
             confidence=confidence,
@@ -985,12 +1283,123 @@ class Storage:
     # 查询
     # =========================
 
+    # 能被 `query` / `count_rows` 查的表。**和 `bulk_insert` 里那个局部
+    # `ALLOWED_TABLES` 不是一回事,故意不同名**:那边是「能批量写入的表」,
+    # 这边是「能读的表」—— 集合确实不同(这边多 tasks / monitors /
+    # asset_changes 等),合起来会让两个白名单慢慢漂成同一个。
+    QUERY_TABLES = frozenset({
+        "domains", "hosts", "ports", "sites", "findings",
+        "tasks", "source_status", "correlations", "asset_changes",
+        "workspaces", "monitors", "schedules",
+    })
+
+    @staticmethod
+    def _query_where(table: str, ws: int, filter_sql: str | None) -> str:
+        """`query` 的 WHERE 片段。**只此一份**,`query` 和 `count_rows` 共用
+
+        ## 为什么抽出来(r56)
+
+        CLI 要报「共 N 条,只显示了 M 条」。那个 N 如果自己再拼一遍
+        WHERE,一旦两边漂了就会说出「共 200 条」而当前筛选下其实只有
+        50 条 —— **比不报更坏**,那是个看起来精确的假数字。r55 在
+        `asset_changes` 上栽过一次(r51 的 dry-run 骗人同源),这里不重复。
+
+        `filter_sql` 是**用户传的** SQL 子句,所以共用尤其要紧:一条
+        `--filter "status='down'"` 的总数,必须和列表数的是同一批行。
+        """
+        sql = " WHERE workspace_id = ?"
+        if filter_sql:
+            check_filter_sql(filter_sql)
+            sql += f" AND ({filter_sql})"
+        return sql
+
+    def fetch_all(self, table: str, cap: int | None = None) -> tuple[list[dict], int]:
+        """取这个表的行,并**同时**告诉你库里一共多少行
+
+        返回 `(rows, total)`。`rows` 最多 `cap` 行(`EXPORT_ROW_CAP`),
+        `total` 是这张表在当前工作区里真实的行数。
+
+        ## 为什么要这么别扭地返回两个数(r57)
+
+        因为 `rows` **看不出自己是不是完整的**。r57 之前 `cmd_export`
+        写的是 `storage.query(table, limit=10000)`,拿 12000 行去导,
+        导出文件里静静躺着 10000 行,命令还打印「exported to ...」、
+        退出码 0 —— 用户拿到一个**不完整的文件**去做分析/迁移/归档,
+        推导出的结论是错的,而工具说一切正常。
+
+        `limit` 是数据访问的正常参数,不该被顺手用来「导出全部」。
+        把「取」和「一共多少」绑在一个返回值里,调用方**不可能**在
+        无意间丢掉第二个数 —— 而丢掉它正是 r57 那个 bug 的全部。
+
+        同 `count_rows` 一样走 `QUERY_TABLES` 白名单,表名不接受外部拼接。
+
+        ## 为什么分页,而不是一次 `query(limit=n)`(r59)
+
+        `query` 有个单次行数护栏 `_QUERY_PAGE_LIMIT`。r57 第一版这里直接
+        `query(limit=n)`,于是 `n` 一旦被调大(比如把 `EXPORT_ROW_CAP` 提到
+        20000)就撞死:
+
+            ValueError: limit must be int 0..10000, got 20000
+
+        而 r57 给用户的警告里恰恰写着「或调高 EXPORT_ROW_CAP」——
+        **给用户一条走不通的建议,比不给更坏**:他照做,然后撞上一个和真正
+        原因毫无关系的崩溃。(这和 r58 那个「推荐了 correlate 没有的 --json」
+        是同一个错。)
+
+        护栏本身是合理的(防误传巨大 limit 把整表 list 化),所以不拆它,
+        改成**分页**:每页都在护栏内,页数不限,内存占用是单页量级而不是
+        全表量级。`query` 的 `ORDER BY id DESC` 让分页结果保持原顺序。
+        这样一个真正需要「一次导全」的人调大 `EXPORT_ROW_CAP` 就**能用**,
+        而提示里那句话不再是空头支票。
+        """
+        if table not in self.QUERY_TABLES:
+            raise ValueError(
+                f"table '{table}' not in whitelist: {sorted(self.QUERY_TABLES)}")
+        n = EXPORT_ROW_CAP if cap is None else int(cap)
+        if n < 0:
+            raise ValueError(f"cap must be >= 0, got {cap!r}")
+        total = self.count_rows(table)
+        want = min(n, total)
+        rows: list[dict] = []
+        while len(rows) < want:
+            # `offset=len(rows)` 不是可有可无的:没有它,每页都取回**同样**
+            # 的前 N 行。r59 第一版就是漏了它,而 r59 的判据当场逮到
+            # (20500 行分三页,只拿到 10000 个不同的 id,10500 条重复)。
+            page = self.query(table, limit=min(_QUERY_PAGE_LIMIT,
+                                                want - len(rows)),
+                              offset=len(rows))
+            if not page:            # 期间被并发删了:少拿的就少拿,但 total 已经说了真相
+                break
+            rows.extend(page)
+        return rows, total
+
+    def count_rows(
+        self,
+        table: str,
+        filter_sql: str | None = None,
+        workspace_id: int | None = None,
+    ) -> int:
+        """这张表在当前筛选下**一共**有多少行 —— `query` 截断前的真实条数
+
+        走 `_query_where`,和 `query` 同一份条件(含 `check_filter_sql`
+        的白名单校验),所以两边不会漂。表名白名单也共用同一份。
+        """
+        if table not in self.QUERY_TABLES:
+            raise ValueError(
+                f"table '{table}' not in whitelist: {sorted(self.QUERY_TABLES)}")
+        ws = workspace_id or self.workspace_id
+        where = self._query_where(table, ws, filter_sql)
+        with self._conn() as conn:
+            return int(conn.execute(
+                f"SELECT COUNT(*) FROM {table}{where}", [ws]).fetchone()[0])
+
     def query(
         self,
         table: str,
         filter_sql: str | None = None,
         limit: int = 50,
         workspace_id: int | None = None,
+        offset: int = 0,
     ) -> list[dict]:
         """通用查询(带白名单,禁止 DROP/DELETE/UPDATE)
 
@@ -998,22 +1407,24 @@ class Storage:
             table: 表名(白名单:domains/hosts/ports/sites/findings/tasks/source_status/correlations)
             filter_sql: 可选 WHERE 子句(不含 WHERE 关键字)
             limit: 最大行数
+            offset: 跳过前多少行。r59 加的 —— `fetch_all` 分页要靠它,
+                否则每页都取回**同样**的前 N 行(判据实测逮到过:
+                20500 行分三页取,只拿到 10000 个不同的 id,10500 条重复)。
         """
-        ALLOWED = {"domains", "hosts", "ports", "sites", "findings",
-                   "tasks", "source_status", "correlations", "asset_changes",
-                   "workspaces", "monitors", "schedules"}
-        if table not in ALLOWED:
-            raise ValueError(f"table '{table}' not in whitelist: {sorted(ALLOWED)}")
+        if table not in self.QUERY_TABLES:
+            raise ValueError(
+                f"table '{table}' not in whitelist: {sorted(self.QUERY_TABLES)}")
 
         ws = workspace_id or self.workspace_id
-        if not isinstance(limit, int) or limit < 0 or limit > 10000:
-            raise ValueError(f"limit must be int 0..10000, got {limit!r}")
-        sql = f"SELECT * FROM {table} WHERE workspace_id = ?"
+        if not isinstance(limit, int) or limit < 0 or limit > _QUERY_PAGE_LIMIT:
+            raise ValueError(
+                f"limit must be int 0..{_QUERY_PAGE_LIMIT}, got {limit!r}")
+        if not isinstance(offset, int) or offset < 0:
+            raise ValueError(f"offset must be int >= 0, got {offset!r}")
+        where = self._query_where(table, ws, filter_sql)
+        sql = (f"SELECT * FROM {table}{where} "
+               f"ORDER BY id DESC LIMIT {int(limit)} OFFSET {int(offset)}")
         params: list = [ws]
-        if filter_sql:
-            check_filter_sql(filter_sql)
-            sql += f" AND ({filter_sql})"
-        sql += f" ORDER BY id DESC LIMIT {int(limit)}"
         with self._conn() as conn:
             try:
                 rows = conn.execute(sql, params).fetchall()
@@ -1025,30 +1436,76 @@ class Storage:
 
     # ---------- 全文搜索(FTS5)----------
 
+    FTS_TABLES = {"sites": "sites_fts", "domains": "domains_fts",
+                  "findings": "findings_fts"}
+
+    def _search_where(self, table: str, keyword: str) -> tuple[str, str, list]:
+        """FTS 搜索的 FROM/JOIN/WHERE 片段 + 参数。**只此一份**,
+        `search` 和 `count_search` 共用。
+
+        关键词的双引号包裹和转义在这里做一次 —— 那是安全边界的一部分,
+        两处各写一遍就等于两处各漏一次。r56 的理由同 `_query_where`:
+        「数出来的」和「查出来的」必须是同一批行,否则报出的是个
+        看起来精确的假总数。
+        """
+        if table not in self.FTS_TABLES:
+            raise ValueError(f"FTS not available for {table}")
+        fts_table = self.FTS_TABLES[table]
+        # FTS5 特殊字符: . , : ; ! ? * " ( ) [ ] { } ^ $ - + |
+        # 用双引号包整个 phrase,FTS5 双引号内特殊字符视为字面量
+        # 内部双引号转义为 ""
+        if not keyword or not keyword.strip():
+            return "", "", []
+        safe = keyword.strip().replace('"', '""')
+        fts_query = f'"{safe}"'
+        frag = (f"FROM {table} JOIN {fts_table} "
+                f"ON {fts_table}.rowid = {table}.id "
+                f"WHERE {fts_table} MATCH ? AND {table}.workspace_id = ?")
+        return frag, fts_table, [fts_query, self.workspace_id]
+
+    def count_search(self, table: str, keyword: str) -> int | None:
+        """FTS 搜索在当前关键词下**一共**命中多少条 —— `search` 截断前的真实条数
+
+        走 `_search_where`,和 `search` 同一份 FROM/JOIN/WHERE 与转义。
+
+        ## 查不出来时返回 `None`,不是 0
+
+        `search` 在 FTS5 出错时会**退回 LIKE 搜索**继续给结果。那种情况下
+        本方法数的是 FTS 的条数,而列表给的是 LIKE 的条数 —— 两个不同的
+        集合,拿 FTS 的数当总数就是**报一个看起来精确的假数字**。
+
+        更糟的是把它当 0:`0` 的含义是「确实一条都没命中」,而真实情况是
+        「没查出来」。那正是 r47 在 `_ASSET_LABEL_FIELDS` 上栽过的
+        (列名写错 → 静默降级 → 什么都不报),这里同理 —— **静默比错更坏**。
+
+        所以查不出来就说查不出来:调用方拿 `None` 时不显示总数,或者
+        明说「总数未知」。返回类型是可空,int 才是「数出来了」。
+        """
+        frag, _, params = self._search_where(table, keyword)
+        if not frag:                      # 空关键词:`search` 返回 [],这里也是 0
+            return 0
+        with self._conn() as conn:
+            try:
+                return int(conn.execute(
+                    f"SELECT COUNT(*) {frag}", params).fetchone()[0])
+            except Exception as e:
+                # 不 raise:统计是旁路,不该让整条命令挂掉。但也不能假装数到了。
+                log.warning(f"FTS5 count failed for keyword {keyword!r}: {e}")
+                return None
+
     def search(
         self,
         table: str,        # "sites" | "domains" | "findings"
         keyword: str,
         limit: int = 50,
     ) -> list[dict]:
-        FTS_TABLES = {"sites": "sites_fts", "domains": "domains_fts", "findings": "findings_fts"}
-        if table not in FTS_TABLES:
-            raise ValueError(f"FTS not available for {table}")
-        fts_table = FTS_TABLES[table]
-        # FTS5 特殊字符: . , : ; ! ? * " ( ) [ ] { } ^ $ - + |
-        # 用双引号包整个 phrase,FTS5 双引号内特殊字符视为字面量
-        # 内部双引号转义为 ""
-        if not keyword or not keyword.strip():
+        frag, _, params = self._search_where(table, keyword)
+        if not frag:                      # 空关键词
             return []
-        safe = keyword.strip().replace('"', '""')
-        fts_query = f'"{safe}"'
-        sql = f"""SELECT {table}.* FROM {table}
-                  JOIN {fts_table} ON {fts_table}.rowid = {table}.id
-                  WHERE {fts_table} MATCH ? AND {table}.workspace_id = ?
-                  ORDER BY rank LIMIT {int(limit)}"""
+        sql = f"SELECT {table}.* {frag} ORDER BY rank LIMIT {int(limit)}"
         with self._conn() as conn:
             try:
-                rows = conn.execute(sql, (fts_query, self.workspace_id)).fetchall()
+                rows = conn.execute(sql, params).fetchall()
             except Exception as e:
                 log.warning(f"FTS5 search failed for keyword {keyword!r}: {e}")
                 # fallback: 退到 LIKE 搜索(各表实际存在的列,别再引用不存在的列)

@@ -167,6 +167,16 @@ CREATE TABLE IF NOT EXISTS sites (
     tech TEXT,                         -- JSON,指纹结果
     response_headers TEXT,            -- JSON,响应头
     body_hash TEXT,                    -- 用于 site_change 检测
+    -- TLS 证书(资产归属判定的核心维度, 见 integrations/tls_cert.py)
+    cert_sha256 TEXT,                  -- 证书指纹,跨时间稳定
+    cert_issuer_cn TEXT,               -- 签发者 CN,如 GlobalSign nv-sa
+    cert_issuer_org TEXT,              -- 签发者组织
+    cert_subject_cn TEXT,              -- 主体 CN
+    cert_san TEXT,                     -- JSON array,证书认领的域名
+    cert_not_after TEXT,               -- 过期日期 YYYY-MM-DD
+    cert_expired INTEGER DEFAULT 0,    -- 1=已过期
+    cert_self_signed INTEGER DEFAULT 0,-- 1=自签(归属判定时降权)
+    cert_days_left INTEGER,            -- 距过期天数, NULL=未知
     screenshot_path TEXT,
     -- 5 列 + 2 列(标准 7 列)
     hash TEXT NOT NULL,                -- sha256(workspace_id+url)
@@ -259,7 +269,11 @@ CREATE TABLE IF NOT EXISTS asset_changes (
     workspace_id INTEGER NOT NULL,
     asset_hash TEXT NOT NULL,
     asset_type TEXT NOT NULL,          -- domain/host/port/site/finding
-    change_type TEXT NOT NULL,         -- NEW_ASSET / DISAPPEARED / TITLE_CHANGED / TECH_CHANGED / FINGERPRINT_CHANGED / STATUS_CHANGED
+    -- change_type 的取值与 core/monitor.py 的 CHANGE_TYPES 一一对应。
+    -- 这行注释**是契约的一部分**,不是给人看的说明:tests/test_monitor_change_type_whitelist.py
+    -- 会把它读出来跟 CHANGE_TYPES 比,对不上就红。r42 时它是死文档(列 6 种、代码只产 2 种),
+    -- r44 补齐了字段级类型,两边才第一次对上。
+    change_type TEXT NOT NULL,         -- NEW_ASSET / DISAPPEARED / ADDRESS_CHANGED / TITLE_CHANGED / TECH_CHANGED / FINGERPRINT_CHANGED / STATUS_CHANGED
     before_value TEXT,                -- JSON,变更前快照
     after_value TEXT,                 -- JSON,变更后快照
     diff TEXT,                         -- JSON,字段级 diff
@@ -327,6 +341,10 @@ CREATE TABLE IF NOT EXISTS correlations (
     matched_assets TEXT,               -- JSON,命中的资产
     matched_count INTEGER DEFAULT 0,
     evidence TEXT,                     -- JSON,执行引擎的中间结果
+    confidence INTEGER DEFAULT 50,     -- 0-100,证据强度(见 core/confidence.py)
+    confidence_level TEXT,             -- high/medium/low,规则声明的档位
+    confidence_status TEXT,            -- report/observe/discard,处置决定
+    confidence_factors TEXT,           -- JSON,各因子贡献(用于解释这个分怎么来的)
     detected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(workspace_id, rule_name, target),
     FOREIGN KEY (workspace_id) REFERENCES workspaces(id) ON DELETE CASCADE

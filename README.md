@@ -79,8 +79,9 @@ arl-lite
 │   ├── test_phase5.py                # dirscan/nuclei/github/MCP
 │   ├── test_phase6.py                # DNS/WHOIS/HTML
 │   ├── test_phase7.py                # bulk_insert/notify/watcher          ★ v0.7
-│   ├── test_edge.py                  # 13 类边界
-│   └── test_concurrency.py           # 并发 + 隔离
+│   ├── test_no_real_home_writes.py    # 守门:测试不许写用户真实 HOME
+│   ├── scripts/edge_check.py         # 手工脚本(原 test_edge.py,非 pytest)
+│   └── scripts/concurrency_check.py  # 手工脚本(原 test_concurrency.py)
 └── docs/
     ├── PROJECT_PLAN.md               # 1454 行完整设计
     ├── COMPETITOR_ANALYSIS.md        # 184 行竞品分析
@@ -91,13 +92,25 @@ arl-lite
 
 ### 安装
 
-```bash
-# 零依赖,直接拷走用
-tar -xzf arl-lite-v0.7.1.tar.gz
-cd arl-lite
+零第三方依赖,Python 3.10+ 即可运行。**三种方式任选,都不需要打包好的 tarball**
+(本仓库不产出发行包,`git clone` 或直接拷目录即可):
 
-# 或者 pip install -e . (但其实不需要,stdlib 就够)
+```bash
+# 方式 1:克隆后直接用,什么都不装(推荐)
+git clone <repo-url> arl-lite
+cd arl-lite
+PYTHONPATH=. python3 -m arl_lite version
+
+# 方式 2:装成 arl-lite 命令,之后就能直接敲 arl-lite
+./install.sh            # 等价于 make install
+
+# 方式 3:手动装(需要能写 site-packages)
+python3 -m pip install -e .
 ```
+
+> PEP 668 环境(Debian/Ubuntu 的 `python3`、Homebrew 的部分版本)会拒绝
+> `pip install -e .`,报 `externally-managed-environment`。改用方式 1,
+> 或按提示加 `--break-system-packages`。`install.sh` 会自动尝试该参数。
 
 ### 跑一个任务
 
@@ -202,9 +215,9 @@ arl-lite ai config set ollama --base-url http://localhost:11434
 # 5 个 boundary commands
 arl-lite ai ask "解释这个关联分析"
 arl-lite ai report -w default
-arl-lite ai explain --finding-id 123
-arl-lite ai suggest --target example.com
-arl-lite ai fix --rule-id dev_port_public
+arl-lite ai explain 123
+arl-lite ai suggest -w default
+arl-lite ai fix 42
 ```
 
 ## 17 modules
@@ -369,11 +382,30 @@ test_phase4.py          8/8  AI 集成 + 24 bug regression
 test_phase5.py          7/7  dirscan/nuclei/github/MCP
 test_phase6.py          6/6  DNS/WHOIS/HTML 报告
 test_phase7.py          8/8  bulk/notify/watcher     ★
-test_edge.py           13/13 边界
-test_concurrency.py     7/7  并发 + 隔离
 
 bug audit history: 12 + 12 + 7 + 8 = 39 真 bug,全部修
 ```
+
+> **更正(r23)** 上面这份清单原本还列着:
+>
+> ```
+> test_edge.py           13/13 边界
+> test_concurrency.py     7/7  并发 + 隔离
+> ```
+>
+> **那两个数字是假的。** 13/13 和 7/7 是这两个文件自己 `print` 出来的,
+> 而它们**一个 `test_` 函数都没有** —— 全是顶层语句的手工脚本。
+> pytest 从它们身上收集到 **0 条**测试,那两行从来没被验证过。
+>
+> 更糟的是它们文件名匹配 `test_*.py`,所以 pytest 每次收集都会
+> `import` 它们,副作用每次都跑一遍 —— 其中 `test_edge.py` 会起一个
+> CLI 子进程且没传 `-w`,于是在**用户真实 HOME** 里建出了
+> `default` 工作区。
+>
+> 这和"置信度算了 20 轮没人用"是同一类病:**看起来有,和真的有,
+> 不是一回事。** 已改为 `scripts/` 下的手工脚本,并在
+> `tests/conftest.py` 里 `collect_ignore` 掉。
+> `README` 里凡是脚本自己 print 的数字,都不算测试结果。
 
 ## Roadmap (2026-09 调研结论)
 

@@ -140,7 +140,5 @@ async def collect_subdomains(
     except ValueError as e:
         # 集成层对响应结构/JSON 的主动 raise → parse(不是 unknown)
         return [], str(e), "parse"
-    except PermissionError as e:
-        return [], str(e), "auth"
     except Exception as e:
         return [], f"{type(e).__name__}: {e}", "unknown"

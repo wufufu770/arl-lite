@@ -1,6 +1,8 @@
 name: mongodb_public
 description: MongoDB 暴露公网(可能未授权 + 历史大规模脱裤)
 risk: 9
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: medium
 tags: [mongodb, exposure, unauth, data_leak]
 collect:
   - table: findings

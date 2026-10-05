@@ -1,6 +1,8 @@
 name: database_with_public_web
 description: 数据库暴露且同 IP 有公网 Web 服务(高危)
 risk: 10
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: high
 tags: [database, web, exposure, high_risk]
 collect:
   - table: ports

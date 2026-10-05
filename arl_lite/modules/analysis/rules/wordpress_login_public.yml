@@ -1,6 +1,8 @@
 name: wordpress_login_public
 description: WordPress 登录页暴露公网(爆破目标)
 risk: 6
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: low
 tags: [wordpress, login, brute_force]
 collect:
   - table: findings

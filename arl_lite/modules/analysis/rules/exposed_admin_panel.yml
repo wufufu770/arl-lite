@@ -1,6 +1,8 @@
 name: exposed_admin_panel
 description: 管理面板暴露公网
 risk: 8
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: high
 tags: [exposure, admin, network]
 collect:
   # 只收具名管理面板服务;泛化的 http-alt/http-proxy 由 dev_port_public 覆盖,

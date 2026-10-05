@@ -4,6 +4,7 @@ HTTP 站点探活模块(纯 urllib,无 httpx 依赖)。
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 
@@ -39,6 +40,7 @@ class HttpxProbeModule(BaseModule):
             timeout=timeout, concurrency=concurrency,
         ):
             results.append(site)
+            cert = site.get("cert") or {}
             self.storage.add_site(
                 task_id=self.task_id,
                 url=site["url"],
@@ -53,6 +55,16 @@ class HttpxProbeModule(BaseModule):
                 module=self.name,
                 # 证书校验失败的 https 站点内容可能被 MITM 伪造,置信度降级
                 confidence=70 if site.get("tls_verified") in (True, None) else 30,
+                # 证书信息(资产归属判定的核心维度,见 integrations/tls_cert.py)
+                cert_sha256=cert.get("sha256", ""),
+                cert_issuer_cn=cert.get("issuer_cn", ""),
+                cert_issuer_org=cert.get("issuer_org", ""),
+                cert_subject_cn=cert.get("subject_cn", ""),
+                cert_san=json.dumps(cert.get("san", []), ensure_ascii=False),
+                cert_not_after=cert.get("not_after", ""),
+                cert_expired=1 if cert.get("expired") else 0,
+                cert_self_signed=1 if cert.get("self_signed") else 0,
+                cert_days_left=cert.get("days_left"),
             )
 
         sr = self.make_source_result(

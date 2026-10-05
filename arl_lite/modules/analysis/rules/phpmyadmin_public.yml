@@ -1,10 +1,20 @@
 name: phpmyadmin_public
 description: phpMyAdmin 暴露公网(数据库管理工具)
 risk: 7
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: medium
 tags: [phpmyadmin, exposure, database, brute_force]
 collect:
   - table: findings
     where: "title = 'phpMyAdmin'"
+# 认证层排除。误报率实测发现:面板明明架在 Keycloak/Auth0 后面,
+# 本规则照样报"暴露公网" —— 因为 37 条规则里只有 3 条带 exclusion,
+# 同语义的 admin_panel_no_auth 带了,本规则没带。
+# 既然引擎已经能表达这一层,就没有理由只给一条规则写。
+exclusion:
+  - table: findings
+    where: "target = findings.target AND title IN ('Cloudflare', 'Keycloak', 'Auth0', 'Google reCAPTCHA', 'Cloudflare Access')"
+    description: "已有认证层或 CDN 保护,不是裸暴露"
 headline: "⚠️ phpMyAdmin 暴露公网: {target} (数据库管理工具)"
 advice: |
   1. 加上 IP 白名单(只允许内网)

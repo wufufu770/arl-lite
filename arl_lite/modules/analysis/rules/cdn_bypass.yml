@@ -1,6 +1,8 @@
 name: cdn_bypass
 description: 同一域名既有 CDN 又有直接 IP(可能 CDN 旁路)
 risk: 4
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: low
 tags: [cdn, network, misconfig]
 collect:
   - table: findings

@@ -9,15 +9,177 @@
 - monitors 表存监控任务配置
 - asset_changes 表存变更事件
 - diff 算法:用 last_run_at + first_seen 判断 NEW_ASSET
-- DISAPPEARED:这次没出现的 hash(需要 snapshot)
+- DISAPPEARED:靠 first_seen/last_seen 的时间差判断,不需要 snapshot 表
+  (资产表的 upsert 纪律「first_seen 永不变、last_seen 每次见到就 UPDATE」
+   已经把"存在过"和"最近还活着"编码进去了)
 """
 from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 log = logging.getLogger("arl_lite.core.monitor")
+
+# 变更类型 = **本模块产得出什么**(r42 起它不再是一份死文档)。
+# schema 注释里的 6 种是「这张表能存什么」,两者刻意不相等:
+# 按词表校验等于「注释里写过」就当「实现了」。
+#
+# `ADDRESS_CHANGED` 是 r44 加的第 7 种,schema 注释已同步更新 ——
+# 资产换了 IP 是资产监控最主要的变化之一,原先 6 种里没有任何一种
+# 能诚实地描述它(它是 STATUS_CHANGED?还是 TECH_CHANGED?都不对)。
+# 与其塞进一个勉强的类别,不如加一个真的。
+CHANGE_TYPES = (
+    "NEW_ASSET", "DISAPPEARED",
+    "ADDRESS_CHANGED", "TITLE_CHANGED", "TECH_CHANGED",
+    "FINGERPRINT_CHANGED", "STATUS_CHANGED",
+)
+
+# 字段 → 变更类型。**这张表就是契约**:没列在这里的可变字段,变了也不报。
+#
+# 为什么不给全部可变字段都配一个类型:
+# - `cert_expired` / `cert_days_left` 是**随时间算出来的**,不是资产变了。
+#   `cert_days_left` 每过一天就少 1,`cert_expired` 到期就翻面 —— 全报的话
+#   每轮扫描刷一条,那是拿噪音换覆盖面。
+# - `findings.*`(description / evidence / cve / reference_url / severity)
+#   基本是写入一次就不再变的产物字段,变了通常意味着换了数据源而不是
+#   资产变了。
+# 这两类都明写在这里,是为了让「为什么它不报」是个能查的决定,
+# 不是一条谁也看不见的静默。
+FIELD_CHANGE_TYPES = {
+    "ip": "ADDRESS_CHANGED",
+    "resolved_ip": "ADDRESS_CHANGED",
+    "title": "TITLE_CHANGED",
+    "tech": "TECH_CHANGED",
+    "server": "TECH_CHANGED",
+    "version": "TECH_CHANGED",
+    "banner": "TECH_CHANGED",
+    "state": "STATUS_CHANGED",
+    "service": "STATUS_CHANGED",
+    "protocol": "STATUS_CHANGED",
+    "status_code": "STATUS_CHANGED",
+    "cert_sha256": "FINGERPRINT_CHANGED",
+    "cert_not_after": "FINGERPRINT_CHANGED",
+}
+
+# DISAPPEARED 默认宽限期:48 小时。
+# 取 2× 常见监控周期(24h),意思是"容得下一次漏扫,拦得住真下线"。
+# 0 = 立刻判定,会因单次不完整扫描刷出大量误报,只在明确知道扫描完整时用。
+DEFAULT_DISAPPEARED_GRACE = 48 * 3600
+
+
+def _iso_minus_seconds(iso: str, seconds: int) -> str:
+    """把 ISO 时间戳往前推 seconds 秒,返回同格式 ISO 字符串
+
+    解析失败时原样返回 —— 宁可退化成"无宽限"也不要抛异常打断整轮扫描。
+    (调用方 detect_disappeared 对参数已经做过类型/范围校验)
+    """
+    try:
+        dt = datetime.fromisoformat(iso)
+    except (TypeError, ValueError):
+        log.debug("_iso_minus_seconds: 无法解析 %r,按无宽限处理", iso)
+        return iso
+    return (dt - timedelta(seconds=seconds)).isoformat()
+
+
+def parse_ts(value) -> datetime | None:
+    """把 SQLite / Python 两种时间戳格式统一成可比较的 naive datetime
+
+    ## 为什么不能直接字符串比较
+
+    同一个库里的时间戳有两种来源,格式不一样:
+
+    - `record_change` 写入 → `datetime.utcnow().isoformat()` → `2026-10-02T04:46:53.083355`
+    - 走 schema 默认值的行 → SQLite `CURRENT_TIMESTAMP` → `2026-10-02 04:46:53`
+
+    分隔符一个是 `T`(0x54)一个是空格(0x20),**空格排在 T 前面**。
+    所以哪怕是同一秒,`'... 04:46:53' >= '...T04:46:53'` 也是 False。
+    按字符串比大小会得出"资产在上报之后还活着"的相反结论,
+    于是已经报过的下线被反复上报(刷屏),或者该报的没报。
+
+    ## 边界处理
+
+    - 带时区的 ISO(`+00:00`)→ 去掉 tzinfo 统一成 naive。
+      库里存的都是无时区的本地时间语义,混着比较会直接抛 TypeError。
+    - 解析不了 → 返回 None,交给调用方决定。**不猜**。
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.replace(tzinfo=None)
+    s = str(value).strip()
+    if not s:
+        return None
+    # SQLite CURRENT_TIMESTAMP 用空格分隔且不带微秒
+    if " " in s and "T" not in s:
+        s = s.replace(" ", "T", 1)
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=None)
+
+
+# 比较时间戳时用的 SQL 表达式:把 SQLite `CURRENT_TIMESTAMP` 的空格换成 `T`,
+# 于是两种格式的字符串在字典序上可比。
+#
+# ## 为什么不能直接 `detected_at >= ?`
+#
+# 上面 `parse_ts` 的文档已经说过:空格(0x20)排在 `T`(0x54)**前面**。
+# 实测(r51):库里有一行 `detected_at='2026-10-03 07:19:23'`(走列的
+# `DEFAULT CURRENT_TIMESTAMP`,也就是任何直接 INSERT 都会得到的形状),
+# 而窗口起点是 `'2026-10-03T00:00:00'`(今天零点)——
+#
+#     朴素字符串比较: 命中 0 行    ← 07:19 明明在零点之后
+#     REPLACE 归一后: 命中 1 行
+#
+# `record_change` 总是显式写 `datetime.utcnow().isoformat()`,所以今天生产里
+# 全是 T 格式、这个洞碰不到。但**一旦拿它去做删除**,方向就反了:
+# 该删的行永远删不掉,表就永远缩不下去。所以这里不靠「现在碰不到」。
+#
+# 注意:归一只统一分隔符,**不统一微秒**。T 格式带微秒、SQLite 格式不带,
+# 同一秒内 `...T07:19:09` 比 `...T07:19:09.000000` 小。这对「今天零点」
+# 这种粗窗口无影响,但如果将来要做「精确到秒的滚动窗口」,得用 julianday()
+# 或者干脆统一写入格式 —— 别拿字符串比较当精确时间。
+_DETECTED_AT_SQL = "REPLACE(detected_at, ' ', 'T')"
+
+
+def _normalized(column: str) -> str:
+    """把某一列的时间戳归一成字典序可比的形状(见 `_DETECTED_AT_SQL`)"""
+    return f"REPLACE({column}, ' ', 'T')"
+
+
+def _since_clause(column: str, since_iso: str) -> tuple[str, str]:
+    """造出「这一列 >= 起点」的 SQL 片段和参数 —— 用于**取**较新的
+
+    `column` 由调用方给,而且必须是代码里的字面量 —— 这里不做白名单,
+    因为片段会拼进 SQL。调用方(本文件内的几处)传的都是自己写死的列名。
+    """
+    dt = parse_ts(since_iso)
+    if dt is None:
+        raise ValueError(
+            f"since must be a parseable timestamp, got {since_iso!r}")
+    return (f"{_normalized(column)} >= ?", dt.isoformat())
+
+
+def _older_than_clause(column: str, older_than_iso: str) -> tuple[str, str]:
+    """造出「这一列 < 起点」的 SQL 片段和参数 —— 用于**删**较旧的
+
+    ## 为什么单独一个函数,而不是给 `_since_clause` 加个方向参数
+
+    因为 r51 第一版就是把「删较旧」也用了 `>=` —— 方向反了,`monitor prune
+    --yes` 删掉的是**最新**那几条,旧的全留着。实测抓到的。
+
+    这类错误特别阴险:命令不报错、退出码 0、而且**看起来删成功了**(行数确实
+    少了),只是删错了方向。所以两个方向必须是两个**名字**,让用错方向这件事
+    在 code review 里就看得出来 —— `prune` 里出现 `_since_clause` 应该是
+    一眼能发现的错。
+    """
+    dt = parse_ts(older_than_iso)
+    if dt is None:
+        raise ValueError(
+            f"older_than must be a parseable timestamp, got {older_than_iso!r}")
+    return (f"{_normalized(column)} < ?", dt.isoformat())
 
 
 class Monitor:
@@ -126,11 +288,364 @@ class Monitor:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def detect_disappeared(
+        self,
+        asset_type: str,
+        since_iso: str,
+        grace_seconds: int = DEFAULT_DISAPPEARED_GRACE,
+    ) -> list[dict]:
+        """检测「本次运行没再出现」的资产(基于 last_seen)
+
+        ## 判定条件
+
+        某资产相对一次运行(起始 `since_iso`)算 DISAPPEARED,当且仅当:
+
+        - `first_seen < since_iso` —— 运行开始前它就存在(否则是新增,不是消失)
+        - `last_seen  < since_iso` —— 本次运行期间一次都没再见到
+
+        资产表的 upsert 纪律是「first_seen 永不变,last_seen 每次见到就 UPDATE」,
+        所以这两个时间戳天然编码了"存在过"和"最近还活着"。**不需要额外的
+        snapshot 表**——这就是当初把 last_seen 设计成必更新的原因。
+
+        ## 去抖(grace_seconds)
+
+        朴素实现有个致命问题:一次**不完整**的扫描(某个模块超时、crt.sh 限流、
+        DNS 解析失败)会让它本该覆盖的资产全部"消失",于是一条抖动就刷出
+        上千条 DISAPPEARED 告警。
+
+        所以加宽限期:资产必须连续 `grace_seconds` 没被见到才判定下线。
+        24h 周期 + 默认 48h 宽限 = 容得下一次漏扫,拦得住真下线。
+
+        ## 这个方法解决不了什么(重要)
+
+        **时间宽限区分不了「资产真没了」和「负责发现它的模块这轮挂了」。**
+        一次部分失败的扫描跑满两轮之后,宽限期照样会被耗尽,误报照样发生。
+        真正的解法需要按数据源的成功率来算(模块失败 → 该模块的数据不算"消失"),
+        而 arl-lite 目前没有采集这个信息。
+
+        所以这里选择:把机制做对(状态判定 + 状态转移去重 + 可配置宽限),
+        **把局限写明白**,而不是假装解决了。误报率的实测是队列里的
+        `item-21-c66b81`,它依赖真实数据源才能给结论。
+
+        Args:
+            asset_type: domain/host/port/site/finding
+            since_iso: 本次运行的起始时间(ISO),对应 detect_changes 的同一参数
+            grace_seconds: 宽限期秒数。0 = 立刻判定(慎用,会抖)
+
+        Returns:
+            消失资产行列表(与 detect_changes 同形状)
+        """
+        table = self._ASSET_TABLES.get(asset_type)
+        if table is None:
+            raise ValueError(f"unknown asset_type: {asset_type!r} "
+                             f"(choose from {sorted(self._ASSET_TABLES)})")
+        if grace_seconds < 0:
+            raise ValueError(f"grace_seconds must be >= 0, got {grace_seconds}")
+
+        # 宽限期换算成时间戳上界:比 since_iso 再早这么多仍没被见到 → 算消失。
+        # 用 Python 算而不是 SQL 的 datetime(),因为 since_iso 是 ISO 字符串,
+        # 交给 SQLite 解析会踩时区/格式的坑。
+        cutoff = _iso_minus_seconds(since_iso, grace_seconds)
+
+        # 表名来自上面的白名单映射,不接受外部拼接
+        sql = f"""SELECT * FROM {table}
+                  WHERE workspace_id = ?
+                    AND first_seen < ?
+                    AND (last_seen IS NULL OR last_seen < ?)"""
+        params = [self.s.workspace_id, since_iso, cutoff]
+        with self.s._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+
+    def filter_newly_disappeared(self, rows: list[dict]) -> list[dict]:
+        """从消失行里滤掉"已经报过 DISAPPEARED 且之后没复活"的
+
+        不做去重的话,一次下线会被每轮扫描重复上报一遍,`monitor changes`
+        里全是同一条hash 的刷屏。
+
+        判据:asset_changes 里已存在一条同 hash 的 DISAPPEARED 记录,且它的
+        detected_at **晚于**该资产的最后一次 last_seen —— 说明"消失"这个
+        状态转移已经报过了,还没恢复过。资产复活后 last_seen 会前移,
+        于是下次再消失时又能正常上报。
+
+        这是**状态转移**检测而不是水位检测:比"有没有报过"准,因为它能
+        区分"一直没复活"和"复活后又掉了"。
+        """
+        if not rows:
+            return []
+        out = []
+        with self.s._conn() as conn:
+            for row in rows:
+                asset_hash = row.get("hash")
+                if not asset_hash:
+                    continue
+                prior = conn.execute(
+                    """SELECT detected_at FROM asset_changes
+                       WHERE workspace_id = ? AND asset_hash = ?
+                         AND change_type = 'DISAPPEARED'
+                       ORDER BY id DESC LIMIT 1""",
+                    (self.s.workspace_id, asset_hash),
+                ).fetchone()
+                if not prior:
+                    out.append(row)
+                    continue
+                # 必须解析成 datetime 再比。直接比字符串的话,
+                # SQLite CURRENT_TIMESTAMP 的空格分隔格式永远小于
+                # Python isoformat 的 T 分隔格式,去重会完全失效。
+                reported_at = parse_ts(prior["detected_at"])
+                last_seen = parse_ts(row.get("last_seen"))
+                if reported_at is None or last_seen is None:
+                    # 时间戳认不出来就不去重:宁可重复报一次,也别漏报下线
+                    log.debug(
+                        "filter_newly_disappeared: hash=%s 时间戳无法比较,"
+                        "detected_at=%r last_seen=%r,按未上报处理",
+                        asset_hash, prior["detected_at"], row.get("last_seen"),
+                    )
+                    out.append(row)
+                    continue
+                if reported_at >= last_seen:
+                    # 已有上报记录,且记录时间不早于最后存活时间 → 已报过
+                    continue
+                out.append(row)
+        return out
+
+
+DEFAULT_BASELINE_LEARN = 3
+
+
+def _val_identity(value):
+    """给一个从 JSON 里读出来的值一个可比较的身份
+
+    带类型名:JSON 的 `true` 和 `1` 被 Python 读成 `True` 和 `1`,
+    而 `True == 1` 为真 —— 布尔字段改成数字会被误当成"变回过"。
+    """
+    return (type(value).__name__, value)
+
+
+def _field_transitions(rows, field: str) -> tuple[int, bool]:
+    """从历史行里读出这个字段"变过几次"和"有没有变回过"
+
+    返回 `(证据条数, 是否变回过)`。
+
+    ## 「变回过」是把取值排成一条序列,看有没有重复
+
+    序列 = 第一次的 before,后面每次的 after。所以
+
+    - `A→B, B→A` 的序列是 `A, B, A` —— A 出现两次,它回来过,是抖动;
+    - `A→B1, B1→B2` 的序列是 `A, B1, B2` —— 三个值各一次,它一路往前,
+      是演进。
+
+    **不能**在遍历时看"当前 before 在不在见过的值里"—— 连续链的接缝
+    必然命中(A→B 之后见过 B,下一条 B→C 的 before 就是 B),那样两段以上
+    的链一律被判成"变回过",等于这个判据根本不干活。接缝在序列里只占
+    **一个**位置,所以必须先把序列拼出来再看重复。
+
+    ## 为什么 LIKE 不能当判据,一定要 parse
+
+    `diff LIKE '%"ip"%'` 会把 `{"geo": {"before": {"ip": ...}}}` 这种**嵌套**
+    同名字段也算进去 —— 那只是别的字段的取值内容。所以 LIKE 现在只当
+    **预筛**:宁可多捞几行(漏掉才是致命的),捞回来的一律 parse,
+    判据由 parse 后的**顶层 key** 决定。预筛里 `%`/`_` 仍是通配符,
+    只会多捞不会少捞,这个方向的宽松是安全的。
+
+    ## 认不出来的行不算证据
+
+    diff 缺失 / 坏 JSON / 结构不对 → 跳过,**不**当成"变回过"。
+    少一条证据 = 少一次抑制 = 多报一次。反过来会把真变化吃掉。
+    """
+    n = 0
+    values: list = []  # 用 list 不用 set:JSON 值可能是 dict/list,不可哈希
+    for row in rows:
+        try:
+            parsed = json.loads(row["diff"]) if row["diff"] else None
+        except (TypeError, ValueError):
+            parsed = None
+        entry = parsed.get(field) if isinstance(parsed, dict) else None
+        if not isinstance(entry, dict) or "before" not in entry or "after" not in entry:
+            log.debug("基线判据:第 %s 行的 diff 里认不出字段 %s,跳过",
+                      row["id"], field)
+            continue
+        n += 1
+        b = _val_identity(entry["before"])
+        # 接缝上的 before 就是上一条的 after,重复记一次会把"继续往前"
+        # 误读成"回来过"(第一版就这么写错了)。但断链时(中间有没记到的
+        # 变更)它是**新出现**的取值,必须补进去,否则后续的回访会漏判。
+        if not values or values[-1] != b:
+            values.append(b)
+        values.append(_val_identity(entry["after"]))
+    # 有过重复取值 = 回来过。用切片而不是 set:值可能不可哈希。
+    came_back = any(v in values[:i] for i, v in enumerate(values))
+    return n, came_back
+
+
+def is_baseline_noise(storage, asset_hash: str, change_type: str,
+                      field: str | None = None,
+                      threshold: int = DEFAULT_BASELINE_LEARN) -> bool:
+    """这个变更是不是"这个资产本来就这样"的基线噪声
+
+    ## 判据:两条都要满足
+
+    1. 同一 `asset_hash` + `change_type` + `field` 已经变过 **至少
+       `threshold` 次**;
+    2. 历史里这个字段**变回过** —— 某个取值出现过不止一次。
+
+    只看第 1 条会把单向演进一起吃掉(r41 实测修掉的):证书到期日一路
+    往后推、IP 段迁移、DNS 切到新机房,全都是"变了 N 次"却从不停在
+    某个值上,默认阈值 3 意味着第 4 次起就被静默 —— 而那恰恰是最该
+    被看见的东西。加上第 2 条之后:抖动(A→B→A)照常压,演进
+    (A→B1→B2→B3)继续报。
+
+    前 `threshold - 1` 次照常上报:刚开始抖的时候没人知道它是抖动,
+    这正是"学习"的含义 —— 连着抖够多次才敢下结论。
+
+    ## 第 2 条为什么问"回来过没有"而不是"取值不超过 2 个"
+
+    三值轮转(A→B→C→A)抖得比两值还厉害,但取值有 3 个 —— 按"不超过
+    2 个"会把它误判成演进,于是永远刷屏。"某个取值出现过不止一次"
+    直接问的就是它回来没有,3 值轮转照样判成抖动。
+
+    ## `field=None` 一律 False
+
+    没有字段就无从判断变没变回过,不构成任何噪声结论。
+
+    ## 为什么不新增存储字段
+
+    `asset_changes` 表自己就是历史:它记了每一次变更的 asset_hash /
+    change_type / diff / detected_at。用它当基线库,schema 一个字不用动,
+    而基线随历史自然演化 —— 资产稳定久了,下次再变就会重新计次。
+
+    ## 局限(说在前面)
+
+    - **只看历史,不看时间。** 一年前抖过 3 次的资产,今天再抖会被当基线;
+      反过来一年前演进过的资产,今天开始真抖也要先攒够次数才学得出来。
+    - **阈值是全局的,不 per-asset 学习。** 按资产各自的历史长度调阈值
+      要一张新表,那超出这一步的范围。
+    - **判据要靠 before/after 快照,只有单边快照的变更学不出来。**
+      `record_change` 允许只传 `after`(NEW_ASSET)或只传 `before`
+      (DISAPPEARED),那类记录没有字段级 diff,一律照报。
+    """
+    if threshold <= 0 or field is None:
+        return False
+    sql = ("SELECT id, diff FROM asset_changes "
+           "WHERE workspace_id = ? AND asset_hash = ? AND change_type = ? "
+           "AND diff IS NOT NULL AND diff LIKE ? ORDER BY id")
+    params: list = [storage.workspace_id, asset_hash, change_type,
+                    f'%"{field}"%']
+    with storage._conn() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    n, came_back = _field_transitions(rows, field)
+    return int(n) >= int(threshold) and came_back
+
+
+def attach_field_change_sink(storage) -> None:
+    """把「字段级变更记录」接到一个 Storage 上
+
+    ## 为什么是回调,而不是 db 直接 import core
+
+    `db` 层**不能**依赖 `core`(`tests/test_architecture.py` 的分层规则:
+    外层可以依赖内层,反之不行)。但检测本身又必须在 `db` 里做 ——
+    旧值和新值在同一条 `ON CONFLICT DO UPDATE` 里就没了,放到上面
+    任何一层都已经比不出来。
+
+    所以切成两半:`db` 只回答「哪些字段变了」(它本来就最清楚那句
+    UPDATE 的语义),`core` 回答「那意味着什么」(类型 + 基线噪声)。
+
+    ## 记不上不能影响入库
+
+    采集器只管把资产写进来,变更监控是搭在上面的。记录失败就中断入库,
+    等于让一个观察功能把被观察的东西弄没了。
+
+    ## 没注册就只是不记,不会报错
+
+    那是**旁路**该有的样子:没挂上不该拦住任何东西。
+    `tests/test_monitor_field_changes.py` 盯着生产入口确实挂了。
+    """
+    def _sink(table: str, asset_hash: str, changes: dict) -> None:
+        # 表名 → asset_type。**反转 `Monitor._ASSET_TABLES`,不另抄一份** ——
+        # 同一张契约表有两个来源,迟早会漂。
+        asset_type = next((t for t, tbl in Monitor._ASSET_TABLES.items()
+                           if tbl == table), None)
+        if asset_type is None:
+            # 拿不到就**不记**,不硬猜一个。asset_type 是 record_change
+            # 的第一等参数,猜错等于把别的表上的变更记成 host 的。
+            return
+        for field, ch in changes.items():
+            change_type = FIELD_CHANGE_TYPES.get(field)
+            if change_type is None:
+                continue      # 不在契约表里:明写的不报,不是漏报
+            try:
+                record_change(storage, asset_type, change_type, asset_hash,
+                              before={field: ch["before"]},
+                              after={field: ch["after"]})
+            except Exception as e:       # noqa: BLE001 - 旁路
+                log.warning("field change not recorded (%s.%s): %s",
+                            table, field, e)
+
+    storage.set_field_change_sink(_sink)
+
 
 def record_change(storage, asset_type: str, change_type: str,
                   asset_hash: str, before: dict | None = None,
-                  after: dict | None = None, task_id: int | None = None) -> None:
-    """记录一个变更事件到 asset_changes 表"""
+                  after: dict | None = None, task_id: int | None = None,
+                  baseline_threshold: int = DEFAULT_BASELINE_LEARN) -> bool:
+    """记录一个变更事件到 asset_changes 表。返回这条是否**被记下来**。
+
+    ## 返回 False = 被基线判为噪声,没记
+
+    判据见 `is_baseline_noise`。返回 bool 而不是 None,是为了让调用方
+    知道"这条没报出去"—— 而不返回的话,调用方无法区分"记了"和"被挡了",
+    报表上就会出现"报了 0 条",看起来像没检测到,其实是被去噪了。
+
+    ## `change_type` 必须在 `CHANGE_TYPES` 里,否则 raise
+
+    和 `Monitor.detect_changes` 对 `asset_type` 用 `_ASSET_TABLES` 白名单
+    是同一套纪律。**报错,不静默改写** —— 静默改写等于把一个拼错换成
+    另一个拼错,错得一模一样但更难查。
+
+    ## 为什么按「能力」而不是按 schema 注释里的「词表」
+
+    schema 的注释列了 6 种可能的取值(NEW_ASSET / DISAPPEARED /
+    TITLE_CHANGED / TECH_CHANGED / FINGERPRINT_CHANGED / STATUS_CHANGED),
+    那是**这张表能存什么**。`CHANGE_TYPES` 只有 2 种,是**本模块产得出
+    什么**。按词表校验的话,"注释里写过"就等于"实现了" —— 而事实是
+    `TITLE_CHANGED` 这类字段级变更**根本没有实现**:它们需要一个
+    「上一轮的字段快照」来对比,而资产表是原地 upsert 的,不留历史,
+    `asset_changes` 里也只有变更本身。r42 实测(白名单收紧前):
+    传 `'随便编的'` 或 `''` 都能入库并返回 True,拼错一个字母就是一条
+    永久静默的记录 —— 入库了,却没有任何代码路径会生成它。
+
+    ## r42 收紧白名单的直接后果,说在前面
+
+    **基线机制在生产路径上够不着了。** `record_change` 要判基线必须有
+    双边快照,而生产里唯一的两处调用(watcher 的 NEW_ASSET 只传 `after`、
+    DISAPPEARED 只传 `before`)都是单边的。所以 r40/r41 那套判据目前
+    只能靠直接构造历史行来验证,真实的 watcher 跑一次也不会走到它。
+
+    这是**能力缺失(做不了)**,不是这次修掉的 bug:资产自身的属性变了
+    (换 IP、换标题、换证书)系统本来就看不见。r42 只做的是把「看不见」
+    从静默变成报错。要真正用上基线,先得实现一种带字段快照的变更类型,
+    那是另一件事,已单独立项。
+    """
+    if change_type not in CHANGE_TYPES:
+        raise ValueError(
+            f"unknown change_type: {change_type!r} "
+            f"(choose from {list(CHANGE_TYPES)})")
+
+    # 逐字段判基线:只要**有一个**变动字段已达阈值,整条就是噪声。
+    # 用任一而不是全部 —— 一个资产天天变的往往就那一项(比如 geo 漂移),
+    # 拿它当基线不代表整条记录都不值得看,但足以说明这一条会持续刷屏。
+    if before and after and baseline_threshold > 0:
+        for k in set(before) | set(after):
+            if _val_identity(before.get(k)) == _val_identity(after.get(k)):
+                continue
+            if is_baseline_noise(storage, asset_hash, change_type, k,
+                                 baseline_threshold):
+                log.info(
+                    "record_change: %s/%s 的 %s 变过 %d 次且变回过,"
+                    "判为基线抖动,不记",
+                    asset_hash[:12], change_type, k, baseline_threshold)
+                return False
+
     diff = None
     if before and after:
         # 字段级 diff
@@ -139,7 +654,10 @@ def record_change(storage, asset_type: str, change_type: str,
         for k in keys:
             bv = before.get(k)
             av = after.get(k)
-            if bv != av:
+            # 比身份不比相等:`True == 1`、`False == 0` 在 Python 里为真,
+            # 用 `!=` 判会把「布尔字段改成数字」整条吞掉 —— 变更记了,
+            # diff 却是空的(存成 NULL),基线系统永远看不见它。
+            if _val_identity(bv) != _val_identity(av):
                 diff[k] = {"before": bv, "after": av}
     try:
         with storage._conn() as conn:
@@ -156,12 +674,29 @@ def record_change(storage, asset_type: str, change_type: str,
             )
     except Exception as e:
         log.warning(f"record_change failed: {e}")
+        return False
+    return True
 
 
-def list_changes(storage, asset_type: str | None = None,
-                 change_type: str | None = None, limit: int = 50) -> list[dict]:
-    """列变更事件"""
-    sql = "SELECT * FROM asset_changes WHERE workspace_id = ?"
+def _changes_where(storage, asset_type: str | None,
+                   change_type: str | None,
+                   asset_hash: str | None,
+                   since: str | None) -> tuple[str, list]:
+    """`asset_changes` 的过滤条件。**只此一份**,`list_changes` 和
+    `count_changes` 都走它。
+
+    ## 为什么抽出来
+
+    r55:命令要报「共 N 条,只显示了 M 条」。那个 N 如果单独写一条
+    `COUNT(*)`,一旦两边的过滤条件漂了,就会说出「共 200 条」而实际
+    只有 50 条属于当前筛选 —— **比不报更坏**,因为它是个看起来精确的
+    假数字。r51 的 dry-run 骗人是同一个教训:「数出来的」和
+    「删掉的」用两套判据,于是说删 10 条真删 8 条。
+
+    所以条件共用一份,漂不了。返回的片段**自带前导 `WHERE`**,
+    两边拼的时候不用各自记得写连接词(少一个 `AND` 就是一个静默少筛)。
+    """
+    sql = " WHERE workspace_id = ?"
     params: list = [storage.workspace_id]
     if asset_type:
         sql += " AND asset_type = ?"
@@ -169,8 +704,112 @@ def list_changes(storage, asset_type: str | None = None,
     if change_type:
         sql += " AND change_type = ?"
         params.append(change_type)
-    sql += " ORDER BY id DESC LIMIT ?"
+    if asset_hash:
+        sql += " AND asset_hash = ?"
+        params.append(asset_hash)
+    if since:
+        frag, val = _since_clause("detected_at", since)
+        sql += f" AND {frag}"
+        params.append(val)
+    return sql, params
+
+
+def list_changes(storage, asset_type: str | None = None,
+                 change_type: str | None = None, limit: int = 50,
+                 asset_hash: str | None = None,
+                 since: str | None = None) -> list[dict]:
+    """列变更事件
+
+    `asset_hash` 是**单个**资产 —— `asset_changes` 表只存 hash 不存标识,
+    所以按名字过滤得先由调用方把名字算成 hash(`db.storage.compute_asset_hash`),
+    这里只管按算好的值筛。
+
+    `since` 是时间窗口起点。比较走 `REPLACE(detected_at, ' ', 'T')`,理由见
+    `_DETECTED_AT_SQL` 的文档:两种时间戳格式的字典序不可比,而按同一段
+    比较去做删除时,漏掉的行就是永远删不掉的行。
+
+    ## `limit` 截掉的部分**要有人说出来**
+
+    `limit` 是默认值(CLI 给 50),而这一层**不知道**自己截掉了多少 ——
+    那是 `count_changes` 的活。调用方拿 `len(rows)` 当总数就会印出
+    「50 change(s)」这种话,而库里可能有两百条。r55 的实测就是这个。
+    """
+    where, params = _changes_where(storage, asset_type, change_type,
+                                   asset_hash, since)
+    sql = f"SELECT * FROM asset_changes{where} ORDER BY id DESC LIMIT ?"
     params.append(int(limit))
     with storage._conn() as conn:
         rows = conn.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
+
+
+def count_changes(storage, asset_type: str | None = None,
+                  change_type: str | None = None,
+                  asset_hash: str | None = None,
+                  since: str | None = None) -> int:
+    """当前筛选条件下**一共**有多少条变更 —— `list_changes` 截断前的真实条数
+
+    过滤条件走 `_changes_where`,和 `list_changes` **同一份**。r55 的
+    要害就在这里:数字分开写,漂了就会报出一个看起来精确的假总数。
+    """
+    where, params = _changes_where(storage, asset_type, change_type,
+                                   asset_hash, since)
+    with storage._conn() as conn:
+        return int(conn.execute(
+            f"SELECT COUNT(*) FROM asset_changes{where}", params).fetchone()[0])
+
+
+def count_changes_older_than(storage, older_than: str) -> int:
+    """有多少条变更早于 `older_than` —— 清理前的 dry-run 计数
+
+    和 `prune_changes` 共用 `_older_than_clause`,免得「数出来的」和
+    「删掉的」用两套判据 —— 那是最典型的 dry-run 骗人:说删 10 条,真删 8 条。
+    """
+    frag, val = _older_than_clause("detected_at", older_than)
+    sql = (f"SELECT COUNT(*) FROM asset_changes "
+           f"WHERE workspace_id = ? AND {frag}")
+    with storage._conn() as conn:
+        return int(conn.execute(sql, [storage.workspace_id, val])
+                   .fetchone()[0])
+
+
+def prune_changes(storage, older_than: str, dry_run: bool = True) -> dict:
+    """删掉早于 `older_than` 的变更,返回实际删了多少
+
+    ## `dry_run` 默认 True,而不是加一个 `--dry-run` 开关
+
+    删除操作的安全默认值应该是「什么都不做」。给一个删除命令加
+    `--dry-run` 标志,等于**默认就删** —— 少打一个字母就没了。
+    所以这里反过来:默认只数,要真删必须显式传 `dry_run=False`。
+
+    ## 方向:用 `_older_than_clause`(`<`),不是 `_since_clause`(>=)
+
+    r51 第一版用了 `>=`,于是 `prune --yes` 删掉的是**最新**的几条、
+    旧的原封不动。命令不报错、退出码 0、行数确实少了 —— 看起来完全成功。
+    所以判据的方向由函数名承担,见那两个函数的文档。
+
+    ## 它会影响基线判据,这件事必须由调用方说出来
+
+    `is_baseline_noise` 读的就是这张表,而且**读全部历史**。删掉旧行等于
+    把基线判据的输入截短:一个很久以前抖过几次的资产,清理之后就不再被
+    当成抖动。这大概率是好事(那本来就是 `parse_ts` 文档里记着的局限),
+    但它意味着**同一批数据在清理前后会得到不同的答案** —— 「误报率实测」
+    这类测量因此在某天悄悄失去可比性。所以本函数不替调用方隐瞒这件事,
+    返回值里带上被删的行数,由 CLI 明说出来。
+    """
+    if not isinstance(older_than, str) or not older_than.strip():
+        raise ValueError("older_than must be a non-empty timestamp string")
+    frag, val = _older_than_clause("detected_at", older_than)
+    with storage._conn() as conn:
+        affected = int(conn.execute(
+            f"SELECT COUNT(*) FROM asset_changes "
+            f"WHERE workspace_id = ? AND {frag}",
+            [storage.workspace_id, val]).fetchone()[0])
+        if dry_run:
+            return {"matched": affected, "deleted": 0,
+                    "cutoff": val, "dry_run": True}
+        cur = conn.execute(
+            f"DELETE FROM asset_changes WHERE workspace_id = ? AND {frag}",
+            [storage.workspace_id, val])
+        return {"matched": affected, "deleted": int(cur.rowcount),
+                "cutoff": val, "dry_run": False}

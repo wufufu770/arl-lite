@@ -1,6 +1,8 @@
 name: high_risk_tech_stack
 description: 高风险技术栈识别(Spring Boot 默认错误页、Struts2 等)
 risk: 6
+# 证据强度: high=端口级事实/跨表验证 medium=精确标题匹配 low=模糊匹配/聚合统计
+confidence: low
 tags: [tech_stack, exposure, fingerprint]
 collect:
   - table: findings
