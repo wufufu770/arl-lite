@@ -787,6 +787,11 @@ def cmd_monitor_add(args) -> int:
     if args.interval is not None and args.interval <= 0:
         print(f"[!] --interval must be > 0 (got {args.interval})", file=sys.stderr)
         return 2
+    # r97:工作区不存在就停手。`Storage()` 会**静默自动创建**工作区,
+    # 所以拼错一个 `-w` 的实测后果不是「报错」,而是磁盘上凭空多出一个
+    # 垃圾工作区,并且它会出现在之后每一次 `workspace list` 里。
+    if _ensure_workspace_exists(args.workspace):
+        return 1
     storage = Storage(workspace=args.workspace)
     m = Monitor(storage)
     try:
@@ -830,6 +835,11 @@ def cmd_monitor_list(args) -> int:
 
 def cmd_monitor_remove(args) -> int:
     from .core.monitor import Monitor
+    # r97:见 `cmd_monitor_add` 的同一段注释。删除命令去**建出**一个工作区
+    # 尤其荒唐 —— 实测 `monitor remove nosuch -w TYPO` 会打印
+    # 「workspace 'TYPO' created」并留下一个持久垃圾目录。
+    if _ensure_workspace_exists(args.workspace):
+        return 1
     storage = Storage(workspace=args.workspace)
     m = Monitor(storage)
     arg = str(args.id_or_target).strip()
@@ -852,6 +862,10 @@ def cmd_monitor_remove(args) -> int:
 
 def cmd_monitor_enable(args) -> int:
     from .core.monitor import Monitor
+    # r97:见 `cmd_monitor_add` 的同一段注释。实测这一条尤其荒唐 ——
+    # 它一边打印「monitor #1 not found」,一边把拼错的工作区建了出来。
+    if _ensure_workspace_exists(args.workspace):
+        return 1
     storage = Storage(workspace=args.workspace)
     enabled = not args.disable
     ok = Monitor(storage).enable(args.id, enabled)
@@ -1101,7 +1115,7 @@ def cmd_monitor_changes(args) -> int:
     if not rows:
         print("[i] no changes")
         return 0
-    # 文案和判定都走共用函数(r56):r55 刚在��里手写了一份同样的提示,
+    # 文案和判定都走共用函数(r56):r55 刚在**那里**手写了一份同样的提示,
     # 而 `--limit` 截断是一类横切问题 —— 两处手抄同一段话,迟早漂(决策 #9)。
     total = len(rows)
     if _needs_total(len(rows), args.limit):
@@ -1121,13 +1135,20 @@ def cmd_monitor_changes(args) -> int:
 
 
 def cmd_monitor_prune(args) -> int:
-    """删掉过期���变更记录
+    """删掉过期的变更记录
 
     ## 为什么默认不删
 
     删除的安全默认值是「什么都不做」。给删除命令加一个 `--dry-run` 标志,
     等于**默认就删** —— 少打一个字母就没了。所以这里是反过来的:默认只数,
     真删必须显式加 `--yes`。
+
+    ## 工作区必须已经存在(r97)
+
+    一个**清理**命令凭空建出一个工作区是说不通的:实测
+    `monitor prune --older-than 30d -w TYPO` 报 **rc=0** 说成功,
+    同时在磁盘上留下一个叫 TYPO 的垃圾工作区。没有东西可清理的时候,
+    正确答案是「没有可清理的」,不是「顺手建一个」。
 
     ## 为什么必须把「基线判据会变」说出来
 
@@ -1138,6 +1159,10 @@ def cmd_monitor_prune(args) -> int:
     可比性。所以这里明说,而不是让用户自己发现。
     """
     from .core.monitor import prune_changes
+    # r97:工作区必须已经存在。理由见 docstring 那段 —— 清理命令凭空建出
+    # 一个工作区,还报 rc=0。
+    if _ensure_workspace_exists(args.workspace):
+        return 1
     storage = Storage(workspace=args.workspace)
     try:
         cutoff = _parse_since(args.older_than)
@@ -1521,7 +1546,37 @@ def cmd_watch_remove(args) -> int:
 
 
 def cmd_watch_list(args) -> int:
-    """列出 watch targets"""
+    """列出 watch targets
+
+    ## r97 撤回了加在这里的守卫,原因记在这里免得下一个人再加回来
+
+    r97 的初版结论是「`watch list -w prod` 报 rc=0 +『没有 watch target』
+    是一句假话」,于是给本命令加了 `_ensure_workspace_exists` 守卫。
+    **那个结论是错的。** 实测:
+
+        watch add a.example.com -w teamA   →  rc=0
+          建出 ~/.arl-lite/watch/teamA/watch.json
+          **工作区目录一个都没建**
+
+    watch 全系的 `-w` 是**给 watch 清单用的标签**,不是工作区引用 ——
+    r70 早就把 `cmd_watch_add` 里那个没用的 `Storage()` 删了。
+    在这个契约下,`watch list -w prod` 说「工作区 'prod' 下没有 watch
+    target」是**真的**:那个标签底下确实一个 target 都没有。
+    工具没法知道用户想的是 `default`,那不叫说谎,那叫照实回答。
+
+    守卫加在这里还制造了一个**自相矛盾**,是它被撤回的直接原因:
+
+        watch add -w teamA   → rc=0,清单落盘
+        watch list -w teamA  → rc=1,「workspace not found」
+
+    同一个名字,加得进去列不出来,而清单就在磁盘上。
+    **加进去能成功的名字,必须列得出来。**
+
+    真要统一退出码,该动的是 `cmd_watch_start`(清单不存在时它 rc=1)，
+    而不是把 `list` 改成拒绝。那是另一件事,不在 r97 里做 ——
+    硬改会让 `test_legacy_state_is_reported_but_never_moved` 变红，
+    而「清单为空」本来就不是错误状态。
+    """
     _warn_about_legacy_watch_state(args.workspace)
     state_file = _watch_state_file(args.workspace)
     if not state_file.exists():

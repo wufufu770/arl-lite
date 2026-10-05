@@ -95,15 +95,21 @@ EXCEPTIONS = {
     # 是本文件那条 stale 检测(`EXCEPTIONS 里已不需要例外了就报红`)
     # 把它逮住的 —— 少一行死代码,判据自动跟上。
     "cmd_run": "用户明确要求写入(run 就是建工作区的正路),静默建库合理",
-    "cmd_monitor_add": "新增监控是写操作,用户明确要求写入,建库是副作用",
-    "cmd_monitor_remove": "删除监控是写操作;用户正要动数据,建库无信息损失",
-    "cmd_monitor_enable": "启停监控是写操作,改的是 enabled 标志位",
-    "cmd_monitor_prune": "清理过期监控是写操作,删的是本来就过期的行",
     "cmd_watch_start": "启动 watch 调度器是写操作,状态落在 watch 目录",
     "cmd_workspace_list": "列出工作区本就依赖建出 default(它就是入口命令)",
     "cmd_workspace_create": "建工作区就是它该干的事,建库是本职",
     "cmd_workspace_delete": "删工作区是写操作,而且它删的就是工作区本身",
 }
+# r97 移除了 cmd_monitor_add / remove / enable / prune 四条:它们原来靠
+# `Storage()` 静默建库,实测这会**凭空造出持久垃圾工作区** ——
+# `monitor prune -w TYPO` 报 rc=0 说成功,却在磁盘上留下一个 TYPO,
+# 而且它会出现在之后每一次 `workspace list` 里。
+# 四条现在都走 `_ensure_workspace_exists`,由本文件下面那条 stale 检测
+# 认出来并要求从例外清单里删掉 —— 少四条死豁免,判据自动跟上。
+#
+# r97 的初版**没有**改这张表,而是自己另写了一份登记表。那是决策 #9
+# 的又一处实例(两处手抄同一段逻辑迟早漂),门禁的 test_baseline
+# 当场把两份的冲突逮了出来:一份说「已豁免」,另一份说「未豁免」。
 
 
 def _run(argv, home):
