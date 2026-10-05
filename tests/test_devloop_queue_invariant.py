@@ -460,6 +460,59 @@ def test_no_backlog_entry_is_split_across_two_lines():
         f"  条目必须**一整行**写完(允许很长,长不是问题,断开才是)。")
 
 
+def test_queue_and_backlog_agree_on_every_shared_items_verify():
+    """同一件活的两份副本,`verify` 必须一致
+
+    `backlog.md` 是人维护的**源文件**,`queue.json` 是引擎实际读的那份
+    (`protocol.py` 判「这条活做完没有」走的是 `q.verify_result(item.verify)`,
+    **队列里那份**)。改源文件不会更新副本,于是引擎可能拿着一条**已经不成立
+    甚至早就失效**的验收标准去判定完成。
+
+    ## r111 实测:11 条不一致,而且后果不是「慢一点」
+
+    | 条目 | backlog.md 里 | queue.json 里 | 引擎看到的 `verify_result` |
+    |---|---|---|---|
+    | `confidence` | `pytest tests/test_confidence_reporting.py -q` | **散文**(怎么做) | `unknown` |
+    | `confidence-risk` | 真命令 | **散文** | `unknown` |
+    | `confidence-status` | 真命令 | **散文** | `unknown` |
+    | `item-c66b81`(误报率实测) | `fp-bench --out ...` | **空字符串** | `unknown` |
+    | `check-filter-sql-union` | `pytest tests/test_sql_injection.py` | **`pytest tests/`** | `unknown`(超时) |
+    | `storage` / `disappeared` | 单个测试文件 | **`pytest tests/`** | `unknown` |
+    | `san-issuer-fingerprint` | `pytest tests/test_tls_cert.py` | **整套门禁** | `unknown` |
+
+    关键在 `verify_result` 的超时是 **30 秒**,而超时和散文都返回 `unknown`;
+    `protocol.py` **只拦 `VERIFY_FAIL`**。所以这 11 条里那几条在引擎眼里是
+    **「判断不了」→ 不拦 → 任何时候都能被标 done**。
+
+    散文被 `unknown` 是 `verify_result` docstring 里**写明的取舍**(拿散文去挡
+    完成会把所有待办永久卡死)。但**超时不是作者的问题,是工具慢** —— 两者被
+    归成同一档,这是另一回事,已单独立项(要改 `queue.py`,预算不够)。
+
+    ## 哪一份权威:这里不替人决定
+
+    反过来也成立:队列里那条是「排进队列时约定的验收条件」,拿 backlog.md
+    覆盖它,就给了「把验收标准改弱」一条路。**两份都该一致,但谁是源不是
+    这条判据该定的。** 它只负责让不一致**可见**。
+    """
+    q = Queue(REPO / "devloop" / "queue.json")
+    known = {i.id: i.verify.strip() for i in q.load()}
+    entries = {e["id"]: e for e in _real_backlog_entries()}
+    shared = sorted(set(entries) & set(known))
+    assert len(shared) >= 30, (
+        f"backlog.md 与队列只有 {len(shared)} 条 id 对得上 —— "
+        f"范围不对,这条判据的结论不能拿来用")
+    drift = [
+        f"{iid}\n      backlog.md: {entries[iid]['verify'][:70]}\n"
+        f"      queue.json: {known[iid][:70] or '（空字符串）'}"
+        for iid in shared if entries[iid]["verify"].strip() != known[iid]
+    ]
+    assert not drift, (
+        f"这 {len(drift)} 条在两边都存在,但 verify 不一致 —— 引擎判完成用的是"
+        f"**queue.json 里那份**:\n    " + "\n    ".join(drift)
+        + "\n  改 backlog.md 不会更新队列副本,改队列也不会更新源文件。\n"
+        f"  哪一份权威是需要人拍板的事;但不一致本身必须先可见。")
+
+
 def _real_backlog_entries() -> list[dict]:
     """读**真实** `devloop/backlog.md` 的全部条目,不走播种的过滤。
 
@@ -475,6 +528,7 @@ def _real_backlog_entries() -> list[dict]:
             out.append({
                 "id": _slugify_id(m.group(3).strip(), 0),
                 "detail": m.group(4).strip(),
+                "verify": m.group(5).strip(),      # r111:队列/backlog 的 verify 对账要用
             })
     return out
 
