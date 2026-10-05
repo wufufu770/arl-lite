@@ -1,92 +1,62 @@
-"""r113 变异测试:验「变异脚本必须持锁」和「这把锁真的挡住了竞态」。
+"""r114 变异测试:验「锁的覆盖面」和「入口对得上 `fn()` 这个契约」。
 
-## r114 更正:下面这句普查是错的
+## 主题
 
-    会写仓库文件的       46 个(r41–r64 那 24 个是纯分析,一个 write_* 都没有)
+r113 把 46 个脚本的入口改成 `mutkit.locked(main)`,并且在判据里给
+「不写文件的脚本」留了豁免。两条都在 r114 被实测推翻:
 
-**「那 24 个是纯分析、一个 write 调用都没有」是错的。** 判定函数只认
-`write_text` 和 `write_bytes` 两个方法名,而 r41–r64 用的是
+**一、那个普查是错的。** r113 的判定函数只认 `write_text` 和 `write_bytes`
+两个方法名,于是判「70 个脚本里 46 个会写文件,r41–r64 那 24 个是纯分析,
+一个 write 调用都没有」。而那 24 个用的是
 
     open(path, "w", encoding="utf-8").write(s.replace(old, new, 1))
     shutil.copy(bak, path)
 
 一样在改仓库源码(`arl_lite/core/monitor.py`、`arl_lite/cli.py`、
 `arl_lite/ai/commands.py`、`tests/test_cli_advice_commandable.py` …)。
-后果是那 24 个脚本**确实就地改仓库文件,却被分类器判成「不写文件」而
-豁免在锁外面** —— 正是本轮要防的那件事。r114 把它们全补上了锁,
-现在 71 个脚本一个不落,判据里的豁免整个删掉。
+**后果:24 个确实就地改仓库文件的脚本,被分类器判成不写文件而豁免在锁外面** ——
+正是 r113 那个文件要防的那件事。
 
-**教训**:那个结论是用**一个只认两个名字的检测器**量出来的,我把它当成了
-全称写进文档、判据注释和 backlog。「测得的东西比声称的窄」是这个项目
-反复栽的地方(r101 的检测器误报、r108 的门禁总表虚构引用)。
+修宽检测面之后实测:**71 个脚本全部会写,一个只读的都没有** —— 豁免成了
+死代码,而死代码在这类判据里会被人当先例,所以整个删掉。
 
-## 主题
+**二、入口的名字可以错,而 r113 的改造脚本查不出来。** r114 批量统一入口
+形状时,脚本把 47 个文件的锁统一成了 `mutkit.locked(_run_all)` —— 那些文件里
+根本没有 `_run_all`(只有 r113 自己有)。改造脚本的复核查了「能 parse」
+「写调用数没变」「`main` 还在」,**没查「锁的那个名字是不是就是那个
+`main`」**,于是 47 个脚本一起改成了运行时才 `NameError` 的样子,当场没发现。
 
-r112 收尾时撞到一件归因不明的事:一轮结束时 `arl_lite/devloop/queue.py` 的
-模块 docstring 停在了某条变异的内容上,而那个进程自己报的退出码是 0。
+顺带一个检测器陷阱:把 `Path.replace` 算进「会写」之后,**71 个全部命中** ——
+静态分不清 `s.replace(old, new, 1)` 和 `Path.replace(...)`。分不清的检测器
+会匹配一切,**判不准的检测器比没有更危险**(r101)。
 
-r113 顺着「变异 harness 本身可不可靠」查下去。普查 70 个 `devloop/mutcheck_*.py`:
+## 三条判据 + 一条新增的入口契约
 
-    会写仓库文件的       46 个(r41–r64 那 24 个是纯分析,一个 write_* 都没有)
-    还原点形状           45 个脚本各 1 处,逐字节相同的一行 `t.write_bytes(data)`
-    加锁的               0 个
-    还原后校验的         0 个
-
-`t.write_bytes(data)` 的语义是「无条件写回本进程读到的备份」。单进程内正确,
-跨进程不安全:谁拿到的是「备份」,取决于它读文件那一刻文件长什么样,而不是
-取决于谁真正改的。
-
-## 两个后果都实测复现(两个进程,时序固定)
-
-    1. 文件被留在变异态
-    2. **更糟**:还原发生在判据跑完之前,生效过的变异被报成 SURVIVED,
-       而事后仓库干干净净,没有任何痕迹
-
-第 2 条比第 1 条危险得多 —— 第 1 条会让人去查 git,第 2 条什么都不留,
-而变异测试报出来的 `survived` 恰恰是人最不会怀疑的东西。
-
-## 修法与三条判据
-
-新增 `devloop/mutkit.py`,复用 `arl_lite/devloop/lock.py` **已有**的
-`file_lock`(不手抄第二份 flock),46 个会写文件的脚本入口统一改成
-`mutkit.locked(main)`。三条判据在 `tests/test_mutcheck_sweep_lock.py`:
-结构(都取锁)、行为(锁真挡人)、**负控制**(无锁时竞态是真的)。
-
-## 一条被实测推翻的「更温和的修法」
-
-先试的是**条件还原**:写回备份前先确认文件还等于「我写下的变异」,
-不是就别写 —— 免得踩掉别人的。**它修不了这个竞态**,因为后启动的进程读到的
-「备份」本身就带着前一个进程的变异;A 还原时发现不是自己的(不敢动),B 到点
-把带变异的备份写了回去。负控制里发现的:把还原改成条件式之后判据照样绿。
-
-**能修它的只有一件事:让两个进程不要同时改。** 条件还原是在错误发生之后
-补救,而错误发生的那一刻备份就已经错了。
+1. **每一个** mutcheck 脚本都必须持锁(无豁免,r113 的豁免已删)
+2. 被锁的那个函数必须**真实存在**、**零必填参数**、模块能 import(新增)
+3. 锁真的挡住并发;4. 无锁时竞态是真的(r113 那两条,本轮继续守着)
 
 ## 变异清单
 
 实现变异(期望全被杀):
-  M1 摘掉一个脚本的锁        → 判据 1 红
-  M2 让 locked 不加锁        → 判据 2 红
-  M3 让竞态不发生(备份取自干净副本) → 判据 3 红
-  M4 脚本里那个 write_bytes 还原点整体删掉 → 判据 1 的前置条件红
+  M1 摘掉一个脚本的锁            → 判据 1 红
+  M2 把锁指向一个不存在的函数    → 判据 2 红
+  M3 让 locked 里的名字进 docstring(把真调用删掉) → 判据 1 红
+  M4 让 locked 不加锁            → 判据 3 红
+  M5 让竞态不发生                → 判据 4 红
 
 覆盖变异(期望全存活,拆判据):
   C1 拆判据 1
   C2 拆判据 2
   C3 拆判据 3
+  C4 拆判据 4
 
-## 变异与负控制不是一回事
+## M3 为什么必须有
 
-r113 第一次写负控制时**三条全绿**。逐条查下来:**全是控制脚本自己的 bug** ——
-一条压根没写删除动作;一条把 12 空格缩进的行匹配成 8 空格,替换后语义完全
-不变(**空操作变异**,报出来却像「判据恒真」);第三条改的时序根本不改变胜负。
-
-**假结论比没有结论更贵**(r110)。所以这里把负控制的过程也写下来:三条控制
-最终各自精确转红在**预期的那条判据**上。
-
-M4 是给判据 1 的**前置条件**留的出口:`assert total >= 30` 钉住「至少有 30
-个脚本会写文件」这个实测值(现在 46)。只删掉某个脚本的 write 调用会让它变
-小,判据必须先于「没有脚本取锁」报出来 —— 否则一条范围收缩会被误读成通过。
+首版判据用源码子串 `if "mutkit.locked(" in src` 找入口。它当场出过一次错:
+`mutcheck_r113.py` 的 **docstring 里写着 `mutkit.locked(main)`**,于是被算成
+「锁了 main」,而它实际锁的是 `_run_all`。「文档里提到一个调用」和「代码里
+真的调了它」是两件事。M3 把真调用删掉、只在 docstring 里留一句,判据必须红。
 
 约定:元组第 4 位 = 期望存活(True/False),targets 显式声明。
 CLAIMS 只写字面量。old 侧必须**整句**配平。纯插入 must_not 留空、
@@ -104,7 +74,8 @@ import sys
 REPO = pathlib.Path(__file__).resolve().parent.parent
 MUTKIT = REPO / "devloop" / "mutkit.py"
 CRIT = REPO / "tests" / "test_mutcheck_sweep_lock.py"
-ONE = REPO / "devloop" / "mutcheck_r112.py"
+ONE = REPO / "devloop" / "mutcheck_r65.py"
+DECOY = REPO / "devloop" / "mutcheck_r66.py"
 
 TARGET = ["tests/test_mutcheck_sweep_lock.py"]
 
@@ -115,104 +86,120 @@ _ERROR_IN_SUMMARY_RE = re.compile(r"\d+\s+errors?\b")
 A1 = "    raise SystemExit(mutkit.locked(main))\n"
 M1 = "    raise SystemExit(main())  # 变异 M1:锁被摘掉\n"
 
-# ── M2:让 locked 不再加锁 ──
-A2 = ('        with file_lock(SWEEP_TARGET, timeout=0.0,\n'
-      '                       owner=f"mutcheck pid={os.getpid()}"):\n')
-M2 = ('        import contextlib  # 变异 M2:换成空上下文,等于没加锁\n'
-      '        with contextlib.nullcontext():\n')
+# ── M2:锁一个不存在的函数 ──
+A2 = "    raise SystemExit(mutkit.locked(main))\n"
+M2 = "    raise SystemExit(mutkit.locked(_run_all))\n"
 
-# ── M3:让竞态不发生 ──
+# ── M3:真调用删掉 + 在 docstring 里放一个同形诱饵 ──
 #
-# **r114 重定向锚点**:首版是往复现脚本里塞一份「干净副本」让备份不脏。
-# r114 把那段复现脚本从「靠 sleep 抢时序」改成了「靠哨兵文件协调」(它
-# 偶发红,而且红的原因和被测代码无关),首版的写法随之失效。
+# 这条验的是判据**用 AST 而不是源码子串**。诱饵放在 docstring 里而不是
+# 注释里是有讲究的:注释在 AST 里根本不存在,放那儿等于没放;docstring
+# 是一个真实的字符串常量,子串匹配会**看得见它**,AST 匹配看不见。
 #
-# 现在改成同样能消除竞态、但在**新协议**里成立的两处改动:先启动的那个
-# 不等对方就立刻还原,后启动的等「已还原」再备份。两处必须一起改,
-# 只改一处会死锁。
-A3 = ('    until("second-mutated")        # 等后一个也变异完\n'
+# 所以这条的形状是「删掉真调用 + 加一个长得一模一样的字符串」:
+# 若判据是子串版,诱饵会把它骗绿;是 AST 版,它必须红。
+A3 = "    raise SystemExit(mutkit.locked(main))\n"
+M3 = "    raise SystemExit(main())\n"
+DECOY_LINE = ("入口写法是 `raise SystemExit(mutkit.locked(main))`"
+              " —— 变异 M3:这一句是诱饵,上面那行才是真调用\n")
+
+
+def _decoy(path: pathlib.Path) -> None:
+    """删掉真调用,再往模块 docstring 里塞一句同形的诱饵。"""
+    src = path.read_text(encoding="utf-8")
+    assert src.startswith('"""'), "这个脚本没有模块 docstring,诱饵没处放"
+    i = src.index('"""', 3)
+    out = src[:i] + "\n" + DECOY_LINE + src[i:]
+    out = out.replace(A3, M3, 1)
+    _write_checked(path, out)
+
+# ── M4:让 locked 不再加锁 ──
+A4 = ("        with file_lock(SWEEP_TARGET, timeout=0.0,\n"
+      '                       owner=f"mutcheck pid={os.getpid()}"):\n')
+M4 = ("        import contextlib  # 变异 M4:换成空上下文,等于没加锁\n"
+      "        with contextlib.nullcontext():\n")
+
+# ── M5:让竞态不发生 ──
+#
+# 首版打的是 r113 那版基于 `sleep` 的复现脚本,而 r114 把那段脚本改成了
+# 哨兵协调(见 `test_mutcheck_sweep_lock.py` 里的说明),锚点随之消失。
+#
+# 新写法:让先启动的那个**不等对方**就立刻还原,后启动的那个改成等
+# 「已还原」再备份。两处必须一起改 —— 只改一处会死锁(先一个等
+# `second-mutated`,后一个等 `first-restored`,而 `first-restored` 只在
+# `second-mutated` 之后才发)。于是后一个的备份拿到的是干净内容,竞态排不出来。
+A5 = ('    until("second-mutated")        # 等后一个也变异完\n'
       '    target.write_bytes(backup)     # 无条件还原:干净内容\n')
-M3 = ('    # 变异 M3:不等对方,立刻还原\n'
+M5 = ('    # 变异 M5:不等对方,立刻还原\n'
       '    target.write_bytes(backup)\n')
-A3B = '    until("first-mutated")\n'
-M3B = '    until("first-restored")  # 变异 M3:等它先还原完\n'
+A5B = '    until("first-mutated")\n'
+M5B = '    until("first-restored")  # 变异 M5:等它先还原完\n'
 
 
 def _no_race(path: pathlib.Path) -> None:
     src = path.read_text(encoding="utf-8")
-    if src.count(A3) != 1 or src.count(A3B) != 1:
-        raise AssertionError(
-            f"M3 的锚点指不准(A3={src.count(A3)} 次,A3B={src.count(A3B)} 次)")
-    _write_checked(path, src.replace(A3, M3, 1).replace(A3B, M3B, 1))
-
-# ── M4:掐小判据 1 的遍历范围(打的是它自己那条前置条件) ──
-# 首版 M4 是「把某个脚本的还原点整体删掉」,**它存活了**:那个脚本于是
-# 不再被 `_writes_repo_files` 认成「会写文件」,判据 1 压根不管它 ——
-# 反而是「删掉 finally 里的还原」这种**更危险**的改动,在判据 1 眼里
-# 变成了「这个脚本不危险」。方向打反了。
-#
-# 第二版把属性名改坏一个(`write_bytez`),**也存活了**:`total` 从 46
-# 掉到 45,`assert total >= 30` 照样过。**实测出这条前置条件的真实边界:
-# 它只挡「遍历范围崩塌」,不挡「掉一个脚本」。** 写死 46 又会变成
-# 「写死总数 = 自造一条永远红的门禁」(r110 刚把一个漂移的总数从文件头
-# 去掉)。所以这里如实接受那个边界,M4 掐的是它真正声称的那件事:
-# 范围整个塌掉时前置条件必须先于其它断言报出来。
-A4 = 'MUTCHECKS = sorted(DEV.glob("mutcheck_*.py"))\n'
-M4 = ('MUTCHECKS = sorted(DEV.glob("mutcheck_*.py"))\n'
-      '# 变异 M4:遍历范围被掐小\n'
-      'DEV = DEV / "devloop"  # 多一层,glob 什么都找不到\n')
+    assert src.count(A5) == 1 and src.count(A5B) == 1
+    _write_checked(path, src.replace(A5, M5, 1).replace(A5B, M5B, 1))
 
 # ── 覆盖变异的边界锚点(照文件里的**实际顺序**写) ──
 C1_BODY = "def test_every_mutcheck_script_takes_the_sweep_lock():"
-C2_BODY = "def test_the_locked_entry_point_exists_and_takes_no_arguments():"
-C3_BODY = "def test_the_lock_actually_refuses_a_second_holder(monkeypatch, tmp_path):"
-C4_BODY = "def test_without_the_lock_the_race_is_real():"
-C1_STUB = C1_BODY + "\n    pass  # 变异 C1:整条判据没了\n"
-C2_STUB = C2_BODY + "\n    pass  # 变异 C2:整条判据没了\n"
+C1B_BODY = "def test_the_locked_entry_point_exists_and_takes_no_arguments():"
+C2_BODY = "def test_the_lock_actually_refuses_a_second_holder(monkeypatch, tmp_path):"
+C3_BODY = "def test_without_the_lock_the_race_is_real():"
 
 CLAIMS = {
     "M1-摘掉一个脚本的锁": (["# 变异 M1:锁被摘掉"], ["mutkit.locked(main)"]),
-    "M2-让locked不加锁": (["# 变异 M2:换成空上下文,等于没加锁"],
-                    ["with file_lock(SWEEP_TARGET"]),
-    "M3-让竞态不发生": (["# 变异 M3"], []),
-    # r114 起这条是**纯插入**(保留原行,追加一行把目录掐深),
-    # 所以 must_not 按约定留空。
-    "M4-掐小判据遍历范围": (["# 变异 M4:遍历范围被掐小"], []),
+    "M2-锁一个不存在的函数": (["mutkit.locked(_run_all)"],
+                           ["    raise SystemExit(mutkit.locked(main))\n"]),
+    "M3-子串诱饵": (["变异 M3:这一句是诱饵"],
+                 ["    raise SystemExit(mutkit.locked(main))\n"]),
+    "M4-让locked不加锁": (["# 变异 M4:换成空上下文,等于没加锁"],
+                        ["with file_lock(SWEEP_TARGET"]),
+    "M5-让竞态不发生": (["# 变异 M5"], []),
     "C1-拆判据1": (["    pass  # 变异 C1:整条判据没了"], []),
     "C2-拆判据2": (["    pass  # 变异 C2:整条判据没了"], []),
     "C3-拆判据3": (["    pass  # 变异 C3:整条判据没了"], []),
+    "C4-拆判据4": (["    pass  # 变异 C4:整条判据没了"], []),
 }
 
 MUTANTS = [
     ("M1-摘掉一个脚本的锁", lambda p: _apply(p, A1, M1), False, (ONE,)),
-    ("M2-让locked不加锁", lambda p: _apply(p, A2, M2), False, (MUTKIT,)),
-    ("M3-让竞态不发生", _no_race, False, (CRIT,)),
-    ("M4-掐小判据遍历范围", lambda p: _apply(p, A4, M4), False, (CRIT,)),
+    ("M2-锁一个不存在的函数", lambda p: _apply(p, A2, M2), False, (ONE,)),
+    ("M3-子串诱饵", _decoy, False, (DECOY,)),
+    ("M4-让locked不加锁", lambda p: _apply(p, A4, M4), False, (MUTKIT,)),
+    ("M5-让竞态不发生", _no_race, False, (CRIT,)),
 ]
-
-COVERAGE_MUTANTS = [
-    # r114 在判据 1 与「锁真挡人」之间插了一条「入口契约」,所以顺序锚点
-    # 跟着变了:C1 的**结束**锚点现在是「入口契约」,不是「锁真挡人」。
-    # 顺序反了 `_replace_fn` 会当场报错(它本来就查这个)。
-    ("C1-拆判据1",
-     lambda p: _replace_fn(p, C1_BODY, C1_STUB, C2_BODY), True, (CRIT,)),
-    ("C2-拆判据2",
-     lambda p: _replace_fn(p, C2_BODY, C2_STUB, C3_BODY), True, (CRIT,)),
-    # 「竞态是真的」是文件里**最后一个**判据,后面没有可作边界的 `def`,
-    # 所以用 `_stub_tail` 截到文件尾。
-    # (r114 首版把结束锚点写成 `\nif __name__`,而那个测试文件里根本没有
-    #  `if __name__` —— 一次典型的「结束标记想当然」,harness 当场报 BAD-MUTANT。)
-    ("C3-拆判据3", lambda p: _stub_tail(p, C4_BODY), True, (CRIT,)),
-]
-
 
 def _stub_tail(path: pathlib.Path, start: str) -> None:
-    """把**文件末尾**那个函数整条换成 `pass`。判据 3 是最后一个函数。"""
+    """把**文件末尾**那个函数整条换成 `pass`。判据 4 是最后一个。"""
     src = path.read_text(encoding="utf-8")
     if src.count(start) != 1:
         raise AssertionError(f"变异锚点没唯一命中 {path.name}:{start!r}")
     i = src.index(start)
-    _write_checked(path, src[:i] + start + "\n    pass  # 变异 C3:整条判据没了\n")
+    _write_checked(path, src[:i] + start + "\n    pass  # 变异 C4:整条判据没了\n")
+
+
+COVERAGE_MUTANTS = [
+    ("C1-拆判据1",
+     lambda p: _replace_fn(p, C1_BODY, C1_BODY + "\n    pass  # 变异 C1:整条判据没了\n",
+                           C1B_BODY), True, (CRIT,)),
+    ("C2-拆判据2",
+     lambda p: _replace_fn(p, C1B_BODY,
+                           C1B_BODY + "\n    pass  # 变异 C2:整条判据没了\n",
+                           C2_BODY), True, (CRIT,)),
+    ("C3-拆判据3",
+     lambda p: _replace_fn(p, C2_BODY,
+                           C2_BODY + "\n    pass  # 变异 C3:整条判据没了\n",
+                           C3_BODY), True, (CRIT,)),
+    # 这条**首版又是用 `COVERAGE_MUTANTS.append(...)` 挂上去的**,结果
+    # `test_mutcheck_claims_match_their_names.py` 第二次当场报「声明指向的变异
+    # 不存在:C4-拆判据4」—— r113 我刚为同一个错写了一段说明,下一轮又犯。
+    # 那条判据用 AST 读**字面量列表**,`.append` 出来的条目它看不见。
+    # **被逮住两次还犯第三次,就说明「知道」不等于「会做到」**,所以这一次
+    # 直接写进字面量,让结构本身不可能再犯。
+    ("C4-拆判据4", lambda p: _stub_tail(p, C3_BODY), True, (CRIT,)),
+]
+
 
 
 
@@ -271,7 +258,6 @@ def _write_checked(path: pathlib.Path, out: str) -> None:
     if out == path.read_text(encoding="utf-8"):
         raise AssertionError("变异是空操作 —— 什么都不会变,写了也是白写")
     if path.suffix == ".py":
-        import ast
         try:
             ast.parse(out)
         except SyntaxError as e:
@@ -399,7 +385,7 @@ def _run_all() -> int:
         ("实现变异(期望全被杀)", MUTANTS),
         ("覆盖变异(期望全存活)", COVERAGE_MUTANTS),
     ):
-        print(f"\n=== r113 {title} ===")
+        print(f"\n=== r114 {title} ===")
         for name, detail, outp in _sweep(mutants):
             ok = detail in ("killed", "survived")
             if not ok:
@@ -407,7 +393,7 @@ def _run_all() -> int:
             print(f"  {'OK ' if ok else '!! '}{name:22s} {detail}")
             if outp:
                 print("     " + outp.replace("\n", "\n     ")[:300])
-    print(f"\nr113 变异总结论: {bad} 个不符合预期")
+    print(f"\nr114 变异总结论: {bad} 个不符合预期")
     return bad
 
 

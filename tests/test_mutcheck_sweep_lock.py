@@ -46,99 +46,207 @@ REPO = Path(__file__).parents[1]
 DEV = REPO / "devloop"
 MUTCHECKS = sorted(DEV.glob("mutcheck_*.py"))
 
-# 无锁竞态的复现脚本。两个进程跑它,按参数错开时序,文件会被留在变异态。
+# 无锁竞态的复现脚本。**用哨兵文件显式协调,不用 sleep。**
+#
 # `MINE` 是本进程写下去的内容,`restore` 是无条件写回自己的备份 ——
 # **没有任何校验**,这正是要修的那一处。
+#
+# ## 为什么这里一个 sleep 都没有
+#
+# 首版用 `time.sleep(0.05)` 错开两个进程的启动。那是**靠时序碰运气**:
+# 在机器忙的时候(比如刚跑完一轮变异测试、后台还有子进程),B 可能在 A
+# 还原**之后**才启动,竞态就排不出来,判据于是红 —— 而红的和被测代码
+# 毫无关系。**一条会因为无关原因变红的判据,比没有判据更坏**:它会让人
+# 以为是锁坏了,然后去「修」一个没坏的东西(r101:判不准的检测器比没有更危险)。
+#
+# 改成:每一步都等一个**可观察的条件**,而不是等一段时间。于是顺序是
+# 被证明出来的,不是被祈祷出来的。
 RACER = """
 import pathlib, sys, time
-p = pathlib.Path(sys.argv[1]); delay = float(sys.argv[2]); marker = sys.argv[3]
-backup = p.read_bytes()
-p.write_bytes(backup + marker.encode())
-time.sleep(delay)
-p.write_bytes(backup)
+
+target = pathlib.Path(sys.argv[1])
+role = sys.argv[2]
+marker = sys.argv[3]
+sentinel = pathlib.Path(sys.argv[4])
+
+
+def seen(tag):
+    sentinel.mkdir(parents=True, exist_ok=True)
+    (sentinel / tag).write_text("x")
+
+
+def until(tag, limit=30.0):
+    end = time.monotonic() + limit
+    while not (sentinel / tag).exists():
+        if time.monotonic() > end:
+            raise SystemExit(f"等 {tag} 等超时了(limit={limit}s)")
+        time.sleep(0.01)
+
+
+# 每一处写回都是**无条件**的:写什么就是什么,没有「文件现在是不是还等于
+# 我写下去的」这种校验。这正是要修的那一处。
+if role == "first":
+    backup = target.read_bytes()
+    target.write_bytes(backup + marker.encode())
+    seen("first-mutated")
+    until("second-mutated")        # 等后一个也变异完
+    target.write_bytes(backup)     # 无条件还原:干净内容
+    seen("first-restored")
+else:
+    until("first-mutated")
+    backup = target.read_bytes()   # 备份到的是**脏内容**,而它并不知道
+    target.write_bytes(backup + marker.encode())
+    seen("second-mutated")
+    until("first-restored")        # 等先一个把干净内容写回去
+    target.write_bytes(backup)     # 无条件还原:把那份脏备份写回去
+    seen("second-restored")
 """
 
 
-def _writes_repo_files(tree: ast.AST) -> bool:
-    """这个脚本会不会写仓库里的文件"""
-    for n in ast.walk(tree):
-        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                and n.func.attr in ("write_text", "write_bytes")):
-            return True
-    return False
+def _locked_name(tree: ast.AST) -> str | None:
+    """入口那个 `mutkit.locked(<名字>)` 里的 `<名字>`;没有就返回 None
 
+    ## 为什么用 AST 而不是 `if "mutkit.locked(" in src`
 
-def _takes_sweep_lock(tree: ast.AST) -> bool:
-    """有没有调 `mutkit.locked(...)`"""
+    首版是源码子串匹配,当场出了两个错:
+
+    - `mutcheck_r113.py` 的 **docstring 里写着 `mutkit.locked(main)`**,
+      于是它被算成「锁了 main」,而它实际锁的是 `_run_all`。
+    - 统计口径因此虚高。
+
+    「文档里提到一个调用」和「代码里真的调了它」是两件事,而这条判据的全部
+    意义就在于分这两件事。源码里也可能**恰好**有一行代码长得像
+    `mutkit.locked(...)` 但在注释里 —— 子串分不出来,AST 分得出来。
+    """
     for n in ast.walk(tree):
         if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
                 and n.func.attr == "locked"
                 and isinstance(n.func.value, ast.Name)
-                and n.func.value.id == "mutkit"):
-            return True
-    return False
+                and n.func.value.id == "mutkit"
+                and len(n.args) == 1
+                and isinstance(n.args[0], ast.Name)):
+            return n.args[0].id
+    return None
 
 
-def _classify() -> tuple[list[str], list[str]]:
-    """返回 (会写文件且取了锁, 会写文件但没取锁)"""
+def _classify() -> tuple[list[tuple[str, str]], list[str]]:
+    """返回 (取锁的 [(文件名, 被锁的函数名)], 没取锁的 [文件名])"""
     assert MUTCHECKS, (
         "devloop/ 下一个 mutcheck_*.py 都没有 —— 判据遍历器一次都没跑,"
         "下面所有检查都是恒真的。先确认 glob 的路径对不对"
     )
-    locked: list[str] = []
+    locked: list[tuple[str, str]] = []
     bare: list[str] = []
     for f in MUTCHECKS:
-        tree = ast.parse(f.read_text(encoding="utf-8"))
-        if not _writes_repo_files(tree):
-            continue
-        (locked if _takes_sweep_lock(tree) else bare).append(f.name)
+        name = _locked_name(ast.parse(f.read_text(encoding="utf-8")))
+        (locked.append((f.name, name)) if name else bare.append(f.name))
     return locked, bare
 
 
-def test_every_mutcheck_that_writes_files_takes_the_sweep_lock():
-    """每个**会写仓库文件**的变异测试脚本都必须持锁
+def test_every_mutcheck_script_takes_the_sweep_lock():
+    """**每一个**变异测试脚本都必须持锁 —— 没有豁免
 
-    只查「写文件的」那批:`mutcheck_r41` 到 `mutcheck_r64` 那 24 个是纯
-    分析脚本,一个 `write_*` 都没有,给它们套锁是给不存在的问题加仪式。
+    ## r114 更正:上一版有个「会写文件才要求持锁」的豁免,而它是错的
 
-    ## 为什么不按「是不是 mutcheck」一刀切
+    上一版(r113)判据只查「会写仓库文件的脚本」,理由是实测「70 个脚本里
+    46 个会写文件,r41–r64 那 24 个是纯分析,一个 `write_*` 都没有」。
 
-    一刀切的话,判据就变成了「每个文件里都得有 `mutkit.locked` 这串
-    字」—— 于是 (a) 给 24 个纯分析脚本白白套一层,(b) 下一个人新写一个
-    纯分析脚本会被判据红,只能去加一句没用的调用。判据一旦开始逼人写
-    废话,它就没人看了。
+    **那个实测是错的,而且错得很有说服力**:判定函数只认
+    `write_text` 和 `write_bytes` 两个方法名。而 r41–r64 用的是
+
+        open(path, "w", encoding="utf-8").write(s.replace(old, new, 1))
+        shutil.copy(bak, path)
+
+    —— 一样在改仓库源码,只是走的不是那两个方法。逐个查了它们的变异目标:
+    `arl_lite/core/monitor.py`、`arl_lite/core/watcher.py`、`arl_lite/cli.py`、
+    `arl_lite/ai/commands.py`、`tests/test_cli_advice_commandable.py`……
+
+    后果:那 24 个脚本**确实会就地改仓库文件,却因为分类器看不见而被
+    豁免在锁外面** —— 正是本文件要防的那件事。r114 把它们全补上了锁,
+    现在 71 个脚本一个不落。
+
+    ## 为什么豁免整个删掉,而不是把检测面修宽
+
+    修宽之后实测:**71 个脚本全部会写,一个只读的都没有**。豁免成了死代码 ——
+    而死代码在这类判据里比没有更坏,因为它会让人以为「还有一批脚本是不
+    需要管的」,下一个人会拿它当先例。
+
+    ## 顺带记一个检测器陷阱
+
+    把 `Path.replace` 算进「会写」之后,**71 个脚本全部命中** —— 因为静态
+    分不清 `s.replace(old, new, 1)`(纯字符串替换)和 `Path.replace(...)`
+    (换文件)。分不清的检测器会匹配一切,**判不准的检测器比没有更危险**
+    (r101)。所以判据里只保留**模块限定、无歧义**的途径。
 
     ## 前置条件也断言掉
 
-    `locked` 和 `bare` 的数量本身就是结论的一部分。如果哪天判据因为
-    脚本搬家而遍历到 0 个文件,`assert not bare` 会**绿**——那正是
-    「一条永远绿的判据等于没有判据」。所以先钉住「至少有 30 个脚本会写
-    文件」这个实测值(现在是 46)。
+    如果哪天 glob 路径变了导致遍历到 0 个文件,`assert not bare` 会**绿**。
+    所以先钉住「至少有 60 个脚本」(实测 71)。
     """
     locked, bare = _classify()
-    total = len(locked) + len(bare)
-    # 这里的 30 是**实测 46 的下限**,不是精确值 —— 写死精确值会变成
-    # 「写死总数 = 自造一条永远红的门禁」(r110 刚把一个漂移的总数去掉)。
-    #
-    # 它的真实边界是实测出来的,不是猜的:r113 试过把属性名改坏**一个**
-    # (`write_bytez`),`total` 只从 46 掉到 45,这条照样绿。所以它挡的是
-    # **范围崩塌**,不是「掉一个脚本」。一个脚本从「会写文件」变成
-    # 「不写文件」(比如有人删了 finally 里的还原)会让它退出检查范围 ——
-    # 而那恰恰是更危险的改动。这个缺口已知,没在本轮补。
-    assert total >= 30, (
-        f"只认出 {total} 个会写文件的脚本(实测 46)。"
+    assert len(locked) >= 60, (
+        f"只认出 {len(locked)} 个取锁的脚本(实测 71)。"
         "要么判据的遍历范围变了,要么脚本被搬走了 —— "
         "不管哪种,这条判据现在验不到东西,别信它的绿"
     )
-    assert locked, (
-        "一个会写文件的 mutcheck 都没取锁,这条判据此刻全红。"
-        "先跑 devloop/mutkit.py 的说明:竞态能留下假结论(见本文件 docstring)"
-    )
     assert not bare, (
-        "这些变异测试会就地改仓库文件,却没取锁:\n  "
+        "这些变异测试没有持锁:\n  "
         + "\n  ".join(sorted(bare))
         + "\n  入口应该写成 `raise SystemExit(mutkit.locked(main))`,"
-        "并让脚本目录在 sys.path 上。"
+        "并让脚本目录在 sys.path 上。\n"
+        "  (r113 漏掉的 24 个:分类器只认 write_text/write_bytes,"
+        "看不见 `open(path, \"w\")` 和 `shutil.copy` 那种写法。)"
+    )
+
+
+def test_the_locked_entry_point_exists_and_takes_no_arguments():
+    """被锁的那个函数必须**真实存在**,而且**零必填参数**
+
+    `mutkit.locked(fn)` 的全部契约就是 `fn()` 这一句调用。于是它对 `fn`
+    有两个要求:是模块级可调用的、零必填位置参数。
+
+    ## 这条是实测出来的,不是想出来的
+
+    r114 批量统一入口形状时,改造脚本把 47 个脚本的锁**统一成了
+    `mutkit.locked(_run_all)`** —— 而那些脚本里根本没有 `_run_all` 这个
+    函数(r113 自己才有)。改造脚本的复核只查了「能 parse」「写调用数没变」
+    「`main` 还在」,**没查「锁的那个名字是不是就是那个 `main`」**,于是
+    47 个脚本一起改成了会在运行时 `NameError` 的样子,当场没发现。
+
+    所以这里不只是查签名,而是**真的把模块 import 进来**:
+    名字不存在、模块 import 就炸、函数需要参数,三种都会红。
+
+    只 import 不调用 —— 模块级代码只做定义,不碰仓库。
+    """
+    import importlib.util
+    import inspect
+
+    locked, _ = _classify()
+    bad: list[str] = []
+    for fname, fn_name in locked:
+        f = DEV / fname
+        try:
+            spec = importlib.util.spec_from_file_location(f"probe_{f.stem}", f)
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = mod
+            spec.loader.exec_module(mod)
+        except Exception as e:
+            bad.append(f"{fname}: import 就炸了 —— {type(e).__name__}: {e}")
+            continue
+        fn = getattr(mod, fn_name, None)
+        if fn is None:
+            bad.append(f"{fname}: 锁了 `{fn_name}`,但模块里没有这个函数")
+            continue
+        required = [p.name for p in inspect.signature(fn).parameters.values()
+                    if p.default is inspect.Parameter.empty
+                    and p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                                   inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+        if required:
+            bad.append(f"{fname}: `{fn_name}` 需要必填位置参数 {required},"
+                       "而 `mutkit.locked` 是按 `fn()` 调的")
+    assert not bad, (
+        "这些脚本的入口对不上 `mutkit.locked(fn)` 的契约(`fn()`):\n  "
+        + "\n  ".join(bad)
     )
 
 
@@ -268,11 +376,15 @@ def test_without_the_lock_the_race_is_real():
     它照样全绿。而这一条是 r113 那个结论的**唯一**对照物:没有它,
     「加锁」就只是照着直觉做的一件事。
 
-    ## 时序是被刻意排成会出事的那个
+    ## 时序是被**证明**出来的,不是被祈祷出来的
 
-    A 先启动:备份到**干净内容**,施加变异,0.15 秒后还原(干净)。
-    B 在 0.05 秒后启动 —— A 还没还原,于是 B 的「备份」取到的**是 A 的
-    变异内容**;B 3 秒后还原,把那一份脏内容写了回去。
+    首版这里用 `time.sleep(0.05)` 错开两个进程。那是碰运气:机器一忙,
+    B 可能在 A 还原之后才启动,竞态排不出来,这条判据就红 —— 而红的和
+    被测代码无关。**这种判据比没有判据更坏**(r101)。
+
+    现在 A 先启动(备份到干净内容、施加变异),B **等看到 A 的变异**才启动,
+    于是 B 的备份**必然**是脏的;A 等 B 还原完再把干净内容写回去,B 最后
+    把那份脏备份写回去 —— 最终文件不是原始内容。
 
     谁最后还原谁说了算,所以**必须**是「备份干净的那个先还原」。写成
     「A 后启动、B 后还原」看起来对称,实测反而是干净的 —— r113 第一次
@@ -283,17 +395,22 @@ def test_without_the_lock_the_race_is_real():
     with tempfile.TemporaryDirectory() as td:
         script = Path(td) / "racer.py"
         script.write_text(RACER, encoding="utf-8")
-        target = Path(td) / "f.txt"
+        root = Path(td)
+        target = root / "f.txt"
         target.write_text("V0\n", encoding="utf-8")
+        sentinel = root / "sentinel"
 
-        a = subprocess.Popen(
-            [sys.executable, "-B", str(script), str(target), "0.15", "<<A>>"])
-        import time
-        time.sleep(0.05)
-        b = subprocess.Popen(
-            [sys.executable, "-B", str(script), str(target), "3", "<<B>>"])
-        a.wait(timeout=30)
-        b.wait(timeout=30)
+        def spawn(role, marker):
+            return subprocess.Popen(
+                [sys.executable, "-B", str(script), str(target), role,
+                 marker, str(sentinel)])
+
+        # 先起的那个:备份拿到的是**干净内容**,并且等后一个还原完才写回
+        a = spawn("first", "<<A>>")
+        # 后起的那个:等看到 A 的变异才动手 —— 它的备份**必然**是脏的
+        b = spawn("second", "<<B>>")
+        a.wait(timeout=60)
+        b.wait(timeout=60)
 
         left = target.read_bytes()
         assert left != b"V0\n", (

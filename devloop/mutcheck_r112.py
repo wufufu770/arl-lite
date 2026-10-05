@@ -392,6 +392,7 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+    import pathlib as _pl, sys as _sy
+    _sy.path.insert(0, str(_pl.Path(__file__).resolve().parent))
     import mutkit
     raise SystemExit(mutkit.locked(main))
