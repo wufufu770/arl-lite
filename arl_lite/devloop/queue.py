@@ -18,7 +18,12 @@
     1. 持久化:JSON 落盘,原子写(tmp + os.replace),崩溃后可恢复
     2. 调度:next() 按 (priority asc, created_round asc, id asc) 稳定排序
     3. 状态机:pending → in_progress → done | dropped,attempts 在 in_progress 时 +1
-    4. 自愈:seed_if_empty() 永远能产生至少 1 条新 item(协议不变量)
+    4. 自愈:seed_if_empty() 在「还有活可干」时产出新 item。
+       **它不是无条件保证** —— r112 实测它返回过 0:backlog 全部完成 +
+       三条周期项都没到期 + 兜底信号被人 drop。`drop` 是永久开关
+       (人明确说「我不要这条」),所以这一状态**不会自愈**。
+       引擎对此的处理是如实停下并说「没有下一步」,而不是编一条假活出来。
+       完整条件与出路见 `seed_if_empty` 里 Tier 2 那段注释。
     5. 多 agent:claim / release / finish / recover_stale 是加锁的原子操作,
        绕开它们直接 load/save 在并发下会丢更新
 
@@ -899,11 +904,28 @@ class Queue:
         # ── Tier 2:保底 ──
             if not added:
                 # 长期演进项本来就是"做到就算一轮、还会再来"的,所以永远提出
-                # + 改名。保底层必须总能提出东西,否则它不是保底。
+                # + 改名。**但 r112 实测:本层并不总能产出。**
                 #
                 # 原来这里上面还有一层"扫项目现状自动推导"(Tier 2)。它已经
-                # 被整层删掉了,理由见 `REMOVED_TIER2_WHY`。删除之后不变式 #4
-                # 依然成立:本层是保底,永远能产出。
+                # 被整层删掉了,理由见 `REMOVED_TIER2_WHY`。
+                #
+                # r112 更正下面那句「删除之后不变式 #4 依然成立:本层是保底,
+                # 永远能产出」—— **那是错的,而且此刻是错的**。实测
+                # `seed_if_empty()` 返回 **0**。三个条件同时成立时它必然空:
+                #   一,`backlog.md` 里的条目**全部标了完成**(r112:38/38)
+                #   二,三条周期项**都没到期**(verify 全通过 = 没到点)
+                #   三,兜底信号 `no-due-maintenance-review` **被人 drop 了**
+                # 而第三条是**永久开关**:`drop` 的语义就是「我明确不要这条」,
+                # `test_a_dropped_signal_is_never_reproposed` 明确钉着不再重提。
+                #
+                # 当年 drop 那条信号时留下的理由自己就写着「**drop 掉不解决
+                # 根因**,根因是 ensure_next_step 播的就是这种条目,已另登记为
+                # 真活」。那些「真活」r103–r111 做完之后,状态**原样回来了**。
+                #
+                # 所以本层返回空是**对眼下确实没有活干的诚实回答**,不是 bug;
+                # 引擎会在 `protocol.ensure_next_step` 里如实说「没有下一步」。
+                # 该做的只有两件,都是人的决定:往 `backlog.md` 加新待办,
+                # 或者 `devloop unmark no-due-maintenance-review-r6` 把信号放回来。
                 added += self._seed_fallback(set(), next_round)
 
             if added:

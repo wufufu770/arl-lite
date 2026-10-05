@@ -785,3 +785,167 @@ def test_real_queue_has_no_pending_item_whose_verify_already_passes():
         + "\n  用 devloop unmark <id> 改回 pending,或确认它是真的没干完"
         "就换一条能区分'做了'和'本来就成立'的 verify。"
     )
+
+
+def test_seeding_can_return_zero_when_three_conditions_all_hold():
+    """三个条件同时成立时,播种返回 0 是**可以复现的诚实状态**
+
+    ## 这条在守什么
+
+    r112 实测:真实仓库上 `seed_if_empty(112)` 返回 **0**。
+    那一刻 `arl_lite/devloop/queue.py` 里有**两处说法与代码相反**的文本,
+    而且都在说自己描述的那一层:
+
+      - 模块 docstring 不变式 #4 写「seed_if_empty() **永远**能产生至少
+        1 条新 item(协议不变量)」
+      - `seed_if_empty` 里 Tier 2 那段注释写「删除之后不变式 #4
+        **依然成立**:本层是保底,**永远能产出**」
+
+    同一份文件里 `_seed_fallback` 的 docstring 却是诚实的 ——
+    三条都没到期时「本层返回空,队列会空掉,是对眼下确实没有维护活
+    要干的诚实回答」。也就是说三种说法并存,读 Tier 2 注释的人
+    会以为队列永远不会空。
+
+    ## 为什么不满足于「把注释改得和 docstring 一样圆」
+
+    如果只有「文档不许声称 X」这一条判据,能让它变绿的方式有两种:
+    把谎话说得更婉转,或者把那句话删掉。都不是我想要的。所以这里
+    **先造出那个状态**,让注释里那句错话有一个能被复现的反例。
+
+    ## 三个条件(缺任何一个都产得出东西)
+
+      一,`backlog.md` 里每一条都打了 ✅ 完成标记 → Tier 1 跳过
+      二,三条周期项的产物报告都在 90 天内更新过 → 没到期,不提
+      三,兜底信号 `no-due-maintenance-review` 被人 drop 了
+        → drop 是**永久开关**(`test_a_dropped_signal_is_never_reproposed`)
+
+    第一条播种的断言顺带把条件一、条件二也钉住了:只该产出信号一条。
+    如果 ✅ 不被尊重,或三份报告被判成到期,产出条数就变 3 或 4,
+    那条断言当场就红 —— 所以「fixture 造对了」不是假设,是断言出来的。
+
+    ## 隔离说明(不是洁癖,是被真实状态绑架过一次就会记住)
+
+    三份报告是**相对路径**(`_FRESH_WITHIN("docs/DEP_AUDIT.md", 90)`),
+    而 `verify_passes` 用 `cwd=Path.cwd()` 跑。所以这里 chdir 进临时目录
+    并在里面造三份**刚写**的报告。否则这条判据会被仓库里那三份真实
+    文件的年龄绑架:哪天它们过了 90 天,三条周期项会**正常**被提出,
+    播种返回 3 而不是 0,这条判据变红 —— 而红的不是被测代码。
+    """
+    import os
+
+    from arl_lite.devloop.queue import _SIGNAL_ID
+
+    here = Path.cwd()
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "docs").mkdir()
+        for rel in ("DEP_AUDIT.md", "PERF_BASELINE.md", "FP_RATE.md"):
+            (root / "docs" / rel).write_text(f"刚写的报告:{rel}\n", encoding="utf-8")
+        # Tier 1 的料:每一条都打了 ✅,播种必须跳过
+        (root / "backlog.md").write_text(
+            "# devloop 待办清单(人工追加)\n"
+            "# 格式: - [P0..P3] kind: title | detail | verify\n"
+            "- [P2] change: 早已做完的一件旧事 | ✅ r90 完成,别捡 | "
+            "test -f docs/DEP_AUDIT.md\n"
+            "- [P3] doc: 早已做完的另一件旧事 | ✅ r91 完成 | "
+            "test -f docs/PERF_BASELINE.md\n",
+            encoding="utf-8",
+        )
+
+        os.chdir(root)
+        try:
+            q = Queue(root / "queue.json")
+
+            first = q.seed_if_empty(round_no=1)
+            after_first = q.load()
+            assert first == 1, (
+                f"第一次播种产出 {first} 条,预期恰好 1 条信号。\n"
+                "  fixture 没造对:多半是三份报告的 mtime 没落在 90 天窗口内"
+                "(那就说明条件二不成立,这条判据测不到东西),"
+                "或者 ✅ 完成标记没被尊重(条件一不成立)。"
+            )
+            assert [i.id for i in after_first] == [_SIGNAL_ID], (
+                "第一次播种只该产出兜底复查信号一条,实际产出 "
+                f"{[i.id for i in after_first]} —— "
+                "出现周期项说明它们被判成到期(报告太旧),"
+                "出现别的 id 说明带 ✅ 的行没被跳过。"
+            )
+
+            ok, why = q.drop(_SIGNAL_ID, reason="别再提醒,我已确认暂时没有活")
+            assert ok, f"drop 信号失败,条件三不成立:{why}"
+
+            # 之后每一轮都该是同一个诚实回答:0 条,且不往队里塞任何东西
+            for rnd in (2, 3, 4):
+                got = q.seed_if_empty(round_no=rnd)
+                state = [(i.id, i.status) for i in q.load()]
+                assert got == 0, (
+                    f"第 {rnd} 轮播种产出 {got} 条,预期 0。"
+                    "三个条件同时成立时队列确实没有可提的活,引擎不该编一条出来。"
+                )
+                assert state == [(_SIGNAL_ID, "dropped")], (
+                    f"第 {rnd} 轮之后队列内容变成了 {state},"
+                    f"预期恰好一条 dropped 信号。凭空多出来的条目就是假活 —— "
+                    "「让队列非空」正是第 16 轮删掉的整层假活制造机。"
+                )
+        finally:
+            # pytest 从仓库根跑,cwd 泄漏会毁掉后面所有用相对路径的测试
+            os.chdir(here)
+
+
+def test_module_docstring_must_not_claim_an_invariant_it_cannot_hold():
+    """模块 docstring 里的不变式,不许声称代码守不住的东西
+
+    r112 把上两处文本改成实测之后,只说了「改成诚实」是不够的 ——
+    下一轮有人照着 docstring 里 `#4 自愈` 这个标题接着往下写,
+    或者再写一条「删除 X 之后不变式 #4 依然成立」,同样的谎话就换个
+    理由回来了。这条判据盯的是**模块 docstring 那一处**,因为那是
+    最常被当规格引用、也最容易被后来者当成既有结论抄走的位置。
+
+    ## 为什么只查 docstring,不查 `seed_if_empty` 里那段注释
+
+    那段是 `#` 注释,拿它做结构化检查就得回退到源码文本匹配 ——
+    而本项目已经因为「用文本子串匹配代替结构检查」栽过一次
+    (`test_source_checks_are_structural.py` 钉着)。用
+    `ast.get_docstring()` 拿模块文档字符串是真结构化检查:
+    docstring 是语法节点,不是一段恰好长得像的话。
+
+    代价要说清楚:那段注释里的 `永远能产出` 是**被引用的反面教材**
+    (「r112 更正下面那句『……永远能产出』—— 那是错的」),
+    所以判据若改成扫注释,会先被自己这段引用绊倒。这是选择,不是漏洞。
+    """
+    import ast
+
+    from arl_lite.devloop import queue as qmod
+
+    doc = ast.get_docstring(ast.parse(Path(qmod.__file__).read_text(encoding="utf-8")))
+    assert doc, (
+        "arl_lite/devloop/queue.py 的模块 docstring 不见了。"
+        "这个文件的不变式清单全靠它 —— 删掉它等于让 #4 那类声明"
+        "失去唯一的成文位置,下一个人只会照着代码猜"
+    )
+
+    lies = [
+        "永远能产生至少 1 条",
+        "永远能产出",
+    ]
+    said = [s for s in lies if s in doc]
+    assert not said, (
+        f"模块 docstring 声称 {said} —— r112 实测播种返回过 0"
+        "(backlog 全完成 + 三条周期项都没到期 + 兜底信号被 drop),"
+        "而 drop 是永久开关,这个状态不会自愈。"
+        "把「永远」改成「还有活可干时」,并把 drop 的永久性写进去"
+    )
+
+    # 只禁「不许撒谎」不够:还要它把**当时的真实条件**留下。
+    # 否则下一个人看到的不变式 #4 会是一句没有内容的自我安慰。
+    for needed, why in (
+        ("不是无条件保证", "得说清这条不是无条件保证"),
+        ("返回过 0", "得留下实测到的那次返回 0"),
+        ("drop", "得点名 drop 是那个让它不再自愈的开关"),
+        ("永久", "得说清 drop 是永久的,而不是这轮跳过"),
+    ):
+        assert needed in doc, (
+            f"模块 docstring 不变式 #4 缺「{needed}」:{why}。"
+            "只删掉那句错话不算修好 —— 下一个读它的人需要知道"
+            "队列到底在什么条件下会空,以及空了之后能不能自愈"
+        )
