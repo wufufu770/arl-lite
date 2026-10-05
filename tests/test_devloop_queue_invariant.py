@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -31,7 +32,7 @@ import pytest
 from arl_lite.devloop import gates
 from arl_lite.devloop.gates import GateResult
 from arl_lite.devloop.protocol import Loop
-from arl_lite.devloop.queue import Item, Queue, _slugify_id
+from arl_lite.devloop.queue import Item, Queue, _slugify_id, is_backlog_done
 
 REPO = Path(__file__).parents[1]
 
@@ -329,6 +330,18 @@ def test_real_backlog_titles_still_map_to_their_done_records(loop):
     "文件里写了什么",两件事。
 
     这也记一笔:拿一个**会过滤**的函数当数据源用,迟早出事。
+
+    ## r109:这里自己又抄了一份判定,而且已经和实现漂了
+
+    原来这行是 `if "✅" in e["detail"]`,而播种那边是
+    `detail.startswith("✅")`。**两份判定不一样**,后果实测:一条 detail
+    写 `做完了,✅ r99 完成` 的行,本测试判定它是「标了完成」(于是要求
+    队列里有 done 记录),而播种判定它**没标完成**,照样捡回来当新活。
+
+    比「两处都写错」更难查的是这一种:判据漂成**看不见实现的真实行为**,
+    于是它绿着,而引擎在做另一件事。r28 的 `is_signal_id` 就是为同一个
+    理由抽出来的(`round` / CLI / 测试各写一份前缀匹配)。现在完成标记
+    也只有一份:`queue.is_backlog_done`,两边都问它。
     """
     dev = REPO / "devloop"
     q = Queue(dev / "queue.json")
@@ -344,7 +357,8 @@ def test_real_backlog_titles_still_map_to_their_done_records(loop):
     assert entries, "真实 backlog.md 解析不出条目"
 
     known = {i.id: i.status for i in q.load()}
-    marked_done = [e for e in entries if "✅" in e["detail"]]
+    # 问**引擎那一份**判定,不要在这里再抄一次 —— r109 的教训
+    marked_done = [e for e in entries if is_backlog_done(e["detail"])]
     assert marked_done, (
         "backlog.md 里一条 ✅ 都没有 —— 前置条件不成立,"
         "这条测试现在什么都验不到"
@@ -360,6 +374,147 @@ def test_real_backlog_titles_still_map_to_their_done_records(loop):
         f"  多半是改过标题导致 id 变了 —— id 是从标题派生的。"
         f"改标题前先确认队列里那条 done 记录的 id。"
     )
+
+
+def test_every_line_that_looks_like_a_backlog_entry_actually_parses():
+    """凡是 `- [P…]` 形状的行,**必须**能被 `_BACKLOG_LINE` 解析
+
+    r109 撞上的:补 4 个 ✅ 时把 `- [P1]` 写成了 `- [1]`(`m.group(1)`
+    捕到的是 `1`,`P` 是字面量不在捕获组里),于是那 4 行**整行不再匹配**。
+
+    后果是所有判据和播种**一起看不见它们**,而且全都报绿:
+
+    - 播种:`_seed_from_backlog` 认不出 → 走 `done_ids` 兜住了,没出事
+    - 「标了 ✅ ⇒ done」:它不在 entries 里,不参与检查
+    - 「done ⇒ 标了 ✅」(r109 新加):同样不参与检查
+    - 格式校验:我把 `|` 数量查成 2 个,**通过**了 —— 竖线对上了,
+      优先级标签错了,没有一条判据看那个标签
+
+    这是 r83 记过的「探针静默漏报,然后我拿它的输出下结论」,这次是我
+    自己在同一轮里又踩了一遍。**任何只遍历「解析成功的那些」的判据,
+    都有一个共同的盲区:解析失败的那些。** 而 `_BACKLOG_LINE` 匹配不上
+    时不报错、不告警,只是安静地不参与。
+
+    所以判据不查「内容对不对」,只查**「我以为在查的行,是不是真的在」**。
+    """
+    text = (REPO / "devloop" / "backlog.md").read_text(encoding="utf-8")
+    looks_like_entry, unparsed = 0, []
+    for n, line in enumerate(text.splitlines(), 1):
+        if not re.match(r"^\s*-\s*\[", line):
+            continue
+        looks_like_entry += 1
+        if not Queue._BACKLOG_LINE.match(line):
+            unparsed.append(f"L{n}: {line[:60]}")
+    assert looks_like_entry, (
+        "backlog.md 里一条 `- [` 开头的行都没有 —— 前置条件不成立,"
+        "这条判据现在什么都验不到")
+    assert not unparsed, (
+        f"这些行看着是待办条目,却解析不出来,对所有判据和播种都是隐形的:"
+        f"{unparsed}\n"
+        f"  常见原因是优先级标签写错(`[P1]` 写成 `[1]`)—— "
+        f"`_BACKLOG_LINE` 要求 `[P([0-3])]`,那个 `P` 是字面量,不在捕获组里。\n"
+        f"  判据只遍历解析成功的行,所以这类错误对它们**全部报绿**。"
+    )
+
+
+def _real_backlog_entries() -> list[dict]:
+    """读**真实** `devloop/backlog.md` 的全部条目,不走播种的过滤。
+
+    走 `Queue._BACKLOG_LINE` 而不是 `_seed_from_backlog`:播种是「该做什么」,
+    这里要的是「文件里写了什么」。拿一个**会过滤**的函数当数据源用,
+    迟早出事(见上面那条 docstring)。
+    """
+    out = []
+    for line in (REPO / "devloop" / "backlog.md").read_text(
+            encoding="utf-8").splitlines():
+        m = Queue._BACKLOG_LINE.match(line)
+        if m:
+            out.append({
+                "id": _slugify_id(m.group(3).strip(), 0),
+                "detail": m.group(4).strip(),
+            })
+    return out
+
+
+def test_done_work_is_marked_done_in_the_human_facing_index():
+    """**反方向**:队列里 done/dropped 的行,`backlog.md` 必须标 ✅
+
+    上面那条只查「标了 ✅ ⇒ 队列里 done」。反过来没人查,而那正是人受
+    伤的方向:`backlog.md` 是**给人查的索引**(r106 实测确认过这个定位),
+    一个人打开它想知道「还剩什么」,看到的是四条没打标记的条目,而队列
+    里它们早在 r55/r56/r57/r60 就 done 了。
+
+    r109 实测:`bulk-insert` / `200` / `asset-changes` /
+    `watcher-n-3-ports-sites` 四条,队列 done、代码里也真做完了
+    (`_ASSET_IDENTITY` 归一 / `Monitor._ASSET_TABLES` 派生 /
+    `monitor changes --since` + `monitor prune` / `CHANGE_RECORD_CAP`
+    可见截断),但 detail 段一个 ✅ 都没有。
+
+    ## 功能上为什么没出事
+
+    因为播种还有第二道保护:`done_ids` 也会跳过它们。所以这四条**不会**
+    被重新排进队列 —— 代价只是索引在骗人。**这也是它能活到今天的原因**:
+    没有任何可观测的功能故障,只有一处会误导下一个人的记录。
+    所以判据只能盯**一致性**,盯不了「有没有出事」。
+    """
+    q = Queue(REPO / "devloop" / "queue.json")
+    known = {i.id: i.status for i in q.load()}
+    entries = _real_backlog_entries()
+    assert entries, "真实 backlog.md 解析不出条目"
+
+    finished = [e for e in entries if known.get(e["id"]) in ("done", "dropped")]
+    assert finished, (
+        "真实队列里一条 done/dropped 都没有 —— 前置条件不成立,"
+        "这条测试现在什么都验不到"
+    )
+    unmarked = sorted(
+        f"{e['id']}(队列里是 {known[e['id']]})"
+        for e in finished if not is_backlog_done(e["detail"])
+    )
+    assert not unmarked, (
+        f"这些活队列里已经 done/dropped,backlog.md 却没标 ✅:{unmarked}\n"
+        f"  backlog.md 是给人查的索引 —— 不标完成,下一个打开它的人"
+        f"会以为这些还没做。\n"
+        f"  标之前先确认代码里真的做完了,别只信队列的记录。"
+    )
+
+
+def test_the_done_marker_predicate_matches_what_seeding_actually_honours():
+    """完成标记的判定只有一份,而且那份**就是播种用的那份**
+
+    r109 的原发缺陷:播种 `detail.startswith("✅")`,判据 `"✅" in detail`,
+    两份不一样。后果不是「两处都错」,是**判据看不见实现的真实行为** ——
+    `做完了,✅ r99 完成` 这种行,判据放行而播种照样捡回来。
+
+    正控制组用真实判定跑一遍播种:同样的输入,判定说 done 就**不该**被播。
+    """
+    d = REPO / "devloop" / "_tmp_done_marker_probe"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "backlog.md").write_text(
+            "# backlog\n"
+            "- [P1] change : 开头打的 | ✅ r109 完成 | test -f pyproject.toml\n"
+            "- [P1] change : 打在中间的 | 做完了,✅ r109 完成 | test -f pyproject.toml\n",
+            encoding="utf-8")
+        q = Queue(d / "queue.json")
+        q.seed_if_empty()
+        seeded = {i.title for i in Queue(d / "queue.json").load()}
+
+        for title, detail in (("开头打的", "✅ r109 完成"),
+                              ("打在中间的", "做完了,✅ r109 完成")):
+            said_done = is_backlog_done(detail)
+            got_seeded = title in seeded
+            assert said_done != got_seeded, (
+                f"{title}: 判定说标了完成={said_done},实际被播种={got_seeded} —— "
+                f"判定和播种用的不是同一份规则"
+            )
+        assert "开头打的" not in seeded, "开头打了 ✅ 却被播种成新活"
+        assert "打在中间的" in seeded, (
+            "✅ 不在开头就不算完成标记,这条必须被播种 —— "
+            "若它没被播种,说明 `is_backlog_done` 变成了子串包含,"
+            "那正是 r109 修掉的那个漂移")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
 
 
 # =====================================================================

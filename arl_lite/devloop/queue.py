@@ -110,6 +110,20 @@ def is_signal_id(item_id: str) -> bool:
     return item_id == _SIGNAL_ID or item_id.startswith(_SIGNAL_ID + "-r")
 
 
+def is_backlog_done(detail: str) -> bool:
+    """backlog.md 一行的 detail 段是不是打了**完成标记**
+
+    r109 新增。播种和判据此前各写一份,而且**已经漂了**:播种用
+    `startswith("✅")`,`tests/test_devloop_queue_invariant.py` 用
+    `"✅" in detail`。实测一条 detail 写 `做完了,✅ r99 完成` 的行,
+    判据放行、播种照样把它当新活捡回来。
+
+    跟上面 `is_signal_id` 同一个理由(决策 #9:两处手抄同一段逻辑迟早漂),
+    而且漂的方式是**判据看不见实现的真实行为**——比漂成两处都错更难查。
+    """
+    return detail.startswith("✅")
+
+
 # 恒真命令。写成列表而不是只有一个 `true`,是因为:
 #   `true` / `: ` / `true && true` / `|| true` / `echo`  全都恒过,
 # 而判据若只认字面量 `true`,下一个人换个写法就绕过去了。
@@ -1150,7 +1164,7 @@ class Queue:
             # 而"已完成的工作被无限重排"正是第 12 轮清过的那场灾难
             # (8 条待办全是已完成工作的重推导,队列非空但没有一件真活)。
             # 让文档承诺成真,比再写一遍"请记得两边都更新"可靠。
-            if detail.startswith("✅"):
+            if is_backlog_done(detail):
                 continue
             # id 由 title 派生。中文标题 slug 化会退化成 "item"（正则只认
             # [a-z0-9]），所以中文为主时退化为 "item-" + 标题短哈希——

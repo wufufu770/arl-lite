@@ -66,3 +66,5 @@ git log -1 --format=%B <hash>            # 某一轮的完整过程
 | r104 | `35fd05f` | 端口扫描分不清「端口关闭」和「没探到」—— 而它自己的测试拿公网当 fixture | r103 收尾时 test_baseline 红在 test_phase2::test_portscan_integration (断言公网 example.com 的 80/443… |
 | r105 | `2150f56` | 测试拿公网当 fixture,而 @pytest.mark.slow 用了却从没注册 | 一、告警。 |
 | r106 | `7fb5ff5` | r103 写下「记录只在不入库的队列里」—— 方向反了,记录在 commit message 里 | r103 收尾时我只查了 backlog.md 和 queue.json 就下了结论: |
+| r107 | `17a124d` | r107: 补上轮次索引 —— 记录本来就在 commit message 里,丢的只是索引 | r103 收尾时我在 backlog.md 里写: |
+| r108 | `2cbefcb` | r108: 协议文档的门禁总表和实现脱节 67 轮 —— 7 条里 5 条的命令是虚构的 | 把 `docs/devloop-protocol.md` 的 5.1「七道门禁总表」和 |
