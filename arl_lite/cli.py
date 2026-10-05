@@ -750,15 +750,36 @@ def _notify_correlations(args, hits, total: int | None = None) -> str | None:
             )
         except Exception as e:
             return f"[!] invalid webhook config: {e}"
-    if not getattr(cfg, "url", ""):
+    if not getattr(cfg, "url", "") and getattr(cfg, "provider", "") != "local":
+        # r99:原来是无条件查 url。但 `local` provider **本来就不需要 URL**
+        # (它只写日志不发 HTTP),于是「注入了一个合法的 local 配置」会被
+        # 这里判死并报成「--notify given but no webhook url」——
+        # 一句和真实原因无关的话,而且这个分支在本地调试时天天走到。
         return "[!] --notify given but no webhook url"
 
     from .notify import notify_correlation
 
     ok = 0
     failed = 0
+    skipped = 0
     for h in hits:
         payload = h.to_dict() if hasattr(h, "to_dict") else dict(h.__dict__)
+        # r99:门限先自己问一遍。`notify()` 里也会问,但它把「被门限挡下」
+        # 和「发出去了但失败」都返回 False —— 汇总行于是把
+        # **压根没发出去**说成「failed」。实测(r99 修之前):
+        #
+        #     hit 有 severity 吗: False          <- CorrelationHit 根本没这字段
+        #     -> '[i] notified 0/1 correlation(s) (1 failed)'
+        #
+        # 那不是投递失败,是通知在发出**之前**就没了。用户看到这个会去查
+        # 网络、查 token、查 webhook 地址 —— 而真正的原因是门限。
+        #
+        # 所以这里先问一遍门限,把两种「没发出去」分开报:
+        # skipped = 被门限挡下(配置如此,不是故障)
+        # failed  = 真的尝试了但没成(网络/服务端)
+        if not cfg.should_notify(payload.get("severity", "info")):
+            skipped += 1
+            continue
         try:
             if notify_correlation(cfg, payload):
                 ok += 1
@@ -773,6 +794,9 @@ def _notify_correlations(args, hits, total: int | None = None) -> str | None:
         line += (f" —— 共命中 {total} 条,按 --limit 只推了前 {len(hits)} 条,"
                  f"其余 {total - len(hits)} 条**没有推**"
                  f"(它们在命令输出和 correlations 表里)")
+    if skipped:
+        line += (f" ({skipped} 条低于 min_severity={cfg.min_severity!r},"
+                 f"**没有尝试发送**)")
     if failed:
         line += f" ({failed} failed)"
     return line
@@ -1733,6 +1757,12 @@ def cmd_mcp(args) -> int:
 # ============================================
 
 def build_parser() -> argparse.ArgumentParser:
+    # r99:等级表从 notify 模块取,不在这里再抄一份。原来 `--min-severity`
+    # 的 choices 是手抄的字面量,而 `WebhookConfig` 的默认门限是另一个值 ——
+    # 同一个旋钮两个默认值(决策 #9)。
+    # 延迟 import:cli 不该为了建 parser 就把通知层拖进来。
+    from .notify.webhook import SEVERITY_ORDER
+    _SEVERITY_CHOICES = list(SEVERITY_ORDER)
     p = argparse.ArgumentParser(
         prog="arl-lite",
         description="灯塔 ARL 降级增强版:2G 内存友好的资产侦察工具",
@@ -2040,7 +2070,10 @@ def build_parser() -> argparse.ArgumentParser:
     pnft = pnf_sub.add_parser("test", help="发测试通知")
     pnft.add_argument("--url", help="webhook URL")
     pnft.add_argument("--provider", default="generic", choices=["generic", "ntfy", "slack", "local"])
-    pnft.add_argument("--min-severity", default="info", choices=["info", "low", "medium", "high", "critical"])
+    pnft.add_argument("--min-severity", choices=list(_SEVERITY_CHOICES),
+                      default=_SEVERITY_CHOICES[0],
+                      help=(f"只发送不低于该等级的通知(默认 "
+                            f"{_SEVERITY_CHOICES[0]},与 WebhookConfig 同一个来源)"))
     pnft.add_argument("--timeout", type=int, default=10)
     pnft.set_defaults(func=cmd_notify_test)
 

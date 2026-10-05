@@ -28,9 +28,27 @@ from dataclasses import dataclass, field
 
 log = logging.getLogger("arl_lite.notify")
 
-# 严重等级阈值(只 notify 严重事件)
-DEFAULT_MIN_SEVERITY = "high"  # high / critical
-SEVERITY_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+# 严重等级阈值。等级表与默认值都只有这一处定义 —— CLI 的 `--min-severity`
+# 的 choices 和默认值都从它派生。原来两边各写各的:argparse 写 "info"、
+# 这里写 "high",**同一个旋钮两个默认值**(决策 #9)。
+#
+# 实测后果不只是「不一致」:三个发送方发的 severity 全在 "high" 之下,
+# 于是它们**结构上一条都发不出去** ——
+#   notify_task_done        → "info"(无错)/ "medium"(有错)
+#   notify_critical_finding → finding.get("severity", "info")
+#   notify_correlation      → CorrelationHit **压根没有 severity 字段**,恒 "info"
+#
+# 而 `notify test` 走 argparse(门限 info)报「sent OK」,`correlate --notify`
+# 走这里(门限 high)一条不发 —— 同一个 URL、同一个 provider、两个门限。
+# `notify test` 是用户唯一的验证手段,它说通了用户就认为通知配好了。
+#
+# 取 CLI 一直对外承诺的 "info":用户显式传了 `--notify --webhook-url`,
+# 那就是**已经同意收通知**,再拿一个他从没看见过的门限去拦,拦掉的是本意。
+# 要静默只要高危,自己写 `--min-severity high`。
+DEFAULT_MIN_SEVERITY = "info"
+SEVERITY_ORDER = ("info", "low", "medium", "high", "critical")
+SEVERITY_RANK = {name: i for i, name in enumerate(SEVERITY_ORDER)}
+assert set(SEVERITY_RANK) == set(SEVERITY_ORDER)   # 写错了当场炸,别静默
 
 
 def is_valid_url(url: str) -> bool:

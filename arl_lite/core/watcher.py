@@ -564,17 +564,37 @@ class Watcher:
                 f"和这里记了多少条变更**不是一回事**。")
 
         # 通知
+        # r99:原来两处调用的返回值被**整个丢掉**。配合当时的默认门限
+        # (min_severity="high",而这两处发的是 info/medium),watch 每轮都
+        # 「跑完了」,但一条没发出去,用户分不清「没配」和「配了没到」。
+        # 现在三种结局分开记:发出 / 被门限挡下 / 真失败。
         if self.webhook:
-            notify_task_done(
+            sent = dropped = 0
+            if notify_task_done(
                 self.webhook,
                 task_id=0,  # watch 不绑定 task
                 target=wt.target,
                 found=new_total,
                 duration_seconds=duration,
-            )
+            ):
+                sent += 1
             # critical finding 单独通知(只看本次新增的,旧版会拿错行)
             for f in critical_findings:
-                notify_critical_finding(self.webhook, f)
+                if notify_critical_finding(self.webhook, f):
+                    sent += 1
+                else:
+                    dropped += 1
+            if dropped:
+                # 门限挡下和发送失败必须分开记:前者是配置如此,后者要去查
+                # 网络/地址。`min_severity` 用 getattr 取 —— webhook_config 是
+                # **注入**依赖,测试会塞裸 object(),直接取属性会炸
+                # (这轮第一次跑就撞在 test_watcher_new_count 上)。
+                gate = getattr(self.webhook, "min_severity", "?")
+                log.info(f"watch: {sent} 条通知已发出,{dropped} 条因低于 "
+                         f"min_severity={gate!r} 未尝试发送")
+            elif sent == 0 and critical_findings:
+                log.warning(f"watch: 有 {len(critical_findings)} 条 critical "
+                            f"finding,但一条通知都没发出去")
 
         # 外部 callback
         if self.on_run:
