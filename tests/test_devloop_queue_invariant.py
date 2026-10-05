@@ -417,6 +417,49 @@ def test_every_line_that_looks_like_a_backlog_entry_actually_parses():
     )
 
 
+def test_no_backlog_entry_is_split_across_two_lines():
+    """一条条目的**下半截**落到裸行里,对所有判据和播种都是隐形的
+
+    r110 实测:r106 把一条条目写成了**两行** —— L88 是正常的
+    `标题 | detail | verify`,L89 是它的下半截(974 字符,**不带 `- [P` 前缀**),
+    里面装着这条待办的**真正做法**「在 backlog.md 顶部写清三条记录指向哪」
+    和**第二个 verify**。
+
+    后果:`_BACKLOG_LINE` 匹配不上 L89,于是它不参与播种、不参与任何一致性
+    判据、连上面那条「每行都得解析」都看不见它(那条只查 `- [` 开头的行)。
+    而读的人以为它是 L88 的一部分。**r109 的判据挡住了「整个条目解析不了」,
+    挡不住「条目只写了一半」。**
+
+    ## 为什么判据是「紧跟在条目之后」而不是「任何裸行」
+
+    实测 `backlog.md` 里有 26 处既不是条目也不是小标题/列表/引用的裸行,
+    其中 **25 处全在第一条条目之前**(文件头说明区),只有 1 处紧跟在条目后面
+    —— 就是那条被劈开的。所以「紧跟在条目之后」这个信号是干净的:文件头里
+    的说明本来就是裸行,把它们一起禁掉等于把说明也判成缺陷。
+    """
+    entries = _real_backlog_entries()
+    assert entries, "真实 backlog.md 解析不出条目"
+
+    lines = (REPO / "devloop" / "backlog.md").read_text(
+        encoding="utf-8").splitlines()
+    orphans = []
+    for n, line in enumerate(lines, 1):
+        if n < 2 or not line.strip():
+            continue
+        prev = lines[n - 2].strip()
+        if not Queue._BACKLOG_LINE.match(prev):
+            continue                       # 上一行不是条目 → 说明区的正常裸行
+        if Queue._BACKLOG_LINE.match(line):
+            continue                       # 这一行自己就是条目
+        if line.lstrip().startswith(("#", "- ", ">")) or line.strip() == "---":
+            continue                       # 小标题 / 列表 / 引用 / 分隔线
+        orphans.append(f"L{n}(接在 L{n-1} 的条目后): {line[:60]}")
+    assert not orphans, (
+        f"这些行紧跟在一个条目后面,却又不是条目 —— 八成是条目被劈成了两行,"
+        f"下半截对所有判据和播种都是隐形的:\n  {' '.join(orphans)}\n"
+        f"  条目必须**一整行**写完(允许很长,长不是问题,断开才是)。")
+
+
 def _real_backlog_entries() -> list[dict]:
     """读**真实** `devloop/backlog.md` 的全部条目,不走播种的过滤。
 

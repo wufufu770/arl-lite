@@ -151,3 +151,54 @@ def test_the_index_does_not_claim_to_cover_rounds_that_do_not_exist():
     commits = _round_commits()
     phantom = sorted({r for r, _ in _index_rows()} - set(commits))
     assert not phantom, f"索引里这些轮次在 git 里没有对应的 commit:{phantom}"
+
+
+def test_the_titles_starting_round_is_the_first_round_that_actually_exists():
+    """标题里**第一个**出现的轮次号,必须真的是 git 里最早的那个轮次
+
+    r110 实测:`ROUND_INDEX.md` 标题写「# 轮次索引(r53 起)」,而
+    `git log --format=%s` 里带 `rNN:` 前缀的提交是 **r70 起** —— r53–r69
+    **根本不存在**这种形式的提交。标题是照着「devloop 从 r53 开始」想的,
+    不是照着 git 里实际有什么查的。
+
+    下面那条 `test_the_index_does_not_claim_to_cover_rounds_that_do_not_exist`
+    查的是**行**,查不到**标题**:标题里那个 r53 不是一行,所以它压根不在那条
+    的检查范围里。这和 r109 查出的「解析失败的行对所有判据隐形」是同一族 ——
+    **每条判据都有一个「不在它遍历范围内」的死角**。
+
+    ## 判据为什么盯「第一个」而不是「所有」
+
+    现在的标题是「r70 起,**不是 r53** —— 标题原来写错了」,r53 仍然出现在
+    标题里(作为被更正的错误)。所以规则是「**第一个**出现的那个才是它声称的
+    起始轮次」,不是「标题里不许出现别的轮次」。后者会逼着人把更正也删掉 ——
+    那是 r108 明确反对的:记录为什么这么改,和改完之后是什么,都要留着。
+
+    `backlog.md` 的文件头也一起查:两个索引对「最早一轮」的说法不能分叉。
+    """
+    commits = _round_commits()
+    assert commits, "git 里一条 `rNN:` 开头的提交都找不到 —— 范围不对"
+
+    title = INDEX.read_text(encoding="utf-8").splitlines()[0]
+    m = re.search(r"r(\d+)", title)
+    assert m, f"标题里没有轮次号,查不到它声称的起始轮次:{title!r}"
+    claimed = int(m.group(1))
+    assert claimed == min(commits), (
+        f"标题声称从 r{claimed} 起,而 git 里最早的 `rNN:` 提交是 r{min(commits)}"
+        f"({sorted(commits)[:4]}…)\n"
+        f"  标题: {title}\n"
+        f"  查证: git log --format=%s —— 两秒钟的事,别靠印象写轮次号"
+    )
+
+    # backlog.md 的文件头对「最早一轮」的说法不能和索引分叉
+    text = (REPO / "devloop" / "backlog.md").read_text(encoding="utf-8")
+    a = "<!-- devloop:" + "where-records-live -->"
+    b = "<!-- /devloop:" + "where-records-live -->"
+    assert text.count(a) == 1 and text.count(b) == 1, (
+        "backlog.md 的「记录在哪」标记块缺失或重复 —— "
+        "见 tests/test_devloop_queue_invariant.py 里那条 verify")
+    blk = text.split(a)[1].split(b)[0]
+    hm = re.search(r"r(\d+)", blk)
+    assert hm, f"backlog.md 文件头里没有轮次号:{blk[:80]!r}"
+    assert int(hm.group(1)) == min(commits), (
+        f"backlog.md 文件头说最早是 r{hm.group(1)},git 里是 r{min(commits)},"
+        f"而 ROUND_INDEX.md 标题说的是 r{claimed} —— 三个说法必须一致")
