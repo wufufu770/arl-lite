@@ -102,33 +102,67 @@ async def test_9_sources_integration():
 # =============================================================
 
 async def test_portscan_integration():
-    print("\n[Test 2] portscan 集成(nmap 优先 / Python fallback)")
-    results, err, etype = await scan("example.com", ports="80,443,22,21,8080", prefer="auto")
-    assert etype is None, f"unexpected err: {err} ({etype})"
-    assert isinstance(results, list)
-    # 至少 example.com:80 和 :443 应该 open
-    ports_found = {r["port"] for r in results}
-    assert 80 in ports_found or 443 in ports_found, \
-        f"example.com 80/443 should be open, got {ports_found}"
-    ok(f"portscan found {len(results)} ports, {ports_found}")
+    # r104 重写:原来这里打的是**公网** example.com,并断言「80 或 443 必须开着」。
+    # 那不是集成测试,那是**把公网当 fixture** —— 红了没人分得清是代码坏了
+    # 还是网络抖了。r103 收尾时 `test_baseline` 就是被它弄红的,而四组对照
+    # (单跑 5 次 / a-p 1093 条 / 全量 1387 条 / 收集阶段钩子里)证明波动来自
+    # 外网,和被测代码无关。**一个会随机红的门禁等于没有门禁**:基线是 0 失败,
+    # 这种测试红一次就得有人去提基线,而 `--update-baseline` 那个后门正是在
+    # 这种时候最容易被用上。所以先把 fixture 换成本机的。
+    print("\n[Test 2] portscan 集成(本机 listener 造 open/closed,不依赖外网)")
+    import socket as _s
 
-    # 验证字段
-    for r in results:
-        assert "host" in r
-        assert "port" in r
-        assert r["state"] == "open"
-        assert r["service"] in ("http", "https", "ssh", "ftp", "http-proxy", "unknown")
-    ok("portscan 字段齐全 (host/port/state/service)")
+    srv = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(8)
+    open_port = srv.getsockname()[1]          # 开着:connect 会成功
 
-    # 端口解析
-    assert parse_ports("80,443") == [80, 443]
-    assert parse_ports("1-3") == [1, 2, 3]
-    assert parse_ports("80,443,8000-8002") == [80, 443, 8000, 8001, 8002]
-    ok("parse_ports 解析 '80,443' / '1-3' / '80,443,8000-8002' 正确")
+    probe = _s.socket(_s.AF_INET, _s.SOCK_STREAM)
+    probe.bind(("127.0.0.1", 0))
+    closed_port = probe.getsockname()[1]      # 确定关闭:bind 后立刻 close
+    probe.close()
 
-    # nmap 检测
-    nmap_available = check_nmap()
-    ok(f"check_nmap: {nmap_available}")
+    try:
+        results, err, etype = await scan(
+            "127.0.0.1", ports=f"{open_port},{closed_port}",
+            prefer="python", timeout_per_port=1.0,
+        )
+        # 关键断言(r104 的核心):**有一个端口没判定出来,就不许报成功**。
+        # 改前这里只有 `assert etype is None`,而改前 etype 恒为 None ——
+        # 哪怕 5 个端口一个都没探到,它照样「成功」。
+        assert etype is not None, (
+            f"扫了 2 个端口只认出 {sorted(r['port'] for r in results)} 个,"
+            f"etype 却还是 None —— 那是 r104 之前那个静默"
+        )
+        assert err and "未判定" in err, (
+            f"没判定出来的端口必须说出来,不能只给一个类型名:{err!r}"
+        )
+        ports_found = {r["port"] for r in results}
+        assert ports_found == {open_port}, (
+            f"只该认出本机那个 listener,实际 {ports_found}"
+            f"(closed={closed_port} 不该在里面)"
+        )
+        ok(f"portscan: open={ports_found},未判定已如实上报({err})")
+
+        # 验证字段
+        for r in results:
+            assert "host" in r
+            assert "port" in r
+            assert r["state"] == "open"
+            assert r["service"] in ("http", "https", "ssh", "ftp", "http-proxy", "unknown")
+        ok("portscan 字段齐全 (host/port/state/service)")
+
+        # 端口解析
+        assert parse_ports("80,443") == [80, 443]
+        assert parse_ports("1-3") == [1, 2, 3]
+        assert parse_ports("80,443,8000-8002") == [80, 443, 8000, 8001, 8002]
+        ok("parse_ports 解析 '80,443' / '1-3' / '80,443,8000-8002' 正确")
+
+        # nmap 检测
+        nmap_available = check_nmap()
+        ok(f"check_nmap: {nmap_available}")
+    finally:
+        srv.close()
 
 
 # =============================================================
