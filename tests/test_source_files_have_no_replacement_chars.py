@@ -48,6 +48,27 @@ r97 收尾时顺手扫了全仓,发现:
 修法是所有样本改成 `chr(0xFFFD)` 拼出来,于是本文件自己一个 U+FFFD
 都没有。**一条扫「有没有乱码」的守卫,自己必须干净** ——
 不然它每次跑都在报自己,而人只会觉得「这守卫一直吵,先不管它」。
+
+## r100:扫描范围从 `.py` 扩到文档 —— 文档才是人读的东西
+
+r98 只扫 `.py`。但那次实测里 `devloop/backlog.md` 还剩 4 个 U+FFFD
+(「别的□作区的变更」/「落在一□窗口里」,□ 指的就是 U+FFFD 本身),
+`devloop/queue.json` 2 个,
+而**它们一行都没被 r98 的守卫算进去**。
+
+为什么文档更该管:
+
+- 注释里的坏字,读代码的人才看到;
+- `docs/`、`devloop/*.md` 里的坏字,**每一个读项目的人都会看到**,
+  而且那往往正是「这件事当初为什么这么改」的唯一记录 ——
+  坏掉一个字,那段解释就少一个字。
+
+实测到的两处都在解释一段历史决策(`monitor changes` 的资产过滤、
+变更风暴截断),也就是说**它们坏掉的正是知识本身**。
+
+所以扫描范围扩到 `.md / .json / .toml / .txt`,与 `.py` 一视同仁。
+注意 `devloop/queue.json` 是 gitignore 的机具状态 —— 但它**在磁盘上就是
+坏的**,而写盘链路跟它是不是入库没关系,所以照样扫、照样修。
 """
 from __future__ import annotations
 
@@ -59,6 +80,11 @@ REPLACEMENT = chr(0xFFFD)
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 SKIP_PARTS = {".git", "__pycache__", ".pytest_cache", "node_modules"}
+
+# r100:扫描范围从 `.py` 扩到文档。只扫代码的话,坏在 `docs/`、
+# `devloop/*.md`、`*.json` 里的字没人管 —— 而那恰恰是**人读**的那些。
+# 扩展名集中在这里一处,别在两个函数里各写一遍(决策 #9)。
+SCANNED_SUFFIXES = (".py", ".md", ".json", ".toml", ".txt", ".yml", ".yaml")
 
 
 def _find_replacement_chars(text: str) -> list[tuple[int, int]]:
@@ -79,9 +105,15 @@ def _find_replacement_chars(text: str) -> list[tuple[int, int]]:
     return hits
 
 
-def _python_sources(root: pathlib.Path) -> list[pathlib.Path]:
-    return sorted(p for p in root.rglob("*.py")
-                  if not SKIP_PARTS & set(p.parts))
+def _text_sources(root: pathlib.Path) -> list[pathlib.Path]:
+    """root 下所有该扫的文本文件(代码 **和** 文档)
+
+    r100 从 `_python_sources`(只扫 `*.py`)改成这个。名字一起改了 ——
+    留着旧名会让下一个人以为它只管 Python。
+    """
+    return sorted(p for p in root.rglob("*")
+                  if p.suffix in SCANNED_SUFFIXES
+                  and not SKIP_PARTS & set(p.parts))
 
 
 def test_the_scanner_reports_what_it_was_fed():
@@ -146,13 +178,13 @@ def test_the_scanner_handles_a_replacement_char_at_every_position():
 
 
 def test_no_source_file_carries_a_replacement_char():
-    """主判据:仓库里任何 `.py` 都不许有 U+FFFD
+    """主判据:仓库里任何文本文件(代码**和**文档)都不许有 U+FFFD
 
     报错里带上 `文件:行:列`,是因为下一次出现时那正是要改的位置;
     只报「有 N 个」等于让人自己去找 —— 而这件事上一轮就没人做。
     """
     offenders = []
-    for path in _python_sources(REPO):
+    for path in _text_sources(REPO):
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError as e:
@@ -163,16 +195,38 @@ def test_no_source_file_carries_a_replacement_char():
             offenders.append(f"{path.relative_to(REPO)}:{lineno}:{col}")
 
     assert not offenders, (
-        "源码里出现 U+FFFD —— 说明有汉字在**写盘那一刻**被写坏了:\n  "
+        "文本文件里出现 U+FFFD —— 说明有汉字在**写盘那一刻**被写坏了:\n  "
         + "\n  ".join(offenders)
         + "\n每个 U+FFFD 都是一段被毁的 UTF-8。修的时候按上下文重建"
         "(原文多半已不可找回:损坏往往和内容首次入库是同一次写入)。")
 
     # 正控制:扫描范围不能是空的。扫不到文件的守卫等于没写(r91 栽过)。
-    scanned = _python_sources(REPO)
+    scanned = _text_sources(REPO)
     assert len(scanned) >= 90, (
-        f"只扫到 {len(scanned)} 个 .py 文件,扫描范围不对 —— "
+        f"只扫到 {len(scanned)} 个文件,扫描范围不对 —— "
         f"这条判据在空集上永远是绿的")
+
+
+def test_documents_are_actually_in_scope():
+    """**r100 的主判据**:文档必须真的被扫到,不只是代码
+
+    这条是 r100 的全部意义。r98 的守卫只扫 `.py`,于是
+    `devloop/backlog.md` 里的 4 个坏字、`queue.json` 里的 2 个
+    **一行都没被算进去** —— 而那两处坏掉的正是「当初为什么这么改」
+    的唯一记录,是这个项目里最该被读到的文字。
+
+    所以这里不只问「扫到了没有」,而是**按后缀分别点名**:
+    少加一个后缀,少扫一类文件,而那种退化是静默的。
+    """
+    suffixes = {p.suffix for p in _text_sources(REPO)}
+    for required in (".py", ".md", ".json", ".toml"):
+        assert required in suffixes, (
+            f"{required} 没被扫到(实际扫到:{sorted(suffixes)}) —— "
+            f"文档里的坏字没人管,那正是 r100 要治的")
+
+    # 反向:二进制/无关后缀不该被扫进来(扫 `.so`/`.db` 只会拖慢并误报)
+    assert not (suffixes & {".so", ".db", ".png", ".gz"}), (
+        f"扫进了不该扫的后缀:{sorted(suffixes)}")
 
 
 def test_the_guard_would_actually_fail_on_a_corrupted_file(tmp_path):
@@ -189,7 +243,7 @@ def test_the_guard_would_actually_fail_on_a_corrupted_file(tmp_path):
         f"# 有个坏字{REPLACEMENT}\n", encoding="utf-8")
 
     found = []
-    for path in _python_sources(tmp_path):
+    for path in _text_sources(tmp_path):
         for lineno, _col in _find_replacement_chars(
                 path.read_text(encoding="utf-8")):
             found.append(f"{path.name}:{lineno}")

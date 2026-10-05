@@ -99,11 +99,28 @@ A_LOOP_NONE = ("    hits = []\n"
                "            start = col + 1\n"
                "    return []  # 变异 M1:恒报「干净」\n")
 
-A_SOURCES = ("def _python_sources(root: pathlib.Path) -> list[pathlib.Path]:\n"
-             "    return sorted(p for p in root.rglob(\"*.py\")\n"
-             "                  if not SKIP_PARTS & set(p.parts))\n")
-A_SOURCES_NONE = ("def _python_sources(root: pathlib.Path) -> list[pathlib.Path]:\n"
+# r100 把收集器从 `_python_sources`(只扫 `*.py`)改成 `_text_sources`
+# (按 SCANNED_SUFFIXES 扫代码**和**文档),锚点随之重写。
+# **变异锚点绑死在源码原文上** —— 改源码就得改锚点,这不是额外负担,
+# 锚点本来就是源码的一部分(r99 刚因为「顺手删了个行尾注释」栽过一次,
+# 被门禁的 test_mutcheck_claims_match_their_names 逮到)。
+A_SOURCES = ('def _text_sources(root: pathlib.Path) -> list[pathlib.Path]:\n'
+             '    """root 下所有该扫的文本文件(代码 **和** 文档)\n'
+             "\n"
+             "    r100 从 `_python_sources`(只扫 `*.py`)改成这个。名字一起改了 ——\n"
+             "    留着旧名会让下一个人以为它只管 Python。\n"
+             '    """\n'
+             '    return sorted(p for p in root.rglob("*")\n'
+             "                  if p.suffix in SCANNED_SUFFIXES\n"
+             "                  and not SKIP_PARTS & set(p.parts))\n")
+A_SOURCES_NONE = ("def _text_sources(root: pathlib.Path) -> list[pathlib.Path]:\n"
                   "    return []  # 变异 M3:恒扫不到文件\n")
+
+# ── r100 新增:文档必须真的在扫描范围内 ──
+A_SUFFIXES = ('SCANNED_SUFFIXES = (".py", ".md", ".json", ".toml", ".txt",'
+              ' ".yml", ".yaml")\n')
+A_SUFFIXES_M = ('SCANNED_SUFFIXES = (".py", ".json", ".toml", ".txt",'
+                ' ".yml", ".yaml")  # 变异 M6:文档被踢出扫描范围\n')
 
 A_SKIP = 'SKIP_PARTS = {".git", "__pycache__", ".pytest_cache", "node_modules"}\n'
 A_SKIP_M = ('SKIP_PARTS = {".git", "__pycache__", ".pytest_cache", "node_modules",\n'
@@ -132,7 +149,13 @@ CLAIMS = {
     ),
     "M3-扫不到文件": (
         ["    return []  # 变异 M3:恒扫不到文件"],
-        ["    return sorted(p for p in root.rglob(\"*.py\")\n"],
+        ["    return sorted(p for p in root.rglob(\"*\")\n"],
+    ),
+    "M6-文档被踢出扫描范围": (
+        ['SCANNED_SUFFIXES = (".py", ".json", ".toml", ".txt", ".yml",'
+         ' ".yaml")  # 变异 M6:文档被踢出扫描范围'],
+        ['SCANNED_SUFFIXES = (".py", ".md", ".json", ".toml", ".txt",'
+         ' ".yml", ".yaml")'],
     ),
     "M4-码位指错": (
         ["REPLACEMENT = chr(0xFFFE)  # 变异 M4:错码位"],
@@ -154,6 +177,8 @@ MUTANTS = [
     ("M3-扫不到文件", lambda p: _apply(p, A_SOURCES, A_SOURCES_NONE), False, (CRIT,)),
     ("M4-码位指错", lambda p: _apply(p, A_CODEPOINT, A_CODEPOINT_M), False, (CRIT,)),
     ("M5-把整个包跳掉", lambda p: _apply(p, A_SKIP, A_SKIP_M), False, (CRIT,)),
+    ("M6-文档被踢出扫描范围", lambda p: _apply(p, A_SUFFIXES, A_SUFFIXES_M),
+     False, (CRIT,)),
 ]
 
 COVERAGE_MUTANTS = [
