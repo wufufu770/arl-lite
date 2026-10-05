@@ -76,11 +76,6 @@ def clear_screen() -> None:
     sys.stdout.flush()
 
 
-def move_to(row: int, col: int) -> None:
-    sys.stdout.write(f"\033[{row};{col}H")
-    sys.stdout.flush()
-
-
 def _term_width() -> int:
     """终端宽度(取不到时按 100 列)"""
     try:
@@ -229,8 +224,17 @@ def read_int(prompt: str, default: int | None = None,
 # =========================
 
 class Screen:
-    """一个 TUI 屏幕"""
+    """一个 TUI 屏幕基类:`name` + `items`,外加一份共用的按键循环。
+
+    r101:`MainScreen` 原来**没有**继承它,而是把 `loop` 整段手抄了一份
+    (那份代码上面还写着「与 Screen.loop 同款」)。实测两份已经漂了一点:
+    `MainScreen.loop` 把 `digits` 抽成了局部变量,`Screen.loop` 是内联的。
+    现在改成继承,只有一份实现 —— 决策 #9「两处手抄迟早漂」的第一个
+    真实实例,漂移已经发生了,只是这次漂的是排版不是语义。
+    """
     name: str = "Screen"
+    # 类级可变默认值:调用方**必须**在实例上赋 `self.items`,否则
+    # 所有 Screen 实例共用同一份列表。`MainScreen.__init__` 就是这么做的。
     items: list[tuple[str, Callable]] = []  # (label, handler)
 
     def render(self) -> None:
@@ -252,7 +256,8 @@ class Screen:
                 return
             if ch.isdigit():
                 rest = input()  # 该行剩余部分(等回车)
-                idx = int(ch + rest.strip()) - 1 if (ch + rest.strip()).isdigit() else int(ch) - 1
+                digits = ch + rest.strip()
+                idx = int(digits) - 1 if digits.isdigit() else int(ch) - 1
                 if 0 <= idx < len(self.items):
                     try:
                         self.items[idx][1]()
@@ -266,9 +271,8 @@ class Screen:
 # 主屏幕
 # =========================
 
-class MainScreen:
+class MainScreen(Screen):
     name = "arl-lite 主菜单"
-    items = []
 
     def __init__(self, storage):
         self.storage = storage
@@ -300,24 +304,10 @@ class MainScreen:
         print(colorize("  [q]   退出 TUI", "gray"))
         print()
 
-    def loop(self) -> None:
-        self.render()
-        while True:
-            # 序号+回车(与 Screen.loop 同款,保证两位数菜单项可达)
-            ch = read_key()
-            if ch in ("q", "Q", "\x03", "\x1b"):
-                return
-            if ch.isdigit():
-                rest = input()
-                digits = ch + rest.strip()
-                idx = int(digits) - 1 if digits.isdigit() else int(ch) - 1
-                if 0 <= idx < len(self.items):
-                    try:
-                        self.items[idx][1]()
-                    except Exception as e:
-                        error(f"操作失败: {type(e).__name__}: {e}")
-                        read_line("按回车继续...")
-                    self.render()
+    # `loop` 不在这里了 —— r101 之前它是被手抄了一份,现在继承 `Screen.loop`
+    # (那份抄件上面的注释还写着「与 Screen.loop 同款」,自证是抄的)。
+    # 两份已经漂过一次:`MainScreen.loop` 把 `digits` 抽成了局部变量,
+    # `Screen.loop` 是内联的。现在只有一份实现。
 
     # =========================
     # 操作实现
