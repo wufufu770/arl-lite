@@ -74,3 +74,5 @@ git log -1 --format=%B <hash>            # 某一轮的完整过程
 | r106 | `7fb5ff5` | r103 写下「记录只在不入库的队列里」—— 方向反了,记录在 commit message 里 | r103 收尾时我只查了 backlog.md 和 queue.json 就下了结论: |
 | r107 | `17a124d` | r107: 补上轮次索引 —— 记录本来就在 commit message 里,丢的只是索引 | r103 收尾时我在 backlog.md 里写: |
 | r108 | `2cbefcb` | r108: 协议文档的门禁总表和实现脱节 67 轮 —— 7 条里 5 条的命令是虚构的 | 把 `docs/devloop-protocol.md` 的 5.1「七道门禁总表」和 |
+| r109 | `40a0a61` | r109: 完成标记的判定两处各写一份而且已经漂了 —— 判据看不见实现的真实行为 | 播种   arl_lite/devloop/queue.py:1153            detail.startswith("✅") |
+| r110 | `39c5815` | r110: 待办条目被劈成两行,下半截 974 字符对所有判据隐形 —— 而且它那条 verify 要求的正是它自己拒绝的做法 | r106 写 `backlog-index-stops-at-r52` 这条时把一行写成了两行:上半截 L88 是 |
