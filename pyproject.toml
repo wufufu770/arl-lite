@@ -59,6 +59,24 @@ include = ["arl_lite*"]
 arl_lite = ["db/*.sql", "fingerprints/*.json"]
 
 [tool.pytest.ini_options]
+# r105:注册下面两个 mark。起因是 `tests/test_bench_wont_clobber_baseline.py:172`
+# 用了 `@pytest.mark.slow` 却从没注册过,于是**每一次全量跑**都带一条
+#     PytestUnknownMarkWarning: Unknown pytest.mark.slow
+# **这和上面记的 asyncio_mode 是同一个病**:一条每次都出现的告警等于没有
+# 告警 —— 人会脱敏,下一条真告警跟着被忽略。而这一次连「为什么留着它」
+# 都没人记得,因为它不在任何一条判据里,只是每次 summary 里多一行。
+#
+# `network` 是 r105 新加的:`tests/test_phase2.py` 里有两条测试真的打公网
+# API(9 个数据源 / 端到端链路),它们**红了先怀疑网络**。打上标签是为了
+# 让人能一条命令把它们摘出来单独跑:
+#     pytest tests/ -m "not network"
+# 注意:**门禁不按这个标签跳过它们** —— 跳过等于不验,那正是 r104 花一整轮
+# 改掉 portscan 那条测试的原因。标签只用来「让 flaky 的来源可查询」。
+markers = [
+    "slow: 慢测试(基准测试一类),不查功能对错",
+    "network: 需要外网才能跑 —— 红了先怀疑网络,别急着改代码",
+]
+
 # 这里**曾经**配着 `asyncio_mode = "auto"`,r95 删掉了。
 #
 # 那一行是给 pytest-asyncio 用的,而 pytest-asyncio 在本机装不上(PEP 668)。

@@ -14,6 +14,8 @@ import asyncio
 import sys
 import tempfile
 import time
+
+import pytest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -299,7 +301,16 @@ def test_tui_render():
 # Test 8: 端到端 — 子域 → 端口 → 站点 → 指纹 → 关联分析
 # =============================================================
 
+@pytest.mark.network
 async def test_e2e_full():
+    # r105:这条 `runner.run(target='example.com', modules=['crtsh','rapiddns',
+    # 'hackertarget','portscan','httpx_probe',...])` **真的打公网 API**。
+    # r105 试过写一条「全仓扫打公网的测试」的判据,结果自己出了 3 处误报
+    # (test_base_module_3state / test_3state_discipline 调的是测试自造的
+    # Module,test_crtsh_module_mock 把网络 mock 掉了)——
+    # **判不准的检测器比没有更危险**,它会让人去「修」本来没问题的测试。
+    # 所以改成点名制:已知真打公网的逐条点名,而不是靠启发式扫全仓。
+    # 这条是 r105 扫出来唯一真漏网的。
     print("\n[Test 8] 端到端(run → correlate → risk)")
     tmp = tempfile.mkdtemp()
     s = Storage("e2e-phase3", tmp)

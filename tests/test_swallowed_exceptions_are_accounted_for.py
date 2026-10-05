@@ -170,6 +170,16 @@ ACCOUNTED: dict[Site, str] = {
      "(OSError, SyntaxError)", "continue", 1):
         "本文件自己的一处:源码读不到就跳过这个文件,不崩。登记表因此会把自己"
         "也算进去 —— 诚实的代价,总比开个后门强",
+    ("test_no_unlabeled_public_network_tests.py", "_tests_using_mark",
+     "SyntaxError", "continue", 1):
+        "r105 加的:扫 tests/ 找 @pytest.mark.X 时跳过语法坏掉的文件,不崩。"
+        "**代价是明摆着的**:那个文件里的 mark 扫不到,理论上会漏报「用了没注册」。"
+        "但语法坏掉的测试文件 pytest 自己就会红在收集阶段,门禁照样拦得住 —— "
+        "所以这里的漏报不会真的放过什么,登记在此以示知情",
+    ("test_phase2.py", "test_httpx_probe_integration", "OSError", "continue", 1):
+        "r105 加的:本机 HTTP fixture 必须起在 _build_targets 的 web 端口白名单里"
+        "(80/443/8080/…),所以逐个尝试 bind,这个端口被占就试下一个。"
+        "白名单只有十来个端口,全被占时 pytest.skip 明确报出来,不是静默放过",
     ("test_workspace_missing_gives_a_way_out.py", "test_the_way_out_actually_works",
      "subprocess.TimeoutExpired", "pass", 1):
         "出路命令里可能有常驻的,300s 是**从未触发过的安全网**,不是机制 —— "
@@ -296,7 +306,14 @@ def test_a_thin_reason_is_rejected():
 def test_the_detector_finds_every_real_site():
     """检测器不许空转 —— 拿**现场**文件当正控制组,一处都不能漏"""
     found = swallowed_sites()
-    assert len(found) == 17, f"现场站点数不对:{len(found)}(逐条对一遍登记项)"
+    # r105:17 -> 19(r105 在 test_no_unlabeled_public_network_tests.py 和
+    # test_phase2.py 各加了一处 `except: continue`)。
+    #
+    # **刻意不改成 len(ACCOUNTED)** —— 那会让本条和
+    # test_the_derived_sites_are_pinned 变成同一个断言:登记表和现场
+    # 一起少一条时两条判据一起绿,正控制组就白设了。这里要的是一个
+    # **和登记表无关**的独立数字,有人偷偷删登记项时它会红。
+    assert len(found) == 19, f"现场站点数不对:{len(found)}(逐条对一遍登记项)"
     by_file: dict[str, int] = {}
     for f, *_rest in found:
         by_file[f] = by_file.get(f, 0) + 1
