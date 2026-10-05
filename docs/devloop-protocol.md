@@ -127,7 +127,7 @@ confidence = base_prior × signal_factor × cross_evidence × temporal_consisten
 | 阶段 | 进入条件 | 做什么 | 退出条件 | 失败时怎么退 |
 |---|---|---|---|---|
 | **BUILD** | `backlog.md` 头部有未完成任务 | 执行一项任务,改代码,改文档,跑本地 smoke | 任务在 `backlog.md` 标为 done;或被 RETREAT 触发 | 进入 RETREAT(§6) |
-| **TEST** | BUILD 退出后 | 跑 `make test` 全套 9 套（phase1-7 + edge + concurrency）;对照 `state.json.baseline` 比对失败数 | 失败数 ≤ baseline 失败数 | 进入 RETREAT |
+| **TEST** | BUILD 退出后 | r108 实测:跑的是 `pytest tests/ -q --tb=no -rf`,基线在 `devloop/baselines.json`(r19 起从 state.json 拆出去),且**按测试身份**比对而不是只比失败总数 | 失败**身份**集合 ⊆ 基线 `allowed_failures` | 进入 RETREAT |
 | **IMPROVE** | TEST 通过 | 提取本轮发现的通用模式重写（如重复代码、参数传递冗长） | 重写后重跑 TEST 仍通过 | 进入 RETREAT |
 | **PLAN** | IMPROVE 完成或未触发 | 从 backlog 取下一项,或调 `seed_if_empty()`(§7) | 新任务加入 backlog 头部 | 退到 BUILD |
 
@@ -146,15 +146,27 @@ confidence = base_prior × signal_factor × cross_evidence × temporal_consisten
 
 ### 5.1 七道门禁总表
 
-| ID | 门禁 | 防什么退化 | 阻断/非阻断 | 触发命令 |
+**r108 实测校准。** 本表此前与实现脱节:G3 引用的「`tools/check_imports.py`」
+**连 `tools/` 目录都不存在**;G7 引用的「`state.json.last_doc_audit_round`」
+**在 `state.json` 里没有这个键**;G2 写的是「`state.json.baseline.fail_count`」
+(实际在 `devloop/baselines.json`,且 r27 起**按测试身份**判定而不是只比总数);
+G4 写死「≤ 18,000 行」(实际是 baseline + 300 容差),G5 只提 `advice`
+(实际四个字段都要)。**一份说谎的协议比没有协议更糟** —— 它让人以为
+某些检查存在,于是不去补。
+
+**判据**:`tests/test_protocol_doc_gate_table_matches_code.py` 逐条核对
+本表的门禁名与 `gates.py` 里的 `name` 属性一一对应,并检查全文引用的
+`.py` 路径和 `state.json.<键>` **都真实存在**。
+
+| ID | 门禁 | 防什么退化 | 阻断 | 实际怎么判（r108 实测） |
 |---|---|---|---|---|
-| **G1** | `no_thirdparty_import` | L1 铁律被破坏 | **blocking** | `grep -rE "^import (typer|rich|httpx|pyyaml|apscheduler|openpyxl|litellm|textual)" arl_lite/` 应返回空 |
-| **G2** | `test_baseline` | 回归（新增失败） | **blocking** | `make test` 失败数 ≤ `state.json.baseline.fail_count` |
-| **G3** | `no_import_cycle` | 循环依赖导致的 import 地狱 | **blocking** | 自写 `tools/check_imports.py` 跑 `import` 图 DFS |
-| **G4** | `loc_budget` | 无节制膨胀 | **blocking** | `find arl_lite -name "*.py" -exec cat {} + \| wc -l` ≤ 18,000 行 |
-| **G5** | `rules_have_advice` | 规则失去可操作性 | **blocking** | 每条 YAML 规则必须有 `advice:` 非空字段 |
-| **G6** | `prompt_injection_guard` | 安全防线回退 | **blocking** | `ai/prompts.py` 必须调用 `_sanitize` 处理 title/banner/whois/CN |
-| **G7** | `doc_freshness` | 文档过期 | **非阻断** | `state.json.last_doc_audit_round` 与当前轮差 ≤ 5 |
+| **G1** | `no_thirdparty_import` | L1 铁律被破坏 | **blocking** | `NoThirdpartyImportGate`:AST 扫 `arl_lite/` 全部 `.py`(排除 `tests/`),**不是 grep** |
+| **G2** | `test_baseline` | 回归(新增失败) | **blocking** | 跑 `pytest tests/ -q --tb=no -rf`;**按测试身份**比对 `devloop/baselines.json` 的 `allowed_failures`(r27 起不再只比失败总数);600s 硬上限 |
+| **G3** | `no_import_cycle` | 循环依赖导致的 import 地狱 | **blocking** | `NoImportCycleGate`:解析 `from .x import` 建图做 DFS。**没有「`tools/check_imports.py`」** —— 本表此前写的是它 |
+| **G4** | `loc_budget` | 无节制膨胀 | **blocking** | `devloop/baselines.json` 的 `total_loc` + 300 容差(现值 16567);`arl_lite/devloop/` 另有独立红线,按**代码行**算(扣 docstring/注释/空行) |
+| **G5** | `rules_have_advice` | 规则失去可操作性 | **blocking** | 37 条规则**全部加载成功**且 `name` / `risk` / `confidence` / `advice` **四个字段都非空**(不是只查 advice) |
+| **G6** | `prompt_injection_guard` | 安全防线回退 | **blocking** | `arl_lite/ai/prompts.py` 须定义 `_sanitize` 且 `to_json` 调用它,外加 15 条注入载荷逐条拦下 |
+| **G7** | `doc_freshness` | 文档吹嘘已下架依赖 | **非阻断** | 只扫 `docs/PROJECT_PLAN.md`,查 `typer`/`textual`/`litellm`/`pyyaml` 四个;有 `<!-- devloop:ignore-doc-stale -->` 豁免。**与 `state.json` 无关** |
 
 ### 5.2 blocking vs 非阻断的区分理由
 
@@ -307,7 +319,7 @@ arl-lite devloop promotions          # 看提升历史
 | 退路级别 | 触发条件 | 退到 |
 |---|---|---|
 | **R0 软退** | 单次 G1-G6 失败 | REVERT 本轮 git commit；`backlog.md` 该任务未标 done |
-| **R1 硬退** | 连续 2 轮同一 G 失败 | REVERT 到 `state.json.last_all_green_round` 的 git ref；任务保留 |
+| **R1 硬退** | 连续 2 轮同一 G 失败 | r108 实测:`protocol.py::phase_retreat` **刻意不做 git reset**(会丢工作且难恢复),退路是「停下来把状态摊开给人看」,状态留在 `devloop/state.json`,由操作者决定 |
 | **R2 冻结** | 连续 4 轮同一 G 失败 | 冻结该 G（不要求生产代码满足），任务标 `[BLOCKED]`，等人工 |
 | **R3 暂停** | `RETREAT_COUNT` 累加到 5（自项目起累计） | 暂停协议，人工 review |
 
@@ -2738,8 +2750,8 @@ def save_state(state: dict, path: str) -> None:
 |---|---|---|
 | 为**让门禁变绿**而改门禁本身 | 防线失效 | `git log` 看是否某轮专门改门禁代码但任务说明无变更 |
 | 往 backlog 塞永远做不完的大任务 | 让 L2、L3 永不触发,L1 也被稀释 | backlog 任务超过 3 轮未推进 |
-| 跳过 TEST 直接进 IMPROVE | 改 A 坏 B 的经典路径 | `state.json.round_history` 看某轮 phase 序列缺 TEST |
-| 修改 baseline 来掩盖回归 | 让 G2 永远绿 | `git diff state.json` 看是否仅 fail_count 变化 |
+| 跳过 TEST 直接进 IMPROVE | 改 A 坏 B 的经典路径 | `state.json.history` 看某轮 phase 序列缺 TEST |
+| 修改 baseline 来掩盖回归 | 让 G2 永远绿 | `git diff devloop/baselines.json` 看是否只动了 `test_baseline` 那一段 |
 | 引入 `from X import Y` 其中 X 在 stdlib 之外 | L1 失守 | G1 |
 | `git reset --hard` 来"快进" | 丢失 REVERT 历史 | `git reflog` 看是否有 reset |
 | 把 `state.json` 加进 `.gitignore` | 协议状态无法跨机器恢复 | 看 `.gitignore` |
