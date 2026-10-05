@@ -74,8 +74,11 @@ import sys
 REPO = pathlib.Path(__file__).resolve().parent.parent
 MUTKIT = REPO / "devloop" / "mutkit.py"
 CRIT = REPO / "tests" / "test_mutcheck_sweep_lock.py"
-ONE = REPO / "devloop" / "mutcheck_r65.py"
-DECOY = REPO / "devloop" / "mutcheck_r66.py"
+# 靶子脚本只是**任意一个**带 `mutkit.sandboxed(main)` 的脚本 —— `_apply` 只要求
+# 锚点在目标里恰好出现一次。原来挑的是 r65/r66,那 33 个 r41–r73 的脚本已经被
+# 删掉了(它们是判据明说「历史运行记录,不改」的未验证资产),所以改指 r75/r76。
+ONE = REPO / "devloop" / "mutcheck_r75.py"
+DECOY = REPO / "devloop" / "mutcheck_r76.py"
 
 TARGET = ["tests/test_mutcheck_sweep_lock.py"]
 

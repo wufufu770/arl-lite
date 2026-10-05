@@ -163,8 +163,16 @@ def test_every_mutcheck_script_takes_the_sweep_lock():
     `arl_lite/ai/commands.py`、`tests/test_cli_advice_commandable.py`……
 
     后果:那 24 个脚本**确实会就地改仓库文件,却因为分类器看不见而被
-    豁免在锁外面** —— 正是本文件要防的那件事。r114 把它们全补上了锁,
-    现在 71 个脚本一个不落。
+    豁免在锁外面** —— 正是本文件要防的那件事。r114 把它们全补上了锁。
+
+    ## 脚本总数从 73 降到 40
+
+    r41–r73 那 33 个脚本后来被删了 —— 它们被
+    `test_mutcheck_scripts_are_self_checking.py` 判为「历史运行记录,不改」
+    而 skip 掉,也就是**从不验证**,却和真在跑的脚本混在一个目录里。
+    删掉之后本文件的下限从 60 降到 40(原来的 71 个是 r114 当时的实测值)。
+    下面的 40 正好等于现有脚本数,所以这条守卫现在是**贴着上限**的:
+    再少一个就红。
 
     ## 为什么豁免整个删掉,而不是把检测面修宽
 
@@ -182,11 +190,12 @@ def test_every_mutcheck_script_takes_the_sweep_lock():
     ## 前置条件也断言掉
 
     如果哪天 glob 路径变了导致遍历到 0 个文件,`assert not bare` 会**绿**。
-    所以先钉住「至少有 60 个脚本」(实测 71)。
+    所以先钉住「至少有 40 个脚本」—— 那正好是删掉 r41–r73 之后剩下的全部,
+    所以这条守卫现在是贴着上限的:任何脚本再被搬走,这里立刻红。
     """
     locked, bare = _classify()
-    assert len(locked) >= 60, (
-        f"只认出 {len(locked)} 个取锁的脚本(实测 71)。"
+    assert len(locked) >= 40, (
+        f"只认出 {len(locked)} 个取锁的脚本(现有共 40 个)。"
         "要么判据的遍历范围变了,要么脚本被搬走了 —— "
         "不管哪种,这条判据现在验不到东西,别信它的绿"
     )
@@ -530,8 +539,10 @@ def test_a_killed_sweep_never_dirties_the_real_repo():
     # 打红,于是「哪些覆盖变异存活」这个结论全错。
     child_env = {k: v for k, v in os.environ.items()
                  if k != "ARL_MUTCHECK_IN_SANDBOX"}
+    # 靶子只是任意一个走沙箱的 mutcheck:看到「在副本里跑变异测试」那行就杀,
+    # 不必等它跑完。原来挑的是 r41,已随 r41–r73 那批未验证脚本删掉,改指 r74。
     proc = subprocess.Popen(
-        [sys.executable, "-B", "devloop/mutcheck_r41.py"], cwd=REPO,
+        [sys.executable, "-B", "devloop/mutcheck_r74.py"], cwd=REPO,
         env=child_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         text=True)
     assert proc.stderr is not None

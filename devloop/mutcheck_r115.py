@@ -71,7 +71,9 @@ import sys
 REPO = pathlib.Path(__file__).resolve().parent.parent
 MUTKIT = REPO / "devloop" / "mutkit.py"
 CRIT = REPO / "tests" / "test_mutcheck_sweep_lock.py"
-ONE = REPO / "devloop" / "mutcheck_r41.py"
+# 同 r114:靶子只是任意一个带 `mutkit.sandboxed(main)` 的脚本。原来是 r41,
+# 已随 r41–r73 那批未验证脚本一起删掉,改指 r77。
+ONE = REPO / "devloop" / "mutcheck_r77.py"
 
 TARGET = ["tests/test_mutcheck_sweep_lock.py"]
 

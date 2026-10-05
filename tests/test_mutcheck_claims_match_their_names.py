@@ -398,9 +398,55 @@ def test_the_mechanism_rejects_a_mutation_that_lies():
 
 
 def test_historical_scripts_are_skipped_not_silently_ignored():
-    """跳过必须是**可见的**:阈值以下的脚本要能被列出来,不能悄悄不算"""
+    """跳过必须是**可见的**,而且只能是少数派
+
+    ## 数量守卫为什么从 `>= 35` 改成比例
+
+    原写法是 `assert len(skipped) >= 35` —— 它守的是「阈值没被写错成
+    一个小数字、于是几乎所有脚本都被跳过」。但它把**当前总数**焊死了:
+    r41–r73 那 33 个脚本被删掉之后,skipped 从 41 掉到 8,这条直接红。
+
+    一个会因为「少了几份资产」而红的守卫,是在惩罚正确操作。所以改成
+    比例:被跳过的最多只能占四分之一。阈值一旦写错(比如写成 74),
+    40 个脚本会整批落进 skipped,`8 * 4 <= 40` 立刻不成立。
+    **删资产不会红,阈值写错会红** —— 这才是它本来要守的东西。
+
+    ## r41–r73 为什么被删
+
+    那 33 个脚本被 `test_mutcheck_scripts_are_self_checking.py` 判为
+    「历史运行记录,不改」而 **skip** 掉。skip 的意思是**从不验证**,
+    不是「验证通过」。它们和 40 个真在跑的脚本混在同一个目录里,
+    看目录分不出哪个是资产 —— 所以删掉,并用下面那条守住不许回流。
+    """
     skipped = _skip_names()
-    assert len(skipped) >= 35, f"只跳过 {len(skipped)} 个历史脚本,阈值可能写错了"
-    assert "mutcheck_r41.py" in skipped, "最早的脚本没被跳过,阈值反了"
+    total = len(scripts())
+    assert skipped, (
+        "一个脚本都没跳过 —— 要么阈值写错成比最老脚本还大,"
+        "要么下面的「最老轮次」那条该红了"
+    )
+    assert len(skipped) * 4 <= total, (
+        f"{len(skipped)}/{total} 个脚本被判成历史记录,超过四分之一 —— "
+        f"CLAIMS_SINCE_ROUND={CLAIMS_SINCE_ROUND} 很可能写错了。"
+        "这条守卫以前写的是绝对数量(>=35),结果在删掉 r41–r73 时"
+        "因为「少了资产」而红 —— 那是在惩罚正确操作"
+    )
     enforced = {s.name for s in _must_enforce()}
     assert not (skipped & enforced), "同一个脚本既被跳过又被强制"
+
+
+def test_no_unverified_historical_script_survives():
+    """r41–r73 已删除:它们是**从不验证**的历史记录,不是验证过的资产
+
+    这一条守住那次删除本身。原来没有这条,所以「删掉」和「从来没删过」
+    在行为上没区别 —— 下一个照着 r60 抄一个 r60_2.py,没人会响。
+
+    它与上面那条互补:那条守「跳过的比例不许过大」,这条守「被删的那批
+    不许回来」。两条都不是恒真 —— 放回任何一个 r41–r73 的脚本,
+    这里立刻报出它的轮次号。
+    """
+    oldest = min(_round_of(s) for s in scripts())
+    assert oldest >= 74, (
+        f"最老的 mutcheck 脚本是 r{oldest},但 r41–r73 已经删掉了 —— "
+        "那批是判据明说「历史运行记录,不改」的未验证脚本。"
+        "要放回来,先说清楚它凭什么算已验证"
+    )
