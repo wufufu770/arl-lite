@@ -163,4 +163,4 @@ if __name__ == "__main__":
     import pathlib as _pl, sys as _sy
     _sy.path.insert(0, str(_pl.Path(__file__).resolve().parent))
     import mutkit
-    raise SystemExit(mutkit.locked(main))
+    raise SystemExit(mutkit.sandboxed(main))

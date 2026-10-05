@@ -104,7 +104,8 @@ else:
 
 
 def _locked_name(tree: ast.AST) -> str | None:
-    """入口那个 `mutkit.locked(<名字>)` 里的 `<名字>`;没有就返回 None
+    """入口那个 `mutkit.sandboxed(<名字>)` 里的 `<名字>`;没有就返回 None
+    返回值是 `"<被调的函数>:<传入的函数名>"`,两段都要看。
 
     ## 为什么用 AST 而不是 `if "mutkit.locked(" in src`
 
@@ -120,12 +121,12 @@ def _locked_name(tree: ast.AST) -> str | None:
     """
     for n in ast.walk(tree):
         if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
-                and n.func.attr == "locked"
+                and n.func.attr in ("locked", "sandboxed")
                 and isinstance(n.func.value, ast.Name)
                 and n.func.value.id == "mutkit"
                 and len(n.args) == 1
                 and isinstance(n.args[0], ast.Name)):
-            return n.args[0].id
+            return f"{n.func.attr}:{n.args[0].id}"
     return None
 
 
@@ -190,13 +191,63 @@ def test_every_mutcheck_script_takes_the_sweep_lock():
         "不管哪种,这条判据现在验不到东西,别信它的绿"
     )
     assert not bare, (
-        "这些变异测试没有持锁:\n  "
+        "这些变异测试没有走沙箱入口:\n  "
         + "\n  ".join(sorted(bare))
-        + "\n  入口应该写成 `raise SystemExit(mutkit.locked(main))`,"
-        "并让脚本目录在 sys.path 上。\n"
-        "  (r113 漏掉的 24 个:分类器只认 write_text/write_bytes,"
-        "看不见 `open(path, \"w\")` 和 `shutil.copy` 那种写法。)"
+        + "\n  入口应该写成 `raise SystemExit(mutkit.sandboxed(main))`,"
+        "并让脚本目录在 sys.path 上。"
     )
+    # r115 起入口一律是 `sandboxed` 而不是 `locked`:锁挡不住进程被杀,
+    # 沙箱才行(`mutkit` 的 docstring 有完整说明)。这里钉住「一律」——
+    # 留一个 `locked` 的口子,就等于留一条会脏仓库的路。
+    not_sandboxed = [f"{f}(用的是 {e.split(':', 1)[0]})" for f, e in locked
+                     if not e.startswith("sandboxed:")]
+    assert not not_sandboxed, (
+        "这些变异测试用的是 `mutkit.locked` 而不是 `mutkit.sandboxed`:\n  "
+        + "\n  ".join(not_sandboxed)
+        + "\n  锁只挡并发,挡不住进程被杀 —— r113 实测一轮结束时仓库停在变异态。"
+    )
+    # 链条要闭合:`sandboxed` 内部确实拿了锁,否则「入口都走沙箱」不等于「都互斥」
+    mk = (DEV / "mutkit.py").read_text(encoding="utf-8")
+    tree = ast.parse(mk)
+    sb = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+          and n.name == "_locked_call"]
+    assert sb, "mutkit 里没有 `_locked_call` —— `sandboxed` 的实现被改了?"
+    assert any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+               and n.func.id == "file_lock"
+               for n in ast.walk(sb[0])), (
+        "`_locked_call` 里没有 `file_lock(...)` —— 沙箱没加锁,"
+        "两个 mutcheck 可以在各自的副本里同时跑,备份互相覆盖的竞态又回来了")
+    # 沙箱的**本体**是「在副本里另起一个进程跑同一个脚本」。
+    # 只靠端到端那条判据盯不住这一环:实测把 `subprocess.run(...)` 换成
+    # `return fn()`(于是就在原地跑),端到端判据**存活**了 —— 因为它
+    # 靠「杀掉进程」来发现,而原地跑时脚本还没来得及改文件就被杀掉了。
+    # **靠时序发现的东西,就会有时准时不准。** 所以这一环用结构检查钉死。
+    assert any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+               and n.func.attr == "run" and isinstance(n.func.value, ast.Name)
+               and n.func.value.id == "subprocess"
+               for n in ast.walk(sb[0])), (
+        "`_locked_call` 里没有 `subprocess.run(...)` —— 沙箱没有在副本里"
+        "另起进程,变异于是又落回真仓库。那正是本文件存在的理由。")
+    # 副本必须带 .git:实测不带的话 7 条判据直接红(查 git log),
+    # 任何跑到它们的变异都会被误报成「被杀」
+    # 首版这里写的是 `'".git"' not in _ignore_patterns(mk)` —— 拿**带引号的
+    # 源码文本**去和 `_ignore_patterns` 返回的**值**比,`.git` 永远不等于
+    # `".git"`,于是这条断言**恒真**,M2 变异存活了。
+    # 一条恒真的断言比没有断言更坏:它让人以为这一环有人守。
+    assert ".git" not in _ignore_patterns(mk), (
+        "`_IGNORE` 里出现了 `.git` —— 副本不带 git 的话,"
+        "test_round_index_stays_current / test_round_commit_audit 共 7 条判据"
+        "在副本里直接红,跑到它们的变异会被误报成「被杀」")
+
+
+def _ignore_patterns(src: str) -> list[str]:
+    """把 `shutil.ignore_patterns(...)` 的实参原样取出来(结构化,不是子串)"""
+    tree = ast.parse(src)
+    for n in ast.walk(tree):
+        if (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "ignore_patterns"):
+            return [a.value for a in n.args if isinstance(a, ast.Constant)]
+    raise AssertionError("mutkit 里没有 `shutil.ignore_patterns(...)`")
 
 
 def test_the_locked_entry_point_exists_and_takes_no_arguments():
@@ -223,7 +274,8 @@ def test_the_locked_entry_point_exists_and_takes_no_arguments():
 
     locked, _ = _classify()
     bad: list[str] = []
-    for fname, fn_name in locked:
+    for fname, entry in locked:
+        fn_name = entry.split(":", 1)[1]
         f = DEV / fname
         try:
             spec = importlib.util.spec_from_file_location(f"probe_{f.stem}", f)
@@ -423,3 +475,95 @@ def test_without_the_lock_the_race_is_real():
             "即 A 的变异内容被 B 的还原写了回去。"
             "留成别的形状说明我对竞态的理解和实际不符,这条判据的说明要跟着改"
         )
+
+
+def test_a_killed_sweep_never_dirties_the_real_repo():
+    """端到端:跑到一半被**杀掉**的变异测试,真仓库一个字节都不动
+
+    这是本文件存在的全部理由。前面几条验的是「机制接上了」,这一条验的是
+    「机制真的挡住了那一幕」。
+
+    ## 它挡的是哪一幕
+
+    r113 实测过一次:一轮结束时 `arl_lite/devloop/queue.py` 的模块 docstring
+    停在了某条变异的内容上,而那个进程自己报的退出码是 0。当时没能归因。
+
+    后来又主动复现出一次:用 `timeout` 打断一个跑到一半的 mutcheck,
+    `finally` 对 SIGTERM/SIGKILL 不生效,仓库就停在变异态。**锁拦不住这个** ——
+    锁管的是「两个进程同时改」,管不了「一个进程被杀了,来不及还原」。
+
+    所以修法不是把还原写得更仔细,而是**根本不改真仓库**:把仓库(含 `.git`)
+    复制一份到临时目录,变异作用在副本上,判据也从副本里跑。
+
+    ## 怎么验「真仓库没被动」
+
+    跑之前先记下 `git diff` 的哈希,跑完再记一次,两次必须一样。
+    用哈希而不是「有没有改动」,是因为跑的时候工作区本来就不干净
+    (这一轮自己的改动还没提交)—— 那样比「干净」比不出来。
+
+    ## 为什么这条判据敢放进门禁
+
+    它确实要起一个真进程、跑 10 秒上下。但它是**唯一**一条直接对着
+    「那一幕」的判据,其余三条都只是间接证据。而且它有明确的完成信号:
+    沙箱建好时会往 stderr 打一行「在副本里跑变异测试」,看到那行就可以杀,
+    不必猜它跑到哪一步了。
+    """
+    import hashlib
+    import os
+    import signal
+    import time
+
+
+    def diff_fingerprint() -> str:
+        r = subprocess.run(["git", "diff"], cwd=REPO,
+                           capture_output=True, text=True)
+        return hashlib.sha256(r.stdout.encode("utf-8")).hexdigest()
+
+    before = diff_fingerprint()
+    # **必须摘掉 `ARL_MUTCHECK_IN_SANDBOX`。** 这条判据本身经常是在一个
+    # 变异测试的**沙箱里**被跑的(每次 mutcheck 都会跑一遍判据文件),
+    # 而沙箱里的子进程带着那个标记,于是它会**跳过建自己的沙箱**、
+    # 直接在原地跑 —— 提示行就不出现了,这条判据于是红在一个和被测行为
+    # 无关的地方。
+    #
+    # 首版没摘,后果是:任何一条覆盖变异(把别的判据拆掉)都会顺带把这条
+    # 打红,于是「哪些覆盖变异存活」这个结论全错。
+    child_env = {k: v for k, v in os.environ.items()
+                 if k != "ARL_MUTCHECK_IN_SANDBOX"}
+    proc = subprocess.Popen(
+        [sys.executable, "-B", "devloop/mutcheck_r41.py"], cwd=REPO,
+        env=child_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        text=True)
+    assert proc.stderr is not None
+    banner = ""
+    deadline = time.monotonic() + 60
+    try:
+        while time.monotonic() < deadline:
+            line = proc.stderr.readline()
+            if not line:
+                break
+            banner += line
+            if "在副本里跑变异测试" in line:
+                break
+    finally:
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(timeout=30)
+
+    assert "在副本里跑变异测试" in banner, (
+        "没看到沙箱的启动提示,说明这个 mutcheck 压根没走沙箱 —— "
+        f"它读到的 stderr 是:{banner[:200]!r}"
+    )
+    after = diff_fingerprint()
+    assert after == before, (
+        "杀掉一个跑到一半的变异测试之后,真仓库的 `git diff` 变了。\n"
+        "  沙箱没起作用,或者有别的路径绕过了它 —— "
+        "这正是 r113 撞到的那一幕,它不留任何痕迹,所以只能靠这条判据盯。\n"
+        f"  改前 {before[:16]} / 改后 {after[:16]}"
+    )
+    # 副本会被删掉;被 SIGKILL 时清理代码不跑,临时目录会留着。
+    # 那是**有意的取舍**:宁可留一个一眼能看出该删哪个的临时目录,
+    # 也不要留一个被改坏的仓库。
+    #
+    # 这里**不**断言「当前不在沙箱里」—— 首版加了那么一条,结果每次在
+    # 变异测试里跑就红:判据本来就应该在沙箱里也能跑(它每次跑 mutcheck
+    # 都会被跑到)。一条在自己的正常使用场景里变红的断言,比没有还坏。

@@ -49,7 +49,7 @@ r113 顺着「变异 harness 本身可不可靠」查下去。普查 70 个 `dev
 
 新增 `devloop/mutkit.py`,复用 `arl_lite/devloop/lock.py` **已有**的
 `file_lock`(不手抄第二份 flock),46 个会写文件的脚本入口统一改成
-`mutkit.locked(main)`。三条判据在 `tests/test_mutcheck_sweep_lock.py`:
+`mutkit.sandboxed(main)`。三条判据在 `tests/test_mutcheck_sweep_lock.py`:
 结构(都取锁)、行为(锁真挡人)、**负控制**(无锁时竞态是真的)。
 
 ## 一条被实测推翻的「更温和的修法」
@@ -112,7 +112,7 @@ _RUN_SUMMARY_RE = re.compile(r"^(?:=+\s*)?(.*\bin [\d.]+s.*)$", re.M)
 _ERROR_IN_SUMMARY_RE = re.compile(r"\d+\s+errors?\b")
 
 # ── M1:摘掉一个脚本的锁 ──
-A1 = "    raise SystemExit(mutkit.locked(main))\n"
+A1 = "    raise SystemExit(mutkit.sandboxed(main))\n"
 M1 = "    raise SystemExit(main())  # 变异 M1:锁被摘掉\n"
 
 # ── M2:让 locked 不再加锁 ──
@@ -171,9 +171,13 @@ C1_STUB = C1_BODY + "\n    pass  # 变异 C1:整条判据没了\n"
 C2_STUB = C2_BODY + "\n    pass  # 变异 C2:整条判据没了\n"
 
 CLAIMS = {
-    "M1-摘掉一个脚本的锁": (["# 变异 M1:锁被摘掉"], ["mutkit.locked(main)"]),
-    "M2-让locked不加锁": (["# 变异 M2:换成空上下文,等于没加锁"],
-                    ["with file_lock(SWEEP_TARGET"]),
+    "M1-摘掉一个脚本的锁": (["# 变异 M1:锁被摘掉"], ["mutkit.sandboxed(main)"]),
+        # must_not 写**整块三行**:`with file_lock(SWEEP_TARGET` 这半行在
+    # mutkit.py 里出现 **2 次**(r115 给 `sandboxed` 也加了一把),
+    # 只写半行会被同名兄弟喂饱 —— 那正是这条判据存在的理由。
+    "M2-让locked不加锁": (["变异 M2:换成空上下文,等于没加锁"],
+                 ["        with file_lock(SWEEP_TARGET, timeout=0.0,\n                       owner=f\"mutcheck pid={os.getpid()}\"):\n            return fn()\n"]),
+
     "M3-让竞态不发生": (["# 变异 M3"], []),
     # r114 起这条是**纯插入**(保留原行,追加一行把目录掐深),
     # 所以 must_not 按约定留空。
@@ -415,4 +419,4 @@ if __name__ == "__main__":
     import pathlib as _pl, sys as _sy
     _sy.path.insert(0, str(_pl.Path(__file__).resolve().parent))
     import mutkit
-    raise SystemExit(mutkit.locked(_run_all))
+    raise SystemExit(mutkit.sandboxed(_run_all))

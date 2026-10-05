@@ -81,7 +81,10 @@ from __future__ import annotations
 
 import os
 import pathlib
+import shutil
+import subprocess
 import sys
+import tempfile
 
 _HERE = pathlib.Path(__file__).resolve().parent
 REPO = _HERE.parent
@@ -127,12 +130,118 @@ def locked(fn):
                        owner=f"mutcheck pid={os.getpid()}"):
             return fn()
     except LockTimeout:
-        print(
-            "mutkit: 已经有另一个变异测试在跑,本次不跑。\n"
-            f"  锁:{SWEEP_TARGET}.lock\n"
-            "  变异测试会就地改仓库文件,两个同时跑会互相覆盖对方的备份,\n"
-            "  结果既可能把仓库留在变异态,也可能把生效的变异误报成存活。\n"
-            "  等前一个跑完再跑这一个。",
-            file=sys.stderr,
-        )
+        # 提示语只写一份:`locked` 与 `sandboxed` 都要用。两处各写一份,
+        # 改了一处忘了另一处,就会给人「有时拒绝有时不拒绝」的错觉
+        # (r28 / r109 修过的同一个病)。
+        _print_busy()
         raise SystemExit(2) from None
+
+
+# ── 沙箱:r115 新增 ──
+#
+# 上面那把锁挡不住**进程被杀**:`finally` 对 SIGKILL 不生效,锁也拦不住。
+# r113 实测过一次 —— 一轮结束时 `arl_lite/devloop/queue.py` 的模块 docstring
+# 停在了某条变异的内容上,而那个进程自己报的退出码是 0。
+#
+# 唯一真正的修法是**别改真仓库**:把整个仓库(含 `.git`)复制一份到临时目录,
+# 让变异作用在副本上,判据也从副本里跑。副本建完 1.3–2.0 秒,
+# 而一个 mutcheck 本来就要跑几分钟。
+#
+# ## 为什么 71 个脚本一行都不用改
+#
+# 每个脚本开头都是 `REPO = pathlib.Path(__file__).resolve().parent.parent`。
+# 脚本**在副本里**被执行时,`__file__` 就在副本里,`REPO` 于是自动指向副本 ——
+# 变异目标、`cwd`、判据的 `Path(__file__).parents[1]` 全都跟着走。
+#
+# ## 为什么副本**必须**带 `.git`
+#
+# 实测:不带 `.git` 的副本里,`test_round_index_stays_current.py` 与
+# `test_round_commit_audit.py` 一共 **7 条**判据直接红(它们查 git log)。
+# 任何跑到这些判据的变异都会被**误报成「被杀」** —— 变异测试最坏的输出
+# 就是这个。所以副本要连 `.git` 一起复制(实测 1.34–2.03 秒)。
+#
+# ## 副本漏在磁盘上
+#
+# 被杀时清理代码不会跑,临时目录会留着。宁可留一个临时目录,
+# 也不要留一个被改坏的仓库 —— 前者一眼能看出该删哪个,后者得靠 git diff 找。
+_IN_SANDBOX = "ARL_MUTCHECK_IN_SANDBOX"
+
+# 不复制的东西。`__pycache__`/`*.pyc` 必须排除:从真仓库抄来的字节码可能
+# 让副本里的模块用**旧**的 .pyc,那样测的就不是副本的源码了。
+_IGNORE = shutil.ignore_patterns(
+    "__pycache__", "*.pyc", "*.db", ".pytest_cache", "*.egg-info")
+
+
+def _caller_script() -> pathlib.Path:
+    """拿到调用 `sandboxed` 的那个脚本的路径
+
+    从调用栈往回找一层读它的 `__file__`。比要求每个调用方自己传路径好 ——
+    传路径就得在 71 个文件里各写一遍 `__file__`,而那正是本轮想消除的那类
+    重复。
+    """
+    frame = sys._getframe(1)
+    while frame is not None:
+        g = frame.f_globals
+        if g.get("__name__") == "__main__" and g.get("__file__"):
+            return pathlib.Path(g["__file__"]).resolve()
+        frame = frame.f_back
+    raise RuntimeError(
+        "mutkit.sandboxed 找不到调用它的脚本(__name__ != \"__main__\" 且栈里没有"
+        "__file__)。它必须由 `python3 devloop/mutcheck_rNNN.py` 这样直接执行,"
+        "或者在一个 __name__ == \"__main__\" 的模块里调用。")
+
+
+def sandboxed(fn):
+    """在**副本**里跑完整个脚本,真仓库一个字节都不动。
+
+    `python3 devloop/mutcheck_rNNN.py` 的入口写 `mutkit.sandboxed(main)`。
+    本进程:先拿互斥锁,再建副本,在副本里用**同一个解释器**重新执行本脚本,
+    把子进程的退出码原样返回。
+
+    子进程带着 `ARL_MUTCHECK_IN_SANDBOX=1` 启动,于是它的 `sandboxed`
+    直接跑 `fn()` —— 不再复制、不再加锁(否则会被自己的父进程挡下,
+    退出码 2)。
+
+    Raises:
+        SystemExit: 拿不到互斥锁时以退出码 2 退出(与 `locked` 同)。
+    """
+    if os.environ.get(_IN_SANDBOX) == "1":
+        return fn()                     # 已经在副本里了
+    try:
+        return _locked_call(fn)
+    except LockTimeout:
+        _print_busy()
+        raise SystemExit(2) from None
+
+
+def _locked_call(fn):
+    script = _caller_script()
+    with file_lock(SWEEP_TARGET, timeout=0.0,
+                   owner=f"mutcheck pid={os.getpid()}"):
+        td = tempfile.mkdtemp(prefix="mutcheck-sandbox-")
+        copy = pathlib.Path(td) / "repo"
+        try:
+            shutil.copytree(REPO, copy, ignore=_IGNORE)
+            env = dict(os.environ)
+            env[_IN_SANDBOX] = "1"
+            env["PYTHONDONTWRITEBYTECODE"] = "1"
+            print(f"mutkit: 在副本里跑变异测试(真仓库不会被改动)\n"
+                  f"  副本:{copy}\n"
+                  f"  副本会被删掉;真仓库全程只读。", file=sys.stderr)
+            return subprocess.run(
+                [sys.executable, "-B", str(script.relative_to(REPO))],
+                cwd=copy, env=env,
+            ).returncode
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+
+
+def _print_busy() -> None:
+    print(
+        "mutkit: 已经有另一个变异测试在跑,本次不跑。\n"
+        f"  锁:{SWEEP_TARGET}.lock\n"
+        "  变异测试会就地改文件,两个同时跑会互相覆盖对方的备份,\n"
+        "  结果既可能把仓库留在变异态,也可能把生效的变异误报成存活。\n"
+        "  等前一个跑完再跑这一个。",
+        file=sys.stderr,
+    )
